@@ -5,6 +5,7 @@ import (
 	"image"
 	_ "image/jpeg"
 	_ "image/png"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,6 +26,19 @@ type Loaded struct {
 	Root         *Node
 	Dependencies []string
 	Viewport     document.Viewport
+	StateScopes  []StateScope
+}
+
+type StateReference struct {
+	Scope string
+	Name  string
+}
+
+type StateScope struct {
+	ID      string
+	Context string
+	State   map[string]document.StateDeclaration
+	Initial map[string]any
 }
 
 type Node struct {
@@ -36,6 +50,9 @@ type Node struct {
 	Children   []*Node
 	Source     document.Source
 	Breadcrumb []string
+	Scope      string
+	On         document.Events
+	Variants   []document.Variant
 }
 
 type loader struct {
@@ -46,6 +63,7 @@ type loader struct {
 	dependencies map[string]struct{}
 	diagnostics  []document.Diagnostic
 	nextHandle   int
+	stateScopes  map[string]StateScope
 }
 
 type resolveContext struct {
@@ -56,6 +74,8 @@ type resolveContext struct {
 	slots      map[string][]*Node
 	breadcrumb []string
 	source     document.Source
+	scope      string
+	context    string
 }
 
 func Load(root, entry string, viewportWidth int) (*Loaded, []document.Diagnostic) {
@@ -85,6 +105,7 @@ func LoadSelection(root, entry string, viewportWidth int, selection string) (*Lo
 		cache:        make(map[string]*document.Document),
 		loading:      make(map[string]bool),
 		dependencies: make(map[string]struct{}),
+		stateScopes:  make(map[string]StateScope),
 	}
 	doc := l.loadDocument(canonicalEntry)
 	if doc == nil || len(l.diagnostics) != 0 {
@@ -103,7 +124,11 @@ func LoadSelection(root, entry string, viewportWidth int, selection string) (*Lo
 		background := resolveValue(doc.Viewport.Background, ctx, l)
 		l.validateBackground(doc.File, background)
 		for name, screen := range doc.Screens {
-			loaded.Screens[name] = l.viewportNode(l.resolveNode(screen, ctx), background, doc)
+			screenContext := ctx
+			screenContext.scope = "screen:" + name
+			screenContext.context = name
+			l.registerStateScope(screenContext.scope, name, doc.State, nil, screenContext)
+			loaded.Screens[name] = l.viewportNode(l.resolveNode(screen, screenContext), background, doc)
 		}
 		loaded.Selected = doc.Entry
 	case document.KindComponent:
@@ -128,6 +153,9 @@ func LoadSelection(root, entry string, viewportWidth int, selection string) (*Lo
 		}
 		sort.Strings(loaded.Previews)
 		ctx.parameters = parameters
+		ctx.scope = "fixture:" + previewName
+		ctx.context = previewName
+		l.registerStateScope(ctx.scope, previewName, doc.State, preview.State, ctx)
 		l.validateParameters(doc, parameters, preview.Source)
 		ctx.slots = previewSlots(preview, ctx, l)
 		l.validateSlots(doc, ctx.slots, preview.Source)
@@ -144,6 +172,10 @@ func LoadSelection(root, entry string, viewportWidth int, selection string) (*Lo
 	for dependency := range l.dependencies {
 		loaded.Dependencies = append(loaded.Dependencies, dependency)
 	}
+	for _, scope := range l.stateScopes {
+		loaded.StateScopes = append(loaded.StateScopes, scope)
+	}
+	sort.Slice(loaded.StateScopes, func(i, j int) bool { return loaded.StateScopes[i].ID < loaded.StateScopes[j].ID })
 	sort.Strings(loaded.Dependencies)
 	if len(l.diagnostics) != 0 {
 		return nil, l.diagnostics
@@ -353,10 +385,7 @@ func (l *loader) validateTokenReferences(tokens *document.Document) {
 				text, ok := resolved.(string)
 				valid = ok && resolvedColor(text)
 			case "dimension":
-				switch resolved.(type) {
-				case int64, float64:
-					valid = true
-				}
+				valid = resolvedDimension(resolved, false)
 			case "font_face":
 				value, ok := resolved.(map[string]any)
 				_, sourceOK := value["src"].(string)
@@ -595,7 +624,11 @@ func (l *loader) resolveNode(source *document.Node, ctx resolveContext) *Node {
 		Place:      place,
 		Source:     source.Source,
 		Breadcrumb: append([]string(nil), ctx.breadcrumb...),
+		Scope:      ctx.scope,
+		On:         resolveEvents(source.On, ctx, l),
+		Variants:   resolveVariants(source.Variants, ctx, l),
 	}
+	l.validateResolvedInteraction(node, ctx)
 	for _, child := range source.Children {
 		if resolved := l.resolveNode(child, ctx); resolved != nil {
 			if resolved.Type == "_group" {
@@ -606,6 +639,67 @@ func (l *loader) resolveNode(source *document.Node, ctx resolveContext) *Node {
 		}
 	}
 	return node
+}
+
+func (l *loader) validateResolvedInteraction(node *Node, ctx resolveContext) {
+	if node.Type == "button" {
+		if disabled, exists := node.Props["disabled"]; exists && !resolvedStateType(disabled, "boolean", l) {
+			l.add(node.Source.File, node.Source.Line, node.Source.Column, "button.disabled_type", "button disabled must resolve to boolean state")
+		}
+	}
+	for _, action := range node.On.Activate {
+		declaration, ok := ctx.doc.State[action.State]
+		if !ok {
+			continue
+		}
+		switch action.Action {
+		case "set":
+			if !resolvedStateValueMatches(declaration, action.Value, l) {
+				l.add(action.Source.File, action.Source.Line, action.Source.Column, "action.resolved_type", fmt.Sprintf("set value for %q resolves to the wrong type", action.State))
+			}
+		case "increment", "decrement":
+			if action.By != nil && !resolvedStateType(action.By, "number", l) {
+				l.add(action.Source.File, action.Source.Line, action.Source.Column, "action.resolved_type", fmt.Sprintf("%s by for %q must resolve to a number", action.Action, action.State))
+			}
+		}
+	}
+	for _, variant := range node.Variants {
+		if variant.When.State == "" {
+			continue
+		}
+		declaration, ok := ctx.doc.State[variant.When.State]
+		if ok && !resolvedStateValueMatches(declaration, variant.When.Value, l) {
+			l.add(variant.When.Source.File, variant.When.Source.Line, variant.When.Source.Column, "variant.resolved_type", fmt.Sprintf("comparison for state %q resolves to the wrong type", variant.When.State))
+		}
+	}
+}
+
+func resolvedStateType(value any, expected string, l *loader) bool {
+	if reference, ok := value.(StateReference); ok {
+		scope, exists := l.stateScopes[reference.Scope]
+		declaration, declared := scope.State[reference.Name]
+		return exists && declared && declaration.Type == expected
+	}
+	switch expected {
+	case "boolean":
+		_, ok := value.(bool)
+		return ok
+	case "number":
+		return resolvedNumber(value, false)
+	case "text", "enum":
+		_, ok := value.(string)
+		return ok
+	}
+	return false
+}
+
+func resolvedStateValueMatches(declaration document.StateDeclaration, value any, l *loader) bool {
+	if reference, ok := value.(StateReference); ok {
+		scope, exists := l.stateScopes[reference.Scope]
+		referenced, declared := scope.State[reference.Name]
+		return exists && declared && referenced.Type == declaration.Type
+	}
+	return stateDeclarationMatches(declaration, value)
 }
 
 func validateResolvedValues(source *document.Node, props, place map[string]any, l *loader) {
@@ -640,25 +734,30 @@ func validateResolvedValues(source *document.Node, props, place map[string]any, 
 	}
 	for _, key := range []string{"clip", "italic", "wrap", "scrollbar"} {
 		if value, exists := props[key]; exists {
+			if _, dynamic := value.(StateReference); dynamic {
+				continue
+			}
 			if _, ok := value.(bool); !ok {
 				l.add(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", fmt.Sprintf("prop %q requires true or false", key))
 			}
 		}
 	}
-	for _, key := range []string{"width", "height", "min_width", "max_width", "min_height", "max_height", "gap", "column_gap", "row_gap", "size", "line_height", "letter_spacing", "thickness", "opacity"} {
+	for _, key := range []string{"width", "height", "min_width", "max_width", "min_height", "max_height"} {
 		value, exists := props[key]
 		if !exists {
 			continue
 		}
-		switch value.(type) {
-		case int64, float64:
-		case string:
-			if key != "width" && key != "height" || value != "auto" && value != "fill" {
-				l.add(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", fmt.Sprintf("prop %q requires a number", key))
-			}
-		default:
+		if !resolvedDimension(value, true) {
+			l.add(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", fmt.Sprintf("prop %q requires a dimension", key))
+		}
+	}
+	for _, key := range []string{"gap", "column_gap", "row_gap", "size", "line_height", "letter_spacing", "thickness", "opacity"} {
+		if value, exists := props[key]; exists && !resolvedNumber(value, false) {
 			l.add(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", fmt.Sprintf("prop %q requires a number", key))
 		}
+	}
+	if value, exists := props["aspect_ratio"]; exists && !resolvedAspectRatio(value) {
+		l.add(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", "prop \"aspect_ratio\" requires positive width and height")
 	}
 	for _, key := range []string{"color"} {
 		if value, exists := props[key]; exists {
@@ -703,6 +802,9 @@ func validateResolvedValues(source *document.Node, props, place map[string]any, 
 	if source.Type == "text" {
 		for _, key := range []string{"text", "content"} {
 			if value, exists := props[key]; exists {
+				if _, dynamic := value.(StateReference); dynamic {
+					continue
+				}
 				if _, ok := value.(string); !ok {
 					l.add(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", fmt.Sprintf("text prop %q requires text", key))
 				}
@@ -711,11 +813,19 @@ func validateResolvedValues(source *document.Node, props, place map[string]any, 
 	}
 	for key, value := range place {
 		switch key {
-		case "x", "y", "offset_x", "offset_y", "grow", "row", "column", "row_span", "column_span":
-			switch value.(type) {
-			case int64, float64:
-			default:
+		case "x", "y", "offset_x", "offset_y", "grow", "shrink", "row", "column", "row_span", "column_span":
+			if !resolvedNumber(value, true) {
 				l.add(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", fmt.Sprintf("placement %q requires a number", key))
+			}
+		case "basis":
+			if !resolvedDimension(value, false) && value != "auto" {
+				l.add(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", "placement \"basis\" requires auto or a dimension")
+			}
+		case "alignment":
+			text, ok := value.(string)
+			alignments := []string{"start", "center", "end", "stretch", "left", "right", "top", "bottom", "top_left", "top_right", "bottom_left", "bottom_right"}
+			if !ok || !containsString(alignments, text) {
+				l.add(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", "placement \"alignment\" resolves to an unsupported value")
 			}
 		}
 	}
@@ -726,6 +836,10 @@ func (l *loader) resolveInstance(source *document.Node, instanceProps, place map
 	component := caller.components[alias]
 	if component == nil {
 		l.addSuggestions(source.Source.File, source.Source.Line, source.Source.Column, "component.unknown", fmt.Sprintf("unknown component alias %q", alias), stringKeys(caller.components))
+		return nil
+	}
+	if len(component.State) != 0 && source.Name == "" {
+		l.add(source.Source.File, source.Source.Line, source.Source.Column, "state.instance_name", "instances of stateful components require a unique authored name")
 		return nil
 	}
 
@@ -796,7 +910,18 @@ func (l *loader) resolveInstance(source *document.Node, instanceProps, place map
 		tokens:     tokens,
 		slots:      slots,
 		breadcrumb: breadcrumb,
+		context:    caller.context,
 	}
+	if len(component.State) != 0 {
+		baseScope := "screen:" + caller.context
+		if strings.HasPrefix(caller.scope, "fixture:") {
+			baseScope = "fixture:" + caller.context
+		}
+		componentContext.scope = baseScope + "/" + strings.Join(breadcrumb, "/")
+	} else {
+		componentContext.scope = caller.scope
+	}
+	l.registerStateScope(componentContext.scope, caller.context, component.State, nil, componentContext)
 	resolved := l.resolveNode(component.Root, componentContext)
 	if resolved == nil {
 		return nil
@@ -822,13 +947,10 @@ func parameterValueMatches(parameter document.Parameter, value any) bool {
 	case "color":
 		text, ok := value.(string)
 		return ok && resolvedColor(text)
-	case "number", "dimension":
-		switch value.(type) {
-		case int64, float64:
-			return true
-		default:
-			return false
-		}
+	case "number":
+		return resolvedNumber(value, false)
+	case "dimension":
+		return resolvedDimension(value, false)
 	case "boolean":
 		_, ok := value.(bool)
 		return ok
@@ -845,6 +967,61 @@ func parameterValueMatches(parameter document.Parameter, value any) bool {
 		return false
 	default:
 		return false
+	}
+}
+
+func resolvedNumber(value any, nonNegative bool) bool {
+	var number float64
+	switch value := value.(type) {
+	case int64:
+		number = float64(value)
+	case float64:
+		number = value
+	default:
+		return false
+	}
+	return !math.IsNaN(number) && !math.IsInf(number, 0) && (!nonNegative || number >= 0)
+}
+
+func resolvedDimension(value any, allowKeywords bool) bool {
+	if resolvedNumber(value, true) {
+		return true
+	}
+	if text, ok := value.(string); ok {
+		return allowKeywords && (text == "auto" || text == "fill")
+	}
+	percent, ok := value.(map[string]any)
+	if !ok || len(percent) != 1 {
+		return false
+	}
+	return resolvedNumber(percent["percent"], true)
+}
+
+func resolvedAspectRatio(value any) bool {
+	ratio, ok := value.(map[string]any)
+	if !ok || len(ratio) != 2 {
+		return false
+	}
+	for _, key := range []string{"width", "height"} {
+		if !resolvedNumber(ratio[key], false) {
+			return false
+		}
+		number, _ := numberAsFloat64(ratio[key])
+		if number <= 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func numberAsFloat64(value any) (float64, bool) {
+	switch value := value.(type) {
+	case int64:
+		return float64(value), true
+	case float64:
+		return value, true
+	default:
+		return 0, false
 	}
 }
 
@@ -865,6 +1042,79 @@ func resolveMap(values map[string]any, ctx resolveContext, l *loader) map[string
 		out[key] = resolveValue(value, ctx, l)
 	}
 	return out
+}
+
+func resolveEvents(events document.Events, ctx resolveContext, l *loader) document.Events {
+	resolved := document.Events{Activate: make([]document.Action, len(events.Activate))}
+	for index, action := range events.Activate {
+		resolved.Activate[index] = action
+		resolved.Activate[index].Value = resolveValue(action.Value, ctx, l)
+		resolved.Activate[index].By = resolveValue(action.By, ctx, l)
+	}
+	return resolved
+}
+
+func resolveVariants(variants []document.Variant, ctx resolveContext, l *loader) []document.Variant {
+	resolved := make([]document.Variant, len(variants))
+	for index, variant := range variants {
+		resolved[index] = variant
+		resolved[index].Props = resolveMap(variant.Props, ctx, l)
+		resolved[index].Place = resolveMap(variant.Place, ctx, l)
+		resolved[index].When.Value = resolveValue(variant.When.Value, ctx, l)
+	}
+	return resolved
+}
+
+func (l *loader) registerStateScope(id, context string, declarations map[string]document.StateDeclaration, overrides map[string]any, ctx resolveContext) {
+	if id == "" || len(declarations) == 0 {
+		return
+	}
+	state := make(map[string]document.StateDeclaration, len(declarations))
+	initial := make(map[string]any, len(overrides))
+	for name, declaration := range declarations {
+		declaration.Default = resolveValue(declaration.Default, ctx, l)
+		if !stateDeclarationMatches(declaration, declaration.Default) {
+			l.add(declaration.Source.File, declaration.Source.Line, declaration.Source.Column, "state.default_type", fmt.Sprintf("state %q default does not match %s", name, declaration.Type))
+		}
+		state[name] = declaration
+	}
+	for name, value := range overrides {
+		declaration, ok := state[name]
+		if !ok {
+			continue
+		}
+		value = resolveValue(value, ctx, l)
+		if !stateDeclarationMatches(declaration, value) {
+			l.add(declaration.Source.File, declaration.Source.Line, declaration.Source.Column, "state.fixture_type", fmt.Sprintf("fixture state %q does not match %s", name, declaration.Type))
+			continue
+		}
+		initial[name] = value
+	}
+	l.stateScopes[id] = StateScope{ID: id, Context: context, State: state, Initial: initial}
+}
+
+func stateDeclarationMatches(declaration document.StateDeclaration, value any) bool {
+	switch declaration.Type {
+	case "boolean":
+		_, ok := value.(bool)
+		return ok
+	case "number":
+		return resolvedNumber(value, false)
+	case "text":
+		_, ok := value.(string)
+		return ok
+	case "enum":
+		text, ok := value.(string)
+		if !ok {
+			return false
+		}
+		for _, allowed := range declaration.Values {
+			if text == allowed {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func resolveValue(value any, ctx resolveContext, l *loader) any {
@@ -894,6 +1144,13 @@ func resolveReference(ref string, ctx resolveContext, l *loader) any {
 		source = document.Source{File: ctx.doc.File, Line: 1, Column: 1}
 	}
 	parts := strings.Split(ref, ".")
+	if len(parts) == 2 && parts[0] == "state" {
+		if _, ok := ctx.doc.State[parts[1]]; !ok {
+			l.addSuggestions(source.File, source.Line, source.Column, "reference.state", fmt.Sprintf("unknown state %q", parts[1]), stringKeys(ctx.doc.State))
+			return nil
+		}
+		return StateReference{Scope: ctx.scope, Name: parts[1]}
+	}
 	if len(parts) == 2 && parts[0] == "parameter" {
 		value, ok := ctx.parameters[parts[1]]
 		if !ok {
@@ -1106,6 +1363,15 @@ func stringKeys[V any](values map[string]V) []string {
 		keys = append(keys, key)
 	}
 	return keys
+}
+
+func containsString(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func loadDiagnostic(file, code, message string) document.Diagnostic {

@@ -1,0 +1,23 @@
+gora: 1
+kind: tokens
+tokens:
+  color:
+    ink: "#172033"
+    muted: "#657089"
+    canvas: "#F4F6FB"
+    panel: "#FFFFFF"
+    primary: "#5B55E7"
+    accent: "#16A085"
+  dimension:
+    half: { percent: 50 }
+    card_basis: { percent: 30 }
+  font_face:
+    studio: { src: ../dashboard/assets/StudioSans.ttf }
+  shadow:
+    panel: { x: 0, y: 12, blur: 30, color: "#17203312" }
+  linear_gradient:
+    hero:
+      angle: 125
+      stops:
+        - { offset: 0, color: "#252B55" }
+        - { offset: 1, color: "#675FF2" }

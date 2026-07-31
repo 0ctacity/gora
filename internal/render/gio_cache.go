@@ -29,20 +29,35 @@ type gioCacheKey struct {
 }
 
 type gioScene struct {
-	operations  op.Ops
-	items       []sceneItem
-	inspections []sceneInspection
+	operations   op.Ops
+	items        []sceneItem
+	inspections  []sceneInspection
+	interactions []sceneInteraction
+}
+
+type sceneInteraction struct {
+	region  InteractionRegion
+	scrolls []sceneScroll
 }
 
 type sceneItem struct {
 	call      op.CallOp
 	scrolls   []sceneScroll
 	scrollbar *sceneScrollbar
+	button    *sceneButton
 }
 
 type sceneInspection struct {
 	inspection Inspection
 	scrolls    []sceneScroll
+	button     *project.Node
+}
+
+type sceneButton struct {
+	node    *project.Node
+	bounds  image.Rectangle
+	clip    image.Rectangle
+	opacity float64
 }
 
 type sceneScroll struct {
@@ -126,8 +141,9 @@ func (r *gioRenderer) recordPaint(paintNode func()) {
 
 func (scene *gioScene) replay(gtx layout.Context, theme *material.Theme, state State) GioResult {
 	result := GioResult{
-		Bounds:      make(map[string]image.Rectangle, len(scene.inspections)),
-		Inspections: make([]Inspection, 0, len(scene.inspections)),
+		Bounds:       make(map[string]image.Rectangle, len(scene.inspections)),
+		Inspections:  make([]Inspection, 0, len(scene.inspections)),
+		Interactions: make([]InteractionRegion, 0, len(scene.interactions)),
 	}
 	for _, item := range scene.items {
 		translation, viewportClip, clipped := sceneTransform(item.scrolls, state)
@@ -135,7 +151,17 @@ func (scene *gioScene) replay(gtx layout.Context, theme *material.Theme, state S
 			continue
 		}
 		clipStack := pushSceneClip(gtx, viewportClip)
-		if item.scrollbar != nil {
+		if item.button != nil {
+			button := item.button
+			bounds := button.bounds.Add(translation)
+			staticClip := button.clip.Add(translation)
+			renderer := gioRenderer{gtx: gtx, theme: theme, state: state, opacity: button.opacity}
+			renderer.paintSurfaceGio(
+				buttonNodeForState(button.node, state),
+				bounds,
+				staticClip.Intersect(viewportClipOrBounds(viewportClip, bounds)),
+			)
+		} else if item.scrollbar != nil {
 			scrollbar := item.scrollbar
 			bounds := scrollbar.bounds.Add(translation)
 			staticClip := scrollbar.clip.Add(translation)
@@ -159,6 +185,14 @@ func (scene *gioScene) replay(gtx layout.Context, theme *material.Theme, state S
 	for _, cached := range scene.inspections {
 		translation, viewportClip, clipped := sceneTransform(cached.scrolls, state)
 		inspection := cached.inspection
+		if cached.button != nil {
+			effective := buttonNodeForState(cached.button, state)
+			inspection.Props = cloneMap(effective.Props)
+			inspection.Hovered = state.Hovered == effective.Handle
+			inspection.Pressed = state.Pressed == effective.Handle
+			inspection.Focused = state.Focused == effective.Handle
+			inspection.State = cloneMap(state.Values[effective.Scope])
+		}
 		inspection.Bounds = inspection.Bounds.Add(translation)
 		inspection.Clip = inspection.Clip.Add(translation)
 		if len(cached.scrolls) > 0 {
@@ -169,6 +203,19 @@ func (scene *gioScene) replay(gtx layout.Context, theme *material.Theme, state S
 		}
 		result.Bounds[inspection.Handle] = inspection.Bounds
 		result.Inspections = append(result.Inspections, inspection)
+	}
+	for _, cached := range scene.interactions {
+		translation, viewportClip, clipped := sceneTransform(cached.scrolls, state)
+		region := cached.region
+		region.Bounds = region.Bounds.Add(translation)
+		region.Clip = region.Clip.Add(translation)
+		if len(cached.scrolls) > 0 {
+			region.Clip = region.Clip.Intersect(viewportClip)
+		}
+		if clipped {
+			region.Clip = image.Rectangle{}
+		}
+		result.Interactions = append(result.Interactions, region)
 	}
 	return result
 }

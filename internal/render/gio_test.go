@@ -13,6 +13,7 @@ import (
 	"gioui.org/unit"
 	"gioui.org/widget/material"
 
+	"gora/internal/document"
 	"gora/internal/project"
 )
 
@@ -65,6 +66,29 @@ func TestLayoutGioUsesGrowSpaceAndCentersSurfaceContent(t *testing.T) {
 	}
 }
 
+func TestCPUAndGioUseIdenticalStackGeometry(t *testing.T) {
+	root := &project.Node{
+		Handle: "stack", Type: "stack",
+		Props: map[string]any{"direction": "horizontal", "wrap": true, "column_gap": int64(8), "row_gap": int64(6), "alignment": "start"},
+		Children: []*project.Node{
+			{Handle: "a", Type: "surface", Place: map[string]any{"basis": map[string]any{"percent": int64(45)}}, Props: map[string]any{"height": int64(20)}},
+			{Handle: "b", Type: "surface", Place: map[string]any{"basis": map[string]any{"percent": int64(45)}}, Props: map[string]any{"aspect_ratio": map[string]any{"width": int64(2), "height": int64(1)}}},
+			{Handle: "c", Type: "surface", Place: map[string]any{"basis": int64(80)}, Props: map[string]any{"height": int64(10)}},
+		},
+	}
+	viewport := image.Pt(180, 80)
+	cpu := Render(root, viewport, State{})
+	var operations op.Ops
+	gio := LayoutGio(layout.Context{
+		Ops: &operations, Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}, Constraints: layout.Exact(viewport),
+	}, material.NewTheme(), root, viewport, State{})
+	for _, handle := range []string{"stack", "a", "b", "c"} {
+		if cpu.Bounds[handle] != gio.Bounds[handle] {
+			t.Fatalf("%s bounds: CPU=%v Gio=%v", handle, cpu.Bounds[handle], gio.Bounds[handle])
+		}
+	}
+}
+
 func TestGioLabelLoadsDocumentLocalFontIntoNativeShaper(t *testing.T) {
 	theme := material.NewTheme()
 	renderer := gioRenderer{theme: theme, opacity: 1}
@@ -100,6 +124,24 @@ func TestNativeShadowUsesSoftExpandedLayers(t *testing.T) {
 	}
 	if layers[len(layers)-1].color == (color.NRGBA{}) {
 		t.Fatal("inner shadow layer is transparent")
+	}
+}
+
+func TestRoundedSurfaceBorderDoesNotSquareOffOuterCorners(t *testing.T) {
+	root := &project.Node{
+		Handle: "button", Type: "button",
+		Props: map[string]any{
+			"label": "Save", "background": "#FFFFFF", "radius": float64(12),
+			"border": map[string]any{"thickness": float64(2), "color": "#172033"},
+		},
+		Children: []*project.Node{{Handle: "label", Type: "text", Props: map[string]any{"content": "Save"}}},
+	}
+	captured, err := captureGio(root, image.Pt(100, 40), State{}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if corner := captured.RGBAAt(0, 0); corner.A != 0 {
+		t.Fatalf("rounded border painted square corner %#v", corner)
 	}
 }
 
@@ -183,6 +225,31 @@ func TestGioCacheInvalidatesForViewportMetricAndResolvedRootChanges(t *testing.T
 
 	if cache.builds != 4 {
 		t.Fatalf("scene builds = %d, want 4", cache.builds)
+	}
+}
+
+func TestGioCacheReplaysTransientButtonPaintWithoutGeometryRebuild(t *testing.T) {
+	root := &project.Node{
+		Handle: "button", Type: "button", Props: map[string]any{"label": "Save", "background": "#000000"},
+		Variants: []document.Variant{{When: document.Condition{Interaction: "hovered"}, Props: map[string]any{"background": "#FF0000"}}},
+		Children: []*project.Node{{Handle: "label", Type: "text", Props: map[string]any{"content": "Save"}}},
+	}
+	theme := material.NewTheme()
+	viewport := image.Pt(100, 40)
+	var cache GioCache
+	layoutCached := func(state State) GioResult {
+		var operations op.Ops
+		return cache.Layout(layout.Context{
+			Ops: &operations, Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}, Constraints: layout.Exact(viewport),
+		}, theme, root, viewport, state)
+	}
+	layoutCached(State{})
+	hovered := layoutCached(State{Hovered: "button"})
+	if cache.builds != 1 {
+		t.Fatalf("scene builds = %d, want 1", cache.builds)
+	}
+	if len(hovered.Inspections) == 0 || hovered.Inspections[0].Props["background"] != "#FF0000" || !hovered.Inspections[0].Hovered {
+		t.Fatalf("hovered inspection = %+v", hovered.Inspections)
 	}
 }
 

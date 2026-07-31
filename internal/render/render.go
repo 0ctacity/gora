@@ -26,12 +26,17 @@ import (
 	"golang.org/x/image/math/fixed"
 	_ "golang.org/x/image/webp"
 
+	"gora/internal/document"
 	"gora/internal/project"
 )
 
 // State contains the ephemeral values that are intentionally absent from .gora files.
 type State struct {
-	Scroll map[string]image.Point
+	Scroll  map[string]image.Point
+	Values  map[string]map[string]any
+	Hovered string
+	Pressed string
+	Focused string
 }
 
 type Inspection struct {
@@ -45,12 +50,32 @@ type Inspection struct {
 	Line       int
 	Column     int
 	Breadcrumb []string
+	Role       string
+	Label      string
+	Enabled    bool
+	Scope      string
+	Actions    []document.Action
+	State      map[string]any
+	Hovered    bool
+	Pressed    bool
+	Focused    bool
+}
+
+type InteractionRegion struct {
+	Handle   string
+	Bounds   image.Rectangle
+	Clip     image.Rectangle
+	Scope    string
+	Label    string
+	Disabled bool
+	Actions  []document.Action
 }
 
 type Result struct {
-	Image       *image.RGBA
-	Bounds      map[string]image.Rectangle
-	Inspections []Inspection
+	Image        *image.RGBA
+	Bounds       map[string]image.Rectangle
+	Inspections  []Inspection
+	Interactions []InteractionRegion
 }
 
 type renderer struct {
@@ -140,21 +165,47 @@ func Capture(path string, root *project.Node, viewport image.Point, state State,
 }
 
 func (r *renderer) layout(node *project.Node, bounds, clip image.Rectangle) {
+	r.layoutNode(node, bounds, clip, false)
+}
+
+func (r *renderer) layoutFinal(node *project.Node, bounds, clip image.Rectangle) {
+	r.layoutNode(node, bounds, clip, true)
+}
+
+func (r *renderer) layoutNode(node *project.Node, bounds, clip image.Rectangle, final bool) {
 	if node == nil || bounds.Empty() {
 		return
 	}
-	bounds = applySize(node, bounds)
+	if !final {
+		bounds = applySize(node, bounds)
+	}
+	node = buttonNodeForState(node, r.state)
 	incomingClip := clip
 	clip = clip.Intersect(bounds)
 	previousOpacity := r.opacity
 	r.opacity *= clamp(number(node.Props["opacity"], 1), 0, 1)
 	defer func() { r.opacity = previousOpacity }()
 	r.result.Bounds[node.Handle] = bounds
-	r.result.Inspections = append(r.result.Inspections, Inspection{
+	inspection := Inspection{
 		Handle: node.Handle, Type: node.Type, Name: node.Name, Bounds: bounds, Clip: clip,
 		Props: cloneMap(node.Props), Source: node.Source.File, Line: node.Source.Line,
 		Column: node.Source.Column, Breadcrumb: append([]string(nil), node.Breadcrumb...),
-	})
+	}
+	if node.Type == "button" {
+		disabled := boolValue(node.Props["disabled"], false)
+		label := stringValue(node.Props["label"], "")
+		inspection.Role, inspection.Label, inspection.Enabled, inspection.Scope = "button", label, !disabled, node.Scope
+		inspection.Actions = append([]document.Action(nil), node.On.Activate...)
+		inspection.State = cloneMap(r.state.Values[node.Scope])
+		inspection.Hovered = r.state.Hovered == node.Handle
+		inspection.Pressed = r.state.Pressed == node.Handle
+		inspection.Focused = r.state.Focused == node.Handle
+		r.result.Interactions = append(r.result.Interactions, InteractionRegion{
+			Handle: node.Handle, Bounds: bounds, Clip: clip, Scope: node.Scope, Label: label,
+			Disabled: disabled, Actions: append([]document.Action(nil), node.On.Activate...),
+		})
+	}
+	r.result.Inspections = append(r.result.Inspections, inspection)
 
 	switch node.Type {
 	case "_viewport":
@@ -166,7 +217,7 @@ func (r *renderer) layout(node *project.Node, bounds, clip image.Rectangle) {
 		if len(node.Children) == 1 {
 			r.layout(node.Children[0], bounds, clip)
 		}
-	case "surface":
+	case "surface", "button":
 		r.paintSurface(node, bounds, incomingClip)
 		inner := inset(bounds, insets(node.Props["padding"]))
 		if len(node.Children) == 1 {
@@ -185,21 +236,19 @@ func (r *renderer) layout(node *project.Node, bounds, clip image.Rectangle) {
 			offset := r.state.Scroll[scrollKey(node)]
 			axis := stringValue(node.Props["axis"], "vertical")
 			childBounds := bounds
-			contentSize := bounds.Dy()
+			contentSize := scrollContentSize(node.Children[0], bounds, axis, cpuIntrinsicSize)
 			if axis == "vertical" {
-				contentSize = max(int(number(node.Children[0].Props["height"], float64(bounds.Dy()))), bounds.Dy())
 				offset.Y = min(max(0, offset.Y), contentSize-bounds.Dy())
 				offset.X = 0
 				childBounds = bounds.Sub(offset)
 				childBounds.Max.Y = childBounds.Min.Y + contentSize
 			} else {
-				contentSize = max(int(number(node.Children[0].Props["width"], float64(bounds.Dx()))), bounds.Dx())
 				offset.X = min(max(0, offset.X), contentSize-bounds.Dx())
 				offset.Y = 0
 				childBounds = bounds.Sub(offset)
 				childBounds.Max.X = childBounds.Min.X + contentSize
 			}
-			r.layout(node.Children[0], childBounds, clip.Intersect(bounds))
+			r.layoutFinal(node.Children[0], childBounds, clip.Intersect(bounds))
 			if boolValue(node.Props["scrollbar"], false) && contentSize > func() int {
 				if axis == "vertical" {
 					return bounds.Dy()
@@ -227,6 +276,43 @@ func (r *renderer) layout(node *project.Node, bounds, clip image.Rectangle) {
 			r.layout(child, place(child, bounds), clip)
 		}
 	}
+}
+
+func buttonNodeForState(node *project.Node, state State) *project.Node {
+	if node == nil || node.Type != "button" {
+		return node
+	}
+	props := node.Props
+	changed := false
+	for _, variant := range node.Variants {
+		matched := false
+		switch variant.When.Interaction {
+		case "hovered":
+			matched = state.Hovered == node.Handle
+		case "pressed":
+			matched = state.Pressed == node.Handle
+		case "focused":
+			matched = state.Focused == node.Handle
+		case "disabled":
+			matched = boolValue(props["disabled"], false)
+		}
+		if !matched {
+			continue
+		}
+		if !changed {
+			props = cloneMap(props)
+			changed = true
+		}
+		for key, value := range variant.Props {
+			props[key] = value
+		}
+	}
+	if !changed {
+		return node
+	}
+	clone := *node
+	clone.Props = props
+	return &clone
 }
 
 func (r *renderer) paintScrollbar(bounds, clip image.Rectangle, axis string, contentSize int, offset image.Point) {
@@ -646,107 +732,28 @@ func fittedRect(source image.Point, target image.Rectangle, fit, alignment strin
 }
 
 func (r *renderer) stack(node *project.Node, bounds, clip image.Rectangle) {
-	padding := insets(node.Props["padding"])
-	inner := inset(bounds, padding)
-	gap := int(number(node.Props["gap"], 0))
-	vertical := stringValue(node.Props["direction"], "vertical") != "horizontal"
-	available := inner.Dx()
-	if vertical {
-		available = inner.Dy()
+	for index, childBounds := range planStack(node, bounds, cpuIntrinsicSize) {
+		r.layoutFinal(node.Children[index], childBounds, clip)
 	}
-	available -= gap * max(0, len(node.Children)-1)
-	sizes := make([]int, len(node.Children))
-	var flexible []int
-	growTotal := 0.0
-	for index, child := range node.Children {
-		key := "width"
-		if vertical {
-			key = "height"
-		}
-		if size := int(number(child.Props[key], 0)); size > 0 {
-			sizes[index] = size
-			available -= size
-		} else if size := intrinsicMainSize(child, vertical); size > 0 {
-			sizes[index] = size
-			available -= size
-		} else {
-			flexible = append(flexible, index)
-			growTotal += math.Max(0, number(child.Place["grow"], 1))
-		}
-	}
-	remaining := max(0, available)
-	assigned := 0
-	for index, childIndex := range flexible {
-		weight := math.Max(0, number(node.Children[childIndex].Place["grow"], 1))
-		size := 0
-		if index == len(flexible)-1 {
-			size = remaining - assigned
-		} else if growTotal > 0 {
-			size = int(math.Floor(float64(remaining) * weight / growTotal))
-			assigned += size
-		}
-		sizes[childIndex] = size
-	}
-	used := gap * max(0, len(node.Children)-1)
-	for _, size := range sizes {
-		used += size
-	}
-	spare := max(0, func() int {
-		if vertical {
-			return inner.Dy() - used
-		}
-		return inner.Dx() - used
-	}())
-	cursor := 0
-	switch stringValue(node.Props["distribution"], "start") {
-	case "center":
-		cursor = spare / 2
-	case "end":
-		cursor = spare
-	case "space_between":
-		if len(node.Children) > 1 {
-			gap += spare / (len(node.Children) - 1)
-		}
-	case "space_around":
-		if len(node.Children) > 0 {
-			gap += spare / len(node.Children)
-			cursor = gap / 2
-		}
-	}
-	alignment := stringValue(node.Props["alignment"], "stretch")
-	for index, child := range node.Children {
-		childBounds := inner
-		if vertical {
-			height := sizes[index]
-			childBounds.Min.Y += cursor
-			childBounds.Max.Y = childBounds.Min.Y + height
-			if width := int(number(child.Props["width"], 0)); width > 0 && width < inner.Dx() {
-				switch alignment {
-				case "center":
-					childBounds.Min.X += (inner.Dx() - width) / 2
-				case "end":
-					childBounds.Min.X = inner.Max.X - width
-				}
-				childBounds.Max.X = childBounds.Min.X + width
+}
+
+func cpuIntrinsicSize(node *project.Node, limit image.Point) image.Point {
+	return measureIntrinsic(node, limit, cpuIntrinsicLeaf)
+}
+
+func cpuIntrinsicLeaf(node *project.Node, limit image.Point) image.Point {
+	if node.Type == "image" {
+		source := stringValue(node.Props["src"], "")
+		if source != "" {
+			if !filepath.IsAbs(source) {
+				source = filepath.Join(filepath.Dir(node.Source.File), source)
 			}
-			cursor += height + gap
-		} else {
-			width := sizes[index]
-			childBounds.Min.X += cursor
-			childBounds.Max.X = childBounds.Min.X + width
-			if height := int(number(child.Props["height"], 0)); height > 0 && height < inner.Dy() {
-				switch alignment {
-				case "center":
-					childBounds.Min.Y += (inner.Dy() - height) / 2
-				case "end":
-					childBounds.Min.Y = inner.Max.Y - height
-				}
-				childBounds.Max.Y = childBounds.Min.Y + height
+			if decoded, err := loadImage(source); err == nil {
+				return decoded.Bounds().Size()
 			}
-			cursor += width + gap
 		}
-		r.layout(child, childBounds, clip)
 	}
+	return image.Pt(intrinsicMainSize(node, false), intrinsicMainSize(node, true))
 }
 
 func intrinsicMainSize(node *project.Node, vertical bool) int {
@@ -906,29 +913,29 @@ func (r *renderer) paintRect(bounds, clip image.Rectangle, value color.Color, op
 }
 
 func applySize(node *project.Node, bounds image.Rectangle) image.Rectangle {
-	if width := int(number(node.Props["width"], 0)); width > 0 {
+	parentWidth, parentHeight := bounds.Dx(), bounds.Dy()
+	width, widthDefinite := resolveDimension(node.Props["width"], parentWidth)
+	height, heightDefinite := resolveDimension(node.Props["height"], parentHeight)
+	if ratio, ok := aspectRatio(node.Props["aspect_ratio"]); ok {
+		if widthDefinite && !heightDefinite {
+			height, heightDefinite = rounded(float64(width)/ratio), true
+		} else if heightDefinite && !widthDefinite {
+			width, widthDefinite = rounded(float64(height)*ratio), true
+		}
+	}
+	if widthDefinite {
 		bounds.Max.X = bounds.Min.X + width
 	}
-	if height := int(number(node.Props["height"], 0)); height > 0 {
+	if heightDefinite {
 		bounds.Max.Y = bounds.Min.Y + height
 	}
-	minWidth := int(number(node.Props["min_width"], 0))
-	maxWidth := int(number(node.Props["max_width"], 0))
-	minHeight := int(number(node.Props["min_height"], 0))
-	maxHeight := int(number(node.Props["max_height"], 0))
-	width, height := bounds.Dx(), bounds.Dy()
-	if minWidth > 0 {
-		width = max(width, minWidth)
-	}
-	if maxWidth > 0 {
-		width = min(width, maxWidth)
-	}
-	if minHeight > 0 {
-		height = max(height, minHeight)
-	}
-	if maxHeight > 0 {
-		height = min(height, maxHeight)
-	}
+	minWidth, _ := resolveDimension(node.Props["min_width"], parentWidth)
+	maxWidth, hasMaxWidth := resolveDimension(node.Props["max_width"], parentWidth)
+	minHeight, _ := resolveDimension(node.Props["min_height"], parentHeight)
+	maxHeight, hasMaxHeight := resolveDimension(node.Props["max_height"], parentHeight)
+	width, height = bounds.Dx(), bounds.Dy()
+	width = clampDimension(width, minWidth, maxWidth, hasMaxWidth)
+	height = clampDimension(height, minHeight, maxHeight, hasMaxHeight)
 	bounds.Max = bounds.Min.Add(image.Pt(width, height))
 	return bounds
 }

@@ -16,6 +16,7 @@ import (
 	"unicode"
 
 	"gioui.org/app"
+	"gioui.org/f32"
 	"gioui.org/io/event"
 	"gioui.org/io/key"
 	"gioui.org/io/pointer"
@@ -29,6 +30,7 @@ import (
 	"gioui.org/widget"
 	"gioui.org/widget/material"
 
+	"gora/internal/interaction"
 	"gora/internal/project"
 	"gora/internal/render"
 	"gora/internal/session"
@@ -41,7 +43,6 @@ type uiState struct {
 	zoomOut           widget.Clickable
 	zoomIn            widget.Clickable
 	inspect           widget.Clickable
-	canvas            widget.Clickable
 	capture           widget.Clickable
 	output            widget.Editor
 	zoomValue         float32
@@ -62,6 +63,14 @@ type uiState struct {
 	checkerboard      checkerboardCache
 	previewScroll     previewScrollbarModel
 	previewScrollRoot *project.Node
+	router            *interaction.Router
+	interactionInput  struct{}
+	interactions      []render.InteractionRegion
+	inspectPointerID  int
+	inspectPressed    bool
+	inspectPending    bool
+	inspectPoint      image.Point
+	resetState        widget.Clickable
 }
 
 type checkerboardCache struct {
@@ -78,7 +87,7 @@ func Start(root, entry, socketPath string) error {
 	runtime, err := NewRuntime(root, entry)
 	if err != nil {
 		// An invalid initial document is still a valid Studio state.
-		runtime = &Runtime{root: root, entry: entry, scroll: make(map[string]image.Point)}
+		runtime = &Runtime{root: root, entry: entry, scroll: make(map[string]image.Point), state: interaction.NewStore()}
 		runtime.Reload()
 	}
 	window := new(app.Window)
@@ -116,7 +125,7 @@ func eventLoop(window *app.Window, runtime *Runtime, server *session.Server, cle
 	defer cleanup()
 	defer server.Close()
 	theme := material.NewTheme()
-	state := &uiState{zoomValue: 1}
+	state := &uiState{zoomValue: 1, router: interaction.NewRouter()}
 	state.output.SingleLine = true
 	state.output.Alignment = text.End
 	state.output.SetText(filepath.Join(filepath.Dir(runtime.entry), "gora-capture.png"))
@@ -195,26 +204,32 @@ func layoutStudioCanvas(gtx layout.Context, theme *material.Theme, runtime *Runt
 
 	hardClip := clip.Rect{Max: viewport}.Push(gtx.Ops)
 	event.Op(gtx.Ops, &state.zoomInput)
+	event.Op(gtx.Ops, &state.interactionInput)
 	position := canvasPosition(viewport, size, state.canvasPan)
 	offset := op.Offset(position).Push(gtx.Ops)
 	previewGtx.Constraints = layout.Exact(size)
-	var result render.GioResult
-	state.canvas.Layout(previewGtx, func(gtx layout.Context) layout.Dimensions {
-		state.checkerboard.paint(gtx.Ops, size, gtx.Dp(unit.Dp(8)))
-		result = state.preview.Layout(
-			gtx,
-			theme,
-			snapshot.Root,
-			snapshot.Viewport,
-			render.State{Scroll: snapshot.Scroll},
-		)
-		if state.inspecting && state.selectedHandle != "" {
-			paintHighlight(gtx, result.Bounds[state.selectedHandle])
-		}
-		layoutPreviewScrollbar(gtx, theme, runtime, state, snapshot, result, window)
-		return layout.Dimensions{Size: size}
-	})
+	state.checkerboard.paint(gtx.Ops, size, previewGtx.Dp(unit.Dp(8)))
+	result := state.preview.Layout(
+		previewGtx,
+		theme,
+		snapshot.Root,
+		snapshot.Viewport,
+		renderState(snapshot),
+	)
+	if state.inspecting && state.selectedHandle != "" {
+		paintHighlight(previewGtx, result.Bounds[state.selectedHandle])
+	}
+	layoutPreviewScrollbar(previewGtx, theme, runtime, state, snapshot, result, window)
 	state.inspections = result.Inspections
+	state.interactions = append(state.interactions[:0], result.Interactions...)
+	if state.router == nil {
+		state.router = interaction.NewRouter()
+	}
+	state.router.Update(state.interactions)
+	if state.router.Transient() != snapshot.Transient {
+		runtime.SetTransient(state.router.Transient())
+		window.Invalidate()
+	}
 	offset.Pop()
 	hardClip.Pop()
 	return layout.Dimensions{Size: viewport}
@@ -245,7 +260,14 @@ func fitZoom(viewport, available image.Point) float32 {
 }
 
 func layoutPreview(gtx layout.Context, theme *material.Theme, snapshot Snapshot) render.GioResult {
-	return render.LayoutGio(gtx, theme, snapshot.Root, snapshot.Viewport, render.State{Scroll: snapshot.Scroll})
+	return render.LayoutGio(gtx, theme, snapshot.Root, snapshot.Viewport, renderState(snapshot))
+}
+
+func renderState(snapshot Snapshot) render.State {
+	return render.State{
+		Scroll: snapshot.Scroll, Values: snapshot.StateValues,
+		Hovered: snapshot.Transient.Hovered, Pressed: snapshot.Transient.Pressed, Focused: snapshot.Transient.Focused,
+	}
 }
 
 func paintCheckerboard(operations *op.Ops, size image.Point, tile int) {
@@ -416,6 +438,10 @@ func layoutPreviewScrollbar(
 }
 
 func handleActions(gtx layout.Context, runtime *Runtime, state *uiState, snapshot Snapshot, window *app.Window) {
+	if state.router == nil {
+		state.router = interaction.NewRouter()
+	}
+	handleDocumentInteraction(gtx, runtime, state, window)
 	zoomScroll, horizontalScroll, verticalScroll := canvasScrollEvents(gtx, state)
 	axis, scroll := dominantPageScroll(horizontalScroll, verticalScroll)
 	blockPageScroll := state.blockPageScroll(gtx.Now, zoomScroll, scroll)
@@ -463,23 +489,28 @@ func handleActions(gtx layout.Context, runtime *Runtime, state *uiState, snapsho
 		state.inspecting = !state.inspecting
 		state.selected = ""
 		state.selectedHandle = ""
+		state.inspectPressed = false
+		state.inspectPending = false
+		state.router.SetInspecting(state.inspecting)
+		runtime.SetTransient(state.router.Transient())
 	}
-	if state.canvas.Clicked(gtx) && state.inspecting && snapshot.Root != nil {
-		history := state.canvas.History()
-		if len(history) != 0 {
-			position := history[len(history)-1].Position
-			scale := state.zoomValue * gtx.Metric.PxPerDp
-			point := image.Pt(int(float32(position.X)/scale), int(float32(position.Y)/scale))
-			for index := len(state.inspections) - 1; index >= 0; index-- {
-				inspection := state.inspections[index]
-				if point.In(inspection.Bounds.Intersect(inspection.Clip)) {
-					state.selectedHandle = inspection.Handle
-					state.selected = fmt.Sprintf("%s %q bounds=%v clip=%v props=%v · %s:%d · %v",
-						inspection.Type, inspection.Name, inspection.Bounds,
-						inspection.Clip, inspection.Props,
-						filepath.Base(inspection.Source), inspection.Line, inspection.Breadcrumb)
-					break
-				}
+	if state.resetState.Clicked(gtx) {
+		runtime.ResetState()
+		state.router.Update(nil)
+		state.status = "state reset"
+	}
+	if state.inspectPending && state.inspecting && snapshot.Root != nil {
+		state.inspectPending = false
+		for index := len(state.inspections) - 1; index >= 0; index-- {
+			inspection := state.inspections[index]
+			if state.inspectPoint.In(inspection.Bounds.Intersect(inspection.Clip)) {
+				state.selectedHandle = inspection.Handle
+				state.selected = fmt.Sprintf("%s %q role=%s label=%q enabled=%t hovered=%t pressed=%t focused=%t scope=%s state=%v actions=%v bounds=%v clip=%v props=%v · %s:%d · %v",
+					inspection.Type, inspection.Name,
+					inspection.Role, inspection.Label, inspection.Enabled, inspection.Hovered, inspection.Pressed, inspection.Focused,
+					inspection.Scope, inspection.State, inspection.Actions, inspection.Bounds, inspection.Clip, inspection.Props,
+					filepath.Base(inspection.Source), inspection.Line, inspection.Breadcrumb)
+				break
 			}
 		}
 	}
@@ -494,6 +525,134 @@ func handleActions(gtx layout.Context, runtime *Runtime, state *uiState, snapsho
 		}
 	}
 	_ = window
+}
+
+func handleDocumentInteraction(gtx layout.Context, runtime *Runtime, state *uiState, window *app.Window) {
+	before := state.router.Transient()
+	mutated := false
+	pointerFilter := pointer.Filter{
+		Target: &state.interactionInput,
+		Kinds:  pointer.Enter | pointer.Leave | pointer.Move | pointer.Drag | pointer.Press | pointer.Release | pointer.Cancel,
+	}
+	for {
+		raw, ok := gtx.Event(pointerFilter)
+		if !ok {
+			break
+		}
+		event, ok := raw.(pointer.Event)
+		if !ok {
+			continue
+		}
+		point := documentPoint(state, gtx.Metric, event.Position)
+		touch := event.Source == pointer.Touch
+		switch event.Kind {
+		case pointer.Enter, pointer.Move, pointer.Drag:
+			state.router.Move(point, touch)
+		case pointer.Leave:
+			state.router.Move(image.Pt(-1, -1), touch)
+		case pointer.Press:
+			if touch || event.Buttons.Contain(pointer.ButtonPrimary) {
+				if state.inspecting {
+					state.inspectPointerID = int(event.PointerID)
+					state.inspectPressed = true
+					gtx.Execute(pointer.GrabCmd{Tag: &state.interactionInput, ID: event.PointerID})
+					continue
+				}
+				if state.router.Press(int(event.PointerID), point) {
+					gtx.Execute(pointer.GrabCmd{Tag: &state.interactionInput, ID: event.PointerID})
+					gtx.Execute(key.FocusCmd{Tag: &state.interactionInput})
+				}
+			}
+		case pointer.Release:
+			if state.inspecting {
+				if state.inspectPressed && state.inspectPointerID == int(event.PointerID) {
+					state.inspectPressed = false
+					state.inspectPoint = point
+					state.inspectPending = true
+				}
+				continue
+			}
+			if activation, activated := state.router.Release(int(event.PointerID), point); activated {
+				if err := runtime.Activate(activation); err != nil {
+					state.status = err.Error()
+				} else {
+					mutated = true
+				}
+			}
+		case pointer.Cancel:
+			if state.inspecting && state.inspectPointerID == int(event.PointerID) {
+				state.inspectPressed = false
+				continue
+			}
+			state.router.Cancel(int(event.PointerID))
+		}
+	}
+
+	filters := []key.Filter{
+		{Focus: &state.interactionInput, Name: key.NameTab, Optional: key.ModShift},
+		{Focus: &state.interactionInput, Name: key.NameReturn},
+		{Focus: &state.interactionInput, Name: key.NameEnter},
+		{Focus: &state.interactionInput, Name: key.NameSpace},
+		{Focus: &state.interactionInput, Name: key.NameEscape},
+	}
+	for _, filter := range filters {
+		for {
+			raw, ok := gtx.Event(filter)
+			if !ok {
+				break
+			}
+			event, ok := raw.(key.Event)
+			if !ok {
+				continue
+			}
+			if event.Name == key.NameTab && event.State == key.Press {
+				state.router.FocusNext(event.Modifiers.Contain(key.ModShift))
+				continue
+			}
+			name := ""
+			switch event.Name {
+			case key.NameReturn, key.NameEnter:
+				name = "Enter"
+			case key.NameSpace:
+				name = "Space"
+			case key.NameEscape:
+				name = "Escape"
+			}
+			var activation interaction.Activation
+			var activated bool
+			if event.State == key.Press {
+				activation, activated = state.router.KeyDown(name)
+			} else {
+				activation, activated = state.router.KeyUp(name)
+			}
+			if activated {
+				if err := runtime.Activate(activation); err != nil {
+					state.status = err.Error()
+				} else {
+					mutated = true
+				}
+			}
+		}
+	}
+	transient := state.router.Transient()
+	if transient != before {
+		runtime.SetTransient(transient)
+	}
+	if transient != before || mutated {
+		window.Invalidate()
+	}
+}
+
+func documentPoint(state *uiState, metric unit.Metric, position f32.Point) image.Point {
+	scale := state.zoomValue * metric.PxPerDp
+	if scale <= 0 {
+		scale = 1
+	}
+	origin := canvasPosition(state.canvasViewport, state.canvasSize, state.canvasPan)
+	return image.Pt(
+		int((position.X-float32(origin.X))/scale),
+		int((position.Y-float32(origin.Y))/scale),
+	)
 }
 
 func scrollDocument(runtime *Runtime, state *uiState, snapshot Snapshot, axis string, delta int) {
@@ -742,6 +901,12 @@ func layoutToolbar(gtx layout.Context, theme *material.Theme, state *uiState, sn
 							}),
 							layout.Rigid(horizontalSpace(8)),
 							layout.Rigid(toolbarButton(theme, &state.inspect, "Inspect", model.inspecting)),
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								if !snapshot.HasState {
+									return layout.Dimensions{}
+								}
+								return layout.Inset{Left: unit.Dp(8)}.Layout(gtx, toolbarButton(theme, &state.resetState, "Reset state", false))
+							}),
 							layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 								return layout.Dimensions{Size: gtx.Constraints.Min}
 							}),

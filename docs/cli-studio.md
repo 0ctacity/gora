@@ -63,20 +63,30 @@ Studio owns:
 - visual zoom, which never changes logical layout;
 - named scroll offsets;
 - the last-good resolved document;
-- current diagnostics and inspection selection.
+- current diagnostics and inspection selection;
+- independent local state for every screen, fixture, and named component instance;
+- transient button hover, press, and logical focus state.
 
 The toolbar cycles screens or fixtures, edits viewport width and height as one
 combined control (press Return to apply), changes zoom with compact minus and
 plus buttons, toggles inspect mode, and captures to an explicitly entered new
-PNG path. The center canvas is independent from the host window size. On macOS,
+PNG path. `Reset state` appears only for a selected context that declares state
+and restores that context plus its component instances. The center canvas is
+independent from the host window size. On macOS,
 hold Command while scrolling with two fingers over the canvas for smooth zoom;
 the zoom gesture exclusively owns its trackpad momentum so it cannot move the
 preview document. Unmodified two-finger movement scrolls the matching document
 axis directly: up/down targets vertical scroll nodes. Left/right pans an
 overflowing zoomed Studio canvas; when the canvas fits, it targets horizontal
-document scroll nodes instead. Studio prepaints a bounded 20% margin beyond
-both ends of the visible scroll axis so newly revealed text and images are
-warm before they enter the viewport.
+document scroll nodes instead. Retained Gio operations keep scroll-only frames
+to clip, translation, and cached replay work.
+
+Document buttons receive topmost clipped pointer hit testing. A press captures
+its pointer and activates only when released inside the same enabled button.
+Tab and Shift-Tab traverse visible enabled buttons in expanded source order;
+Enter activates on key press, Space activates on key release, and Escape
+cancels a keyboard press. Inspect mode exclusively owns clicks and clears
+document hover, press, and focus.
 
 File watching is directory-based and debounced. The watch set includes the
 entry document, imports, token modules, fonts, and images. A valid reload swaps
@@ -86,7 +96,9 @@ exist; unnamed scroll nodes reset.
 
 Inspect mode reports the deepest painted node, including its type, authored
 name when present, logical bounds, effective props, source location, clip, and
-component-instance breadcrumb. Inspection overlays are Studio-only.
+component-instance breadcrumb. For buttons it also reports semantic label,
+enabled/hovered/pressed/focused state, lexical scope, actions, and current
+scoped values. Inspection overlays are Studio-only.
 
 ## `gora render`
 
@@ -96,9 +108,10 @@ gora render <file> --output <new.png> \
 ```
 
 Rendering requires the matching live Studio session. It captures the session's
-current screen or fixture, explicit viewport, responsive result, and scroll
-offsets. Zoom, checkerboards, inspection highlighting, guides, diagnostics,
-and all Studio chrome are excluded.
+current screen or fixture, explicit viewport, responsive result, scroll
+offsets, persistent values, and current button interaction visuals. Zoom,
+checkerboards, inspection highlighting, guides, diagnostics, and all Studio
+chrome are excluded.
 
 The command refuses an existing output file. If the current source is invalid
 but Studio has a last-good frame, the command captures that visible frame and

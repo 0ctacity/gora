@@ -23,13 +23,15 @@ import (
 	"gioui.org/widget"
 	"gioui.org/widget/material"
 
+	"gora/internal/document"
 	"gora/internal/project"
 )
 
 // GioResult describes the nodes laid out into a native Gio frame.
 type GioResult struct {
-	Bounds      map[string]image.Rectangle
-	Inspections []Inspection
+	Bounds       map[string]image.Rectangle
+	Inspections  []Inspection
+	Interactions []InteractionRegion
 }
 
 type gioRenderer struct {
@@ -109,10 +111,21 @@ func captureGio(root *project.Node, viewport image.Point, state State, scale int
 }
 
 func (r *gioRenderer) layout(node *project.Node, bounds, currentClip image.Rectangle) {
+	r.layoutNode(node, bounds, currentClip, false)
+}
+
+func (r *gioRenderer) layoutFinal(node *project.Node, bounds, currentClip image.Rectangle) {
+	r.layoutNode(node, bounds, currentClip, true)
+}
+
+func (r *gioRenderer) layoutNode(node *project.Node, bounds, currentClip image.Rectangle, final bool) {
 	if node == nil || bounds.Empty() {
 		return
 	}
-	bounds = applySize(node, bounds)
+	if !final {
+		bounds = applySize(node, bounds)
+	}
+	node = buttonNodeForState(node, r.state)
 	nodeClip := currentClip.Intersect(bounds)
 	previousOpacity := r.opacity
 	r.opacity *= clamp(number(node.Props["opacity"], 1), 0, 1)
@@ -124,11 +137,36 @@ func (r *gioRenderer) layout(node *project.Node, bounds, currentClip image.Recta
 		Props: cloneMap(node.Props), Source: node.Source.File, Line: node.Source.Line,
 		Column: node.Source.Column, Breadcrumb: append([]string(nil), node.Breadcrumb...),
 	}
+	if node.Type == "button" {
+		disabled := boolValue(node.Props["disabled"], false)
+		label := stringValue(node.Props["label"], "")
+		inspection.Role, inspection.Label, inspection.Enabled, inspection.Scope = "button", label, !disabled, node.Scope
+		inspection.Actions = append([]document.Action(nil), node.On.Activate...)
+		inspection.State = cloneMap(r.state.Values[node.Scope])
+		inspection.Hovered = r.state.Hovered == node.Handle
+		inspection.Pressed = r.state.Pressed == node.Handle
+		inspection.Focused = r.state.Focused == node.Handle
+		r.result.Interactions = append(r.result.Interactions, InteractionRegion{
+			Handle: node.Handle, Bounds: bounds, Clip: nodeClip, Scope: node.Scope, Label: label,
+			Disabled: disabled, Actions: append([]document.Action(nil), node.On.Activate...),
+		})
+		if r.scene != nil {
+			r.scene.interactions = append(r.scene.interactions, sceneInteraction{
+				region:  r.result.Interactions[len(r.result.Interactions)-1],
+				scrolls: append([]sceneScroll(nil), r.scrolls...),
+			})
+		}
+	}
 	r.result.Inspections = append(r.result.Inspections, inspection)
 	if r.scene != nil {
+		var button *project.Node
+		if node.Type == "button" {
+			button = node
+		}
 		r.scene.inspections = append(r.scene.inspections, sceneInspection{
 			inspection: inspection,
 			scrolls:    append([]sceneScroll(nil), r.scrolls...),
+			button:     button,
 		})
 	}
 
@@ -144,6 +182,20 @@ func (r *gioRenderer) layout(node *project.Node, bounds, currentClip image.Recta
 		r.recordPaint(func() {
 			r.paintSurfaceGio(node, bounds, currentClip)
 		})
+		if len(node.Children) == 1 {
+			inner := inset(bounds, insets(node.Props["padding"]))
+			childBounds := r.surfaceChildBounds(node.Children[0], inner)
+			r.layout(node.Children[0], childBounds, chooseClip(node, currentClip, bounds))
+		}
+	case "button":
+		if r.scene == nil {
+			r.paintSurfaceGio(node, bounds, currentClip)
+		} else {
+			r.scene.items = append(r.scene.items, sceneItem{
+				button:  &sceneButton{node: node, bounds: bounds, clip: currentClip, opacity: r.opacity},
+				scrolls: append([]sceneScroll(nil), r.scrolls...),
+			})
+		}
 		if len(node.Children) == 1 {
 			inner := inset(bounds, insets(node.Props["padding"]))
 			childBounds := r.surfaceChildBounds(node.Children[0], inner)
@@ -222,11 +274,30 @@ func (r *gioRenderer) paintSurfaceGio(node *project.Node, bounds, currentClip im
 	if border, ok := node.Props["border"].(map[string]any); ok {
 		thickness := max(1, int(number(border["thickness"], 1)))
 		value := colorValue(border["color"], color.RGBA{A: 255})
-		r.fillRect(image.Rect(bounds.Min.X, bounds.Min.Y, bounds.Max.X, bounds.Min.Y+thickness), currentClip, value)
-		r.fillRect(image.Rect(bounds.Min.X, bounds.Max.Y-thickness, bounds.Max.X, bounds.Max.Y), currentClip, value)
-		r.fillRect(image.Rect(bounds.Min.X, bounds.Min.Y+thickness, bounds.Min.X+thickness, bounds.Max.Y-thickness), currentClip, value)
-		r.fillRect(image.Rect(bounds.Max.X-thickness, bounds.Min.Y+thickness, bounds.Max.X, bounds.Max.Y-thickness), currentClip, value)
+		r.paintRoundedBorder(bounds, currentClip, value, thickness, radiusValue(node.Props["radius"]))
 	}
+}
+
+func (r *gioRenderer) paintRoundedBorder(bounds, currentClip image.Rectangle, value color.Color, thickness, radius int) {
+	pixelBounds := r.pxRect(bounds)
+	pixelClip := r.pxRect(currentClip.Intersect(bounds))
+	if pixelClip.Empty() {
+		return
+	}
+	pixelThickness := max(1, r.gtx.Dp(unit.Dp(thickness)))
+	clipStack := clip.Rect(pixelClip).Push(r.gtx.Ops)
+	roundStack := clip.UniformRRect(pixelBounds, r.gtx.Dp(unit.Dp(radius))).Push(r.gtx.Ops)
+	colorValue := r.nrgba(value)
+	for _, edge := range []image.Rectangle{
+		image.Rect(pixelBounds.Min.X, pixelBounds.Min.Y, pixelBounds.Max.X, pixelBounds.Min.Y+pixelThickness),
+		image.Rect(pixelBounds.Min.X, pixelBounds.Max.Y-pixelThickness, pixelBounds.Max.X, pixelBounds.Max.Y),
+		image.Rect(pixelBounds.Min.X, pixelBounds.Min.Y+pixelThickness, pixelBounds.Min.X+pixelThickness, pixelBounds.Max.Y-pixelThickness),
+		image.Rect(pixelBounds.Max.X-pixelThickness, pixelBounds.Min.Y+pixelThickness, pixelBounds.Max.X, pixelBounds.Max.Y-pixelThickness),
+	} {
+		paint.FillShape(r.gtx.Ops, colorValue, clip.Rect(edge).Op())
+	}
+	roundStack.Pop()
+	clipStack.Pop()
 }
 
 func shadowLayers(bounds image.Rectangle, shadow map[string]any) []shadowLayer {
@@ -420,6 +491,10 @@ func releaseNativeFonts(theme *material.Theme) {
 }
 
 func (r *gioRenderer) intrinsicSize(node *project.Node, limit image.Point) image.Point {
+	return measureIntrinsic(node, limit, r.intrinsicLeafSize)
+}
+
+func (r *gioRenderer) intrinsicLeafSize(node *project.Node, limit image.Point) image.Point {
 	switch node.Type {
 	case "text":
 		label := r.label(node)
@@ -442,8 +517,19 @@ func (r *gioRenderer) intrinsicSize(node *project.Node, limit image.Point) image
 			return image.Pt(thickness, limit.Y)
 		}
 		return image.Pt(limit.X, thickness)
+	case "image":
+		source := stringValue(node.Props["src"], "")
+		if source != "" {
+			if !filepath.IsAbs(source) {
+				source = filepath.Join(filepath.Dir(node.Source.File), source)
+			}
+			if decoded, err := loadImage(source); err == nil {
+				return decoded.Bounds().Size()
+			}
+		}
+		return image.Point{}
 	default:
-		return image.Pt(int(number(node.Props["width"], 0)), int(number(node.Props["height"], 0)))
+		return image.Point{}
 	}
 }
 
@@ -511,107 +597,8 @@ func gioDirection(value string) layout.Direction {
 }
 
 func (r *gioRenderer) stackGio(node *project.Node, bounds, currentClip image.Rectangle) {
-	inner := inset(bounds, insets(node.Props["padding"]))
-	gap := int(number(node.Props["gap"], 0))
-	vertical := stringValue(node.Props["direction"], "vertical") != "horizontal"
-	available := inner.Dx()
-	if vertical {
-		available = inner.Dy()
-	}
-	available -= gap * max(0, len(node.Children)-1)
-	sizes := make([]int, len(node.Children))
-	var flexible []int
-	growTotal := 0.0
-	for index, child := range node.Children {
-		key := "width"
-		limit := image.Pt(1<<20, inner.Dy())
-		if vertical {
-			key = "height"
-			limit = image.Pt(inner.Dx(), 1<<20)
-		}
-		if size := int(number(child.Props[key], 0)); size > 0 {
-			sizes[index] = size
-			available -= size
-			continue
-		}
-		intrinsic := r.intrinsicSize(child, limit)
-		size := intrinsic.X
-		if vertical {
-			size = intrinsic.Y
-		}
-		if size > 0 {
-			sizes[index] = size
-			available -= size
-			continue
-		}
-		flexible = append(flexible, index)
-		weight := math.Max(0, number(child.Place["grow"], 1))
-		growTotal += weight
-	}
-	remaining := max(0, available)
-	assigned := 0
-	for index, childIndex := range flexible {
-		weight := math.Max(0, number(node.Children[childIndex].Place["grow"], 1))
-		size := 0
-		if index == len(flexible)-1 {
-			size = remaining - assigned
-		} else if growTotal > 0 {
-			size = int(math.Floor(float64(remaining) * weight / growTotal))
-			assigned += size
-		}
-		sizes[childIndex] = size
-	}
-	used := gap * max(0, len(node.Children)-1)
-	for _, size := range sizes {
-		used += size
-	}
-	mainSize := inner.Dx()
-	if vertical {
-		mainSize = inner.Dy()
-	}
-	spare := max(0, mainSize-used)
-	cursor := 0
-	switch stringValue(node.Props["distribution"], "start") {
-	case "center":
-		cursor = spare / 2
-	case "end":
-		cursor = spare
-	case "space_between":
-		if len(node.Children) > 1 {
-			gap += spare / (len(node.Children) - 1)
-		}
-	case "space_around":
-		if len(node.Children) > 0 {
-			gap += spare / len(node.Children)
-			cursor = gap / 2
-		}
-	}
-	alignment := stringValue(node.Props["alignment"], "stretch")
-	for index, child := range node.Children {
-		childBounds := inner
-		if vertical {
-			childBounds.Min.Y += cursor
-			childBounds.Max.Y = childBounds.Min.Y + sizes[index]
-			width := int(number(child.Props["width"], 0))
-			if width <= 0 && alignment != "stretch" {
-				width = r.intrinsicSize(child, inner.Size()).X
-			}
-			if width > 0 && width < inner.Dx() {
-				childBounds = alignCross(childBounds, width, true, alignment)
-			}
-		} else {
-			childBounds.Min.X += cursor
-			childBounds.Max.X = childBounds.Min.X + sizes[index]
-			height := int(number(child.Props["height"], 0))
-			if height <= 0 && alignment != "stretch" {
-				height = r.intrinsicSize(child, inner.Size()).Y
-			}
-			if height > 0 && height < inner.Dy() {
-				childBounds = alignCross(childBounds, height, false, alignment)
-			}
-		}
-		r.layout(child, childBounds, currentClip)
-		cursor += sizes[index] + gap
+	for index, childBounds := range planStack(node, bounds, r.intrinsicSize) {
+		r.layoutFinal(node.Children[index], childBounds, currentClip)
 	}
 }
 
@@ -691,15 +678,13 @@ func (r *gioRenderer) scrollGio(node *project.Node, bounds, currentClip image.Re
 	offset := r.state.Scroll[scrollKey(node)]
 	axis := stringValue(node.Props["axis"], "vertical")
 	childBounds := bounds
-	contentSize := bounds.Dy()
+	contentSize := scrollContentSize(node.Children[0], bounds, axis, r.intrinsicSize)
 	if axis == "vertical" {
-		contentSize = max(int(number(node.Children[0].Props["height"], float64(bounds.Dy()))), bounds.Dy())
 		offset.Y = min(max(0, offset.Y), contentSize-bounds.Dy())
 		offset.X = 0
 		childBounds = bounds.Sub(offset)
 		childBounds.Max.Y = childBounds.Min.Y + contentSize
 	} else {
-		contentSize = max(int(number(node.Children[0].Props["width"], float64(bounds.Dx()))), bounds.Dx())
 		offset.X = min(max(0, offset.X), contentSize-bounds.Dx())
 		offset.Y = 0
 		childBounds = bounds.Sub(offset)
@@ -726,7 +711,7 @@ func (r *gioRenderer) scrollGio(node *project.Node, bounds, currentClip image.Re
 			contentSize: contentSize,
 		}
 		r.scrolls = append(r.scrolls, scroll)
-		r.layout(node.Children[0], childBounds, contentClip)
+		r.layoutFinal(node.Children[0], childBounds, contentClip)
 		r.scrolls = r.scrolls[:len(r.scrolls)-1]
 		if boolValue(node.Props["scrollbar"], false) && contentSize > scroll.viewportSize() {
 			r.scene.items = append(r.scene.items, sceneItem{
@@ -744,7 +729,7 @@ func (r *gioRenderer) scrollGio(node *project.Node, bounds, currentClip image.Re
 	visibleClip, prepaintClip := scrollClips(currentClip.Intersect(bounds), childBounds, axis)
 	hardClip := clip.Rect(r.pxRect(visibleClip)).Push(r.gtx.Ops)
 	firstInspection := len(r.result.Inspections)
-	r.layout(node.Children[0], childBounds, prepaintClip)
+	r.layoutFinal(node.Children[0], childBounds, prepaintClip)
 	hardClip.Pop()
 	for index := firstInspection; index < len(r.result.Inspections); index++ {
 		r.result.Inspections[index].Clip = r.result.Inspections[index].Clip.Intersect(visibleClip)

@@ -43,6 +43,7 @@ func Parse(file string, src []byte) (*Document, []Diagnostic) {
 		Slots:       make(map[string]Slot),
 		Previews:    make(map[string]Preview),
 		Tokens:      make(map[string]map[string]any),
+		State:       make(map[string]StateDeclaration),
 		Imports: Imports{
 			Components: make(map[string]string),
 			Tokens:     make(map[string]string),
@@ -59,6 +60,7 @@ func Parse(file string, src []byte) (*Document, []Diagnostic) {
 	parseImports(file, m["imports"], &doc.Imports, &diagnostics)
 	doc.Viewport = parseViewport(file, m["viewport"], doc.Kind != KindTokens, &diagnostics)
 	doc.Breakpoints = parseBreakpoints(file, m["breakpoints"], &diagnostics)
+	doc.State = parseState(file, m["state"], &diagnostics)
 
 	switch doc.Kind {
 	case KindApp:
@@ -90,7 +92,7 @@ func Parse(file string, src []byte) (*Document, []Diagnostic) {
 }
 
 func topLevelFields() []string {
-	return []string{"gora", "kind", "name", "imports", "viewport", "breakpoints", "entry", "screens", "parameters", "slots", "previews", "root", "tokens"}
+	return []string{"gora", "kind", "name", "imports", "viewport", "breakpoints", "entry", "screens", "parameters", "slots", "previews", "root", "tokens", "state"}
 }
 
 func parseImports(file string, n *yaml.Node, out *Imports, diagnostics *[]Diagnostic) {
@@ -184,7 +186,7 @@ func parseNode(file string, n *yaml.Node, path string, required bool, diagnostic
 		}
 		return nil
 	}
-	m := mapping(file, n, []string{"type", "name", "props", "place", "responsive", "children"}, diagnostics)
+	m := mapping(file, n, []string{"type", "name", "props", "place", "responsive", "children", "on", "variants"}, diagnostics)
 	node := &Node{
 		Type:       stringField(file, m, "type", true, diagnostics),
 		Name:       stringField(file, m, "name", false, diagnostics),
@@ -192,6 +194,8 @@ func parseNode(file string, n *yaml.Node, path string, required bool, diagnostic
 		Place:      valueMap(file, m["place"], diagnostics),
 		Responsive: parseResponsive(file, m["responsive"], diagnostics),
 		Source:     source(file, n),
+		On:         parseEvents(file, m["on"], diagnostics),
+		Variants:   parseVariants(file, m["variants"], diagnostics),
 	}
 	if children := m["children"]; children != nil {
 		if children.Kind != yaml.SequenceNode {
@@ -203,6 +207,110 @@ func parseNode(file string, n *yaml.Node, path string, required bool, diagnostic
 		}
 	}
 	return node
+}
+
+func parseState(file string, n *yaml.Node, diagnostics *[]Diagnostic) map[string]StateDeclaration {
+	out := make(map[string]StateDeclaration)
+	if n == nil {
+		return out
+	}
+	for name, raw := range rawMapping(file, n, diagnostics) {
+		m := mapping(file, raw, []string{"type", "default", "values"}, diagnostics)
+		declaration := StateDeclaration{
+			Type:   stringField(file, m, "type", true, diagnostics),
+			Source: source(file, raw),
+		}
+		if m["values"] != nil {
+			declaration.Values = stringSlice(file, m["values"], diagnostics)
+		}
+		if m["default"] == nil {
+			addNodeDiagnostic(file, raw, "schema.required", fmt.Sprintf("state %q requires default", name), nil, diagnostics)
+		} else {
+			declaration.Default = valueOf(file, m["default"], diagnostics)
+		}
+		out[name] = declaration
+	}
+	return out
+}
+
+func parseEvents(file string, n *yaml.Node, diagnostics *[]Diagnostic) Events {
+	if n == nil {
+		return Events{}
+	}
+	m := mapping(file, n, []string{"activate"}, diagnostics)
+	return Events{Activate: parseActions(file, m["activate"], diagnostics)}
+}
+
+func parseActions(file string, n *yaml.Node, diagnostics *[]Diagnostic) []Action {
+	if n == nil {
+		return nil
+	}
+	if n.Kind != yaml.SequenceNode {
+		addNodeDiagnostic(file, n, "schema.type", "activate actions must be a list", nil, diagnostics)
+		return nil
+	}
+	out := make([]Action, 0, len(n.Content))
+	for _, raw := range n.Content {
+		m := mapping(file, raw, []string{"action", "state", "value", "by"}, diagnostics)
+		action := Action{
+			Action: stringField(file, m, "action", true, diagnostics),
+			State:  stringField(file, m, "state", true, diagnostics),
+			Value:  valueOf(file, m["value"], diagnostics),
+			By:     valueOf(file, m["by"], diagnostics),
+			Source: source(file, raw),
+		}
+		switch action.Action {
+		case "set":
+			if m["value"] == nil || m["by"] != nil {
+				addNodeDiagnostic(file, raw, "action.fields", "set requires value and does not accept by", nil, diagnostics)
+			}
+		case "toggle", "reset":
+			if m["value"] != nil || m["by"] != nil {
+				addNodeDiagnostic(file, raw, "action.fields", action.Action+" does not accept value or by", nil, diagnostics)
+			}
+		case "increment", "decrement":
+			if m["value"] != nil {
+				addNodeDiagnostic(file, raw, "action.fields", action.Action+" does not accept value", nil, diagnostics)
+			}
+		}
+		out = append(out, action)
+	}
+	return out
+}
+
+func parseVariants(file string, n *yaml.Node, diagnostics *[]Diagnostic) []Variant {
+	if n == nil {
+		return nil
+	}
+	if n.Kind != yaml.SequenceNode {
+		addNodeDiagnostic(file, n, "schema.type", "variants must be a list", nil, diagnostics)
+		return nil
+	}
+	var out []Variant
+	operators := []string{"equals", "not_equals", "less_than", "less_than_or_equal", "greater_than", "greater_than_or_equal"}
+	for _, raw := range n.Content {
+		m := mapping(file, raw, []string{"when", "props", "place", "visible"}, diagnostics)
+		when := mapping(file, m["when"], append([]string{"state", "interaction"}, operators...), diagnostics)
+		condition := Condition{State: stringField(file, when, "state", false, diagnostics), Interaction: stringField(file, when, "interaction", false, diagnostics), Source: source(file, m["when"])}
+		operatorCount := 0
+		for _, operator := range operators {
+			if when[operator] != nil {
+				operatorCount++
+				condition.Operator = operator
+				condition.Value = valueOf(file, when[operator], diagnostics)
+			}
+		}
+		if (condition.State == "") == (condition.Interaction == "") || condition.State != "" && operatorCount != 1 || condition.Interaction != "" && operatorCount != 0 {
+			addNodeDiagnostic(file, m["when"], "variant.condition", "when requires either one state comparison or one interaction condition", nil, diagnostics)
+		}
+		variant := Variant{When: condition, Props: valueMap(file, m["props"], diagnostics), Place: valueMap(file, m["place"], diagnostics), Source: source(file, raw)}
+		if m["visible"] != nil {
+			value := boolNode(file, m["visible"], diagnostics)
+			variant.Visible = &value
+		}
+		out = append(out, variant)
+	}
+	return out
 }
 
 func parseResponsive(file string, n *yaml.Node, diagnostics *[]Diagnostic) map[string]Responsive {
@@ -236,7 +344,7 @@ func parseParameters(file string, n *yaml.Node, diagnostics *[]Diagnostic) map[s
 		p := Parameter{
 			Type:     stringField(file, m, "type", true, diagnostics),
 			Required: boolField(file, m, "required", false, diagnostics),
-			Default:  scalarValue(file, m["default"], diagnostics),
+			Default:  valueOf(file, m["default"], diagnostics),
 			Source:   source(file, value),
 		}
 		if values := m["values"]; values != nil {
@@ -265,8 +373,8 @@ func parsePreviews(file string, n *yaml.Node, diagnostics *[]Diagnostic) map[str
 		return out
 	}
 	for key, value := range rawMapping(file, n, diagnostics) {
-		m := mapping(file, value, []string{"viewport", "parameters", "children"}, diagnostics)
-		p := Preview{Parameters: valueMap(file, m["parameters"], diagnostics), Source: source(file, value)}
+		m := mapping(file, value, []string{"viewport", "parameters", "children", "state"}, diagnostics)
+		p := Preview{Parameters: valueMap(file, m["parameters"], diagnostics), State: valueMap(file, m["state"], diagnostics), Source: source(file, value)}
 		if viewport := m["viewport"]; viewport != nil {
 			v := parseViewport(file, viewport, true, diagnostics)
 			p.Viewport = &v
@@ -413,17 +521,53 @@ func validateDocument(doc *Document, diagnostics *[]Diagnostic) {
 			*diagnostics = append(*diagnostics, diagnostic(doc.File, "parameter.default", fmt.Sprintf("parameter %q default does not match %s", name, parameter.Type), parameter.Source.Line, parameter.Source.Column))
 		}
 	}
+	stateTypes := []string{"boolean", "number", "text", "enum"}
+	for name, declaration := range doc.State {
+		if !contains(stateTypes, declaration.Type) {
+			d := diagnostic(doc.File, "state.type", fmt.Sprintf("state %q has unsupported type %q", name, declaration.Type), declaration.Source.Line, declaration.Source.Column)
+			d.Suggestions = nearest(declaration.Type, stateTypes)
+			*diagnostics = append(*diagnostics, d)
+		}
+		if declaration.Type == "enum" && len(declaration.Values) == 0 {
+			*diagnostics = append(*diagnostics, diagnostic(doc.File, "state.enum", fmt.Sprintf("enum state %q requires values", name), declaration.Source.Line, declaration.Source.Column))
+		}
+		if declaration.Type == "enum" {
+			seen := make(map[string]bool, len(declaration.Values))
+			for _, value := range declaration.Values {
+				if seen[value] {
+					*diagnostics = append(*diagnostics, diagnostic(doc.File, "state.enum_duplicate", fmt.Sprintf("enum state %q repeats value %q", name, value), declaration.Source.Line, declaration.Source.Column))
+				}
+				seen[value] = true
+			}
+		}
+		if declaration.Type != "enum" && len(declaration.Values) != 0 {
+			*diagnostics = append(*diagnostics, diagnostic(doc.File, "state.values", fmt.Sprintf("only enum state %q may declare values", name), declaration.Source.Line, declaration.Source.Column))
+		}
+		if !isReferenceValue(declaration.Default) && !stateValueMatches(declaration, declaration.Default) {
+			*diagnostics = append(*diagnostics, diagnostic(doc.File, "state.default", fmt.Sprintf("state %q default does not match %s", name, declaration.Type), declaration.Source.Line, declaration.Source.Column))
+		}
+	}
+	for fixtureName, preview := range doc.Previews {
+		for name, value := range preview.State {
+			declaration, ok := doc.State[name]
+			if !ok {
+				*diagnostics = append(*diagnostics, diagnostic(doc.File, "state.unknown", fmt.Sprintf("preview %q overrides unknown state %q", fixtureName, name), preview.Source.Line, preview.Source.Column))
+			} else if !isReferenceValue(value) && !stateValueMatches(declaration, value) {
+				*diagnostics = append(*diagnostics, diagnostic(doc.File, "state.fixture", fmt.Sprintf("preview %q state %q has the wrong type", fixtureName, name), preview.Source.Line, preview.Source.Column))
+			}
+		}
+	}
 	validateTokens(doc, diagnostics)
 	if doc.Kind == KindComponent && len(doc.Previews) == 0 {
 		*diagnostics = append(*diagnostics, diagnostic(doc.File, "component.preview", "component documents require at least one named preview fixture", 1, 1))
 	}
 
-	var walk func(*Node)
-	walk = func(node *Node) {
+	var walk func(*Node, string)
+	walk = func(node *Node, parentType string) {
 		if node == nil {
 			return
 		}
-		nodeTypes := []string{"stack", "grid", "overlay", "scroll", "surface", "text", "image", "spacer", "divider", "instance", "slot", "slot_content"}
+		nodeTypes := []string{"stack", "grid", "overlay", "scroll", "surface", "button", "text", "image", "spacer", "divider", "instance", "slot", "slot_content"}
 		if !contains(nodeTypes, node.Type) {
 			d := diagnostic(doc.File, "schema.node_type", fmt.Sprintf("unknown node type %q", node.Type), node.Source.Line, node.Source.Column)
 			d.NodeName = node.Name
@@ -431,10 +575,27 @@ func validateDocument(doc *Document, diagnostics *[]Diagnostic) {
 			*diagnostics = append(*diagnostics, d)
 		}
 		validateNodeFields(node, diagnostics)
+		validateChildPlacement(node, parentType, diagnostics)
 		switch node.Type {
 		case "surface":
 			if len(node.Children) > 1 {
 				*diagnostics = append(*diagnostics, nodeDiagnostic(node, "schema.children", "surface accepts at most one child"))
+			}
+		case "button":
+			label, _ := node.Props["label"].(string)
+			if strings.TrimSpace(label) == "" {
+				*diagnostics = append(*diagnostics, nodeDiagnostic(node, "button.label", "button requires a non-empty label"))
+			}
+			if len(node.Children) != 1 {
+				*diagnostics = append(*diagnostics, nodeDiagnostic(node, "schema.children", "button requires exactly one visual child"))
+			}
+			if len(node.Children) == 1 && containsNodeType(node.Children[0], "button") {
+				*diagnostics = append(*diagnostics, nodeDiagnostic(node, "button.nested", "buttons cannot contain interactive descendants"))
+			}
+			if disabled, exists := node.Props["disabled"]; exists {
+				if _, ok := disabled.(bool); !ok && !isReferenceValue(disabled) {
+					*diagnostics = append(*diagnostics, nodeDiagnostic(node, "button.disabled", "button disabled must be true, false, or a compatible state reference"))
+				}
 			}
 		case "scroll":
 			if len(node.Children) != 1 {
@@ -466,6 +627,7 @@ func validateDocument(doc *Document, diagnostics *[]Diagnostic) {
 				}
 			}
 		}
+		validateInteractionNode(doc, node, diagnostics)
 		for breakpoint := range node.Responsive {
 			if _, ok := doc.Breakpoints[breakpoint]; !ok {
 				d := nodeDiagnostic(node, "responsive.breakpoint", fmt.Sprintf("unknown breakpoint %q", breakpoint))
@@ -474,18 +636,118 @@ func validateDocument(doc *Document, diagnostics *[]Diagnostic) {
 			}
 		}
 		for _, child := range node.Children {
-			walk(child)
+			walk(child, node.Type)
 		}
 	}
 	for _, screen := range doc.Screens {
-		walk(screen)
+		walk(screen, "")
 	}
-	walk(doc.Root)
+	walk(doc.Root, "")
 	for _, preview := range doc.Previews {
 		for _, child := range preview.Children {
-			walk(child)
+			walk(child, "")
 		}
 	}
+}
+
+func stateValueMatches(declaration StateDeclaration, value any) bool {
+	switch declaration.Type {
+	case "boolean":
+		_, ok := value.(bool)
+		return ok
+	case "number":
+		_, ok := finiteNumber(value)
+		return ok
+	case "text":
+		_, ok := value.(string)
+		return ok
+	case "enum":
+		text, ok := value.(string)
+		return ok && contains(declaration.Values, text)
+	default:
+		return false
+	}
+}
+
+func validateInteractionNode(doc *Document, node *Node, diagnostics *[]Diagnostic) {
+	if len(node.On.Activate) != 0 && node.Type != "button" {
+		*diagnostics = append(*diagnostics, nodeDiagnostic(node, "action.node", "only buttons may declare activate actions"))
+	}
+	for _, action := range node.On.Activate {
+		declaration, ok := doc.State[action.State]
+		if !ok {
+			*diagnostics = append(*diagnostics, diagnostic(doc.File, "state.unknown", fmt.Sprintf("action targets unknown state %q", action.State), action.Source.Line, action.Source.Column))
+			continue
+		}
+		switch action.Action {
+		case "set":
+			if action.Value == nil || !isReferenceValue(action.Value) && !stateValueMatches(declaration, action.Value) {
+				*diagnostics = append(*diagnostics, diagnostic(doc.File, "action.type", fmt.Sprintf("set value does not match state %q", action.State), action.Source.Line, action.Source.Column))
+			}
+		case "toggle":
+			if declaration.Type != "boolean" {
+				*diagnostics = append(*diagnostics, diagnostic(doc.File, "action.type", fmt.Sprintf("toggle requires boolean state, got %q", action.State), action.Source.Line, action.Source.Column))
+			}
+		case "increment", "decrement":
+			if declaration.Type != "number" {
+				*diagnostics = append(*diagnostics, diagnostic(doc.File, "action.type", fmt.Sprintf("%s requires number state, got %q", action.Action, action.State), action.Source.Line, action.Source.Column))
+			}
+			if action.By != nil && !isReferenceValue(action.By) {
+				if amount, ok := finiteNumber(action.By); !ok || amount < 0 {
+					*diagnostics = append(*diagnostics, diagnostic(doc.File, "action.by", "action by must be a finite non-negative number", action.Source.Line, action.Source.Column))
+				}
+			}
+		case "reset":
+		default:
+			d := diagnostic(doc.File, "action.unknown", fmt.Sprintf("unknown action %q", action.Action), action.Source.Line, action.Source.Column)
+			d.Suggestions = nearest(action.Action, []string{"set", "toggle", "increment", "decrement", "reset"})
+			*diagnostics = append(*diagnostics, d)
+		}
+	}
+	comparisons := []string{"equals", "not_equals", "less_than", "less_than_or_equal", "greater_than", "greater_than_or_equal"}
+	for _, variant := range node.Variants {
+		condition := variant.When
+		if condition.Interaction != "" {
+			if node.Type != "button" || !contains([]string{"hovered", "pressed", "focused", "disabled"}, condition.Interaction) {
+				*diagnostics = append(*diagnostics, diagnostic(doc.File, "variant.interaction", "interaction variants are valid only for button hovered, pressed, focused, or disabled", condition.Source.Line, condition.Source.Column))
+			}
+			for key := range variant.Props {
+				if !contains([]string{"background", "border", "shadow", "opacity"}, key) {
+					*diagnostics = append(*diagnostics, diagnostic(doc.File, "variant.transient", fmt.Sprintf("interaction variants cannot override %q", key), variant.Source.Line, variant.Source.Column))
+				}
+			}
+			if len(variant.Place) != 0 || variant.Visible != nil {
+				*diagnostics = append(*diagnostics, diagnostic(doc.File, "variant.transient", "interaction variants cannot override placement or visibility", variant.Source.Line, variant.Source.Column))
+			}
+			continue
+		}
+		declaration, ok := doc.State[condition.State]
+		if !ok {
+			*diagnostics = append(*diagnostics, diagnostic(doc.File, "state.unknown", fmt.Sprintf("variant references unknown state %q", condition.State), condition.Source.Line, condition.Source.Column))
+			continue
+		}
+		if !contains(comparisons, condition.Operator) || !isReferenceValue(condition.Value) && !stateValueMatches(declaration, condition.Value) {
+			*diagnostics = append(*diagnostics, diagnostic(doc.File, "variant.condition", "variant comparison does not match its state", condition.Source.Line, condition.Source.Column))
+		}
+		if condition.Operator != "equals" && condition.Operator != "not_equals" && declaration.Type != "number" {
+			*diagnostics = append(*diagnostics, diagnostic(doc.File, "variant.condition", "ordering comparisons require number state", condition.Source.Line, condition.Source.Column))
+		}
+	}
+}
+
+func containsNodeType(node *Node, nodeType string) bool {
+	if node == nil {
+		return false
+	}
+	if node.Type == nodeType {
+		return true
+	}
+	for _, child := range node.Children {
+		if containsNodeType(child, nodeType) {
+			return true
+		}
+	}
+	return false
 }
 
 func documentParameterValueMatches(parameter Parameter, value any) bool {
@@ -496,9 +758,11 @@ func documentParameterValueMatches(parameter Parameter, value any) bool {
 	case "color":
 		text, ok := value.(string)
 		return ok && validColor(text)
-	case "number", "dimension":
+	case "number":
 		_, ok := finiteNumber(value)
 		return ok
+	case "dimension":
+		return validDimensionValue(value, false)
 	case "boolean":
 		_, ok := value.(bool)
 		return ok
@@ -515,9 +779,9 @@ func validateKindFields(file string, root *yaml.Node, kind Kind, diagnostics *[]
 	allowed := append([]string(nil), common...)
 	switch kind {
 	case KindApp:
-		allowed = append(allowed, "viewport", "breakpoints", "entry", "screens")
+		allowed = append(allowed, "viewport", "breakpoints", "entry", "screens", "state")
 	case KindComponent:
-		allowed = append(allowed, "viewport", "breakpoints", "parameters", "slots", "previews", "root")
+		allowed = append(allowed, "viewport", "breakpoints", "parameters", "slots", "previews", "root", "state")
 	case KindTokens:
 		allowed = append(allowed, "tokens")
 	default:
@@ -538,9 +802,7 @@ func validateTokens(doc *Document, diagnostics *[]Diagnostic) {
 		}
 	}
 	for name, value := range doc.Tokens["dimension"] {
-		switch value.(type) {
-		case int64, float64:
-		default:
+		if !validDimensionValue(value, false) {
 			*diagnostics = append(*diagnostics, diagnostic(doc.File, "token.dimension", fmt.Sprintf("dimension token %q must be a finite number", name), 1, 1))
 		}
 	}
@@ -610,13 +872,14 @@ func validateTokenFields(doc *Document, kind, name string, value map[string]any,
 }
 
 func validateNodeFields(node *Node, diagnostics *[]Diagnostic) {
-	common := []string{"width", "height", "min_width", "max_width", "min_height", "max_height", "opacity"}
+	common := []string{"width", "height", "min_width", "max_width", "min_height", "max_height", "aspect_ratio", "opacity"}
 	byType := map[string][]string{
-		"stack":        {"direction", "padding", "gap", "alignment", "distribution"},
+		"stack":        {"direction", "padding", "gap", "row_gap", "column_gap", "wrap", "alignment", "distribution"},
 		"grid":         {"columns", "rows", "gap", "column_gap", "row_gap"},
 		"overlay":      {"alignment"},
 		"scroll":       {"axis", "scrollbar"},
 		"surface":      {"padding", "background", "border", "radius", "shadow", "clip"},
+		"button":       {"label", "disabled", "padding", "background", "border", "radius", "shadow", "clip"},
 		"text":         {"text", "content", "style", "font", "size", "weight", "italic", "color", "alignment", "line_height", "letter_spacing", "wrap", "max_lines", "overflow", "background"},
 		"image":        {"src", "fit", "alignment"},
 		"spacer":       {},
@@ -635,7 +898,7 @@ func validateNodeFields(node *Node, diagnostics *[]Diagnostic) {
 	}
 	validateReferenceObjects(node, node.Props, diagnostics)
 	validateReferenceObjects(node, node.Place, diagnostics)
-	placeFields := []string{"x", "y", "offset_x", "offset_y", "alignment", "grow", "row", "column", "row_span", "column_span"}
+	placeFields := []string{"x", "y", "offset_x", "offset_y", "alignment", "basis", "grow", "shrink", "row", "column", "row_span", "column_span"}
 	for key := range node.Place {
 		if !contains(placeFields, key) {
 			d := nodeDiagnostic(node, "schema.place", fmt.Sprintf("unknown placement field %q", key))
@@ -660,6 +923,40 @@ func validateNodeFields(node *Node, diagnostics *[]Diagnostic) {
 				*diagnostics = append(*diagnostics, d)
 			}
 		}
+		responsiveNode := *node
+		responsiveNode.Props = responsive.Props
+		responsiveNode.Place = responsive.Place
+		responsiveNode.Responsive = nil
+		validatePrimitiveValues(&responsiveNode, diagnostics)
+	}
+	for _, variant := range node.Variants {
+		validateReferenceObjects(node, variant.Props, diagnostics)
+		validateReferenceObjects(node, variant.Place, diagnostics)
+		validateReferenceObjects(node, variant.When.Value, diagnostics)
+		for key := range variant.Props {
+			if !contains(allowed, key) {
+				d := nodeDiagnostic(node, "schema.prop", fmt.Sprintf("unknown variant %s prop %q", node.Type, key))
+				d.Suggestions = nearest(key, allowed)
+				*diagnostics = append(*diagnostics, d)
+			}
+		}
+		for key := range variant.Place {
+			if !contains(placeFields, key) {
+				d := nodeDiagnostic(node, "schema.place", fmt.Sprintf("unknown variant placement field %q", key))
+				d.Suggestions = nearest(key, placeFields)
+				*diagnostics = append(*diagnostics, d)
+			}
+		}
+		variantNode := *node
+		variantNode.Props = variant.Props
+		variantNode.Place = variant.Place
+		variantNode.Responsive = nil
+		variantNode.Variants = nil
+		validatePrimitiveValues(&variantNode, diagnostics)
+	}
+	for _, action := range node.On.Activate {
+		validateReferenceObjects(node, action.Value, diagnostics)
+		validateReferenceObjects(node, action.By, diagnostics)
 	}
 	validatePrimitiveValues(node, diagnostics)
 }
@@ -681,6 +978,11 @@ func validatePrimitiveValues(node *Node, diagnostics *[]Diagnostic) {
 		enum("direction", []string{"horizontal", "vertical"})
 		enum("alignment", []string{"start", "center", "end", "stretch"})
 		enum("distribution", []string{"start", "center", "end", "space_between", "space_around"})
+		if value, exists := node.Props["wrap"]; exists {
+			if _, ok := value.(bool); !ok && !isReferenceValue(value) {
+				*diagnostics = append(*diagnostics, nodeDiagnostic(node, "schema.prop_value", "stack.wrap must be true or false"))
+			}
+		}
 	case "scroll":
 		enum("axis", []string{"horizontal", "vertical"})
 	case "image":
@@ -736,15 +1038,12 @@ func validatePrimitiveValues(node *Node, diagnostics *[]Diagnostic) {
 		if isReferenceValue(value) {
 			continue
 		}
-		if text, ok := value.(string); ok {
-			if text != "auto" && text != "fill" {
-				*diagnostics = append(*diagnostics, nodeDiagnostic(node, "schema.size", fmt.Sprintf("%s must be a non-negative number, auto, or fill", key)))
-			}
-			continue
-		}
-		if number, ok := finiteNumber(value); !ok || number < 0 {
+		if !validDimensionValue(value, true) {
 			*diagnostics = append(*diagnostics, nodeDiagnostic(node, "schema.size", fmt.Sprintf("%s must be a non-negative number, auto, or fill", key)))
 		}
+	}
+	if value, exists := node.Props["aspect_ratio"]; exists && !isReferenceValue(value) && !validAspectRatio(value) {
+		*diagnostics = append(*diagnostics, nodeDiagnostic(node, "schema.aspect_ratio", "aspect_ratio must contain positive width and height"))
 	}
 	for _, key := range []string{"gap", "column_gap", "row_gap", "thickness"} {
 		if value, exists := node.Props[key]; exists {
@@ -763,7 +1062,7 @@ func validatePrimitiveValues(node *Node, diagnostics *[]Diagnostic) {
 			}
 		}
 	}
-	for _, key := range []string{"grow", "row", "column", "row_span", "column_span"} {
+	for _, key := range []string{"grow", "shrink", "row", "column", "row_span", "column_span"} {
 		if value, exists := node.Place[key]; exists {
 			if isReferenceValue(value) {
 				continue
@@ -773,8 +1072,84 @@ func validatePrimitiveValues(node *Node, diagnostics *[]Diagnostic) {
 			}
 		}
 	}
+	if value, exists := node.Place["basis"]; exists && !isReferenceValue(value) && !validBasisValue(value) {
+		*diagnostics = append(*diagnostics, nodeDiagnostic(node, "schema.prop_value", "place.basis must be auto, a non-negative number, or a percentage"))
+	}
 	validateMinMax(node, "width", diagnostics)
 	validateMinMax(node, "height", diagnostics)
+}
+
+func validDimensionValue(value any, allowSizingKeywords bool) bool {
+	if isReferenceValue(value) {
+		return true
+	}
+	if number, ok := finiteNumber(value); ok {
+		return number >= 0
+	}
+	if text, ok := value.(string); ok {
+		return allowSizingKeywords && (text == "auto" || text == "fill")
+	}
+	mapping, ok := value.(map[string]any)
+	if !ok || len(mapping) != 1 {
+		return false
+	}
+	percent, exists := mapping["percent"]
+	if !exists {
+		return false
+	}
+	if isReferenceValue(percent) {
+		return true
+	}
+	number, ok := finiteNumber(percent)
+	return ok && number >= 0
+}
+
+func validBasisValue(value any) bool {
+	if text, ok := value.(string); ok {
+		return text == "auto"
+	}
+	return validDimensionValue(value, false)
+}
+
+func validAspectRatio(value any) bool {
+	mapping, ok := value.(map[string]any)
+	if !ok || len(mapping) != 2 {
+		return false
+	}
+	for _, key := range []string{"width", "height"} {
+		value, exists := mapping[key]
+		if !exists {
+			return false
+		}
+		if isReferenceValue(value) {
+			continue
+		}
+		number, ok := finiteNumber(value)
+		if !ok || number <= 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func validateChildPlacement(node *Node, parentType string, diagnostics *[]Diagnostic) {
+	if parentType != "stack" {
+		return
+	}
+	validate := func(place map[string]any) {
+		value, exists := place["alignment"]
+		if !exists || isReferenceValue(value) {
+			return
+		}
+		text, ok := value.(string)
+		if !ok || !contains([]string{"start", "center", "end", "stretch"}, text) {
+			*diagnostics = append(*diagnostics, nodeDiagnostic(node, "schema.prop_value", "stack child alignment must be start, center, end, or stretch"))
+		}
+	}
+	validate(node.Place)
+	for _, responsive := range node.Responsive {
+		validate(responsive.Place)
+	}
 }
 
 func validateObjectFields(node *Node, name string, raw any, allowed []string, diagnostics *[]Diagnostic) {

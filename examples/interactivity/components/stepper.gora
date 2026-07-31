@@ -1,0 +1,92 @@
+gora: 1
+kind: component
+name: Stepper
+viewport: { width: 420, height: 210, background: "#F5F7FB" }
+
+parameters:
+  title: { type: text, default: Team seats }
+
+state:
+  count: { type: number, default: 3 }
+
+previews:
+  default: {}
+  busy:
+    state: { count: 9 }
+
+root:
+  type: surface
+  name: stepper-card
+  props:
+    padding: { top: 24, right: 24, bottom: 24, left: 24 }
+    background: "#FFFFFF"
+    radius: 18
+    border: { thickness: 1, color: "#E2E7F0" }
+  children:
+    - type: stack
+      props: { direction: vertical, gap: 18 }
+      children:
+        - type: text
+          props: { content: { ref: parameter.title }, size: 18, weight: 700, color: "#172033" }
+        - type: stack
+          props: { direction: horizontal, gap: 12, alignment: center }
+          children:
+            - type: button
+              name: decrement
+              props:
+                label: Remove one seat
+                width: 48
+                height: 44
+                padding: { top: 10, right: 14, bottom: 10, left: 14 }
+                background: "#EEF1F7"
+                radius: 10
+              on:
+                activate: [{ action: decrement, state: count }]
+              variants:
+                - when: { state: count, equals: 0 }
+                  props: { disabled: true, opacity: 0.45 }
+                - when: { interaction: hovered }
+                  props: { background: "#E1E6F0" }
+                - when: { interaction: pressed }
+                  props: { background: "#D4DAE7" }
+                - when: { interaction: focused }
+                  props: { border: { thickness: 2, color: "#675FF2" } }
+                - when: { interaction: disabled }
+                  props: { background: "#F5F6F9", opacity: 0.45 }
+              children:
+                - type: text
+                  props: { content: "−", size: 20, color: "#172033", alignment: center }
+                  place: { alignment: center }
+            - type: surface
+              props:
+                width: 120
+                height: 44
+                background: "#F8F9FC"
+                radius: 10
+              children:
+                - type: text
+                  props: { content: { ref: state.count }, size: 22, weight: 700, color: "#172033", alignment: center }
+                  place: { alignment: center }
+            - type: button
+              name: increment
+              props:
+                label: Add one seat
+                width: 48
+                height: 44
+                padding: { top: 10, right: 14, bottom: 10, left: 14 }
+                background: "#675FF2"
+                radius: 10
+              on:
+                activate: [{ action: increment, state: count }]
+              variants:
+                - when: { interaction: hovered }
+                  props: { background: "#756EF5" }
+                - when: { interaction: pressed }
+                  props: { background: "#5148D8" }
+                - when: { interaction: focused }
+                  props: { border: { thickness: 2, color: "#172033" } }
+              children:
+                - type: text
+                  props: { content: "+", size: 20, color: "#FFFFFF", alignment: center }
+                  place: { alignment: center }
+

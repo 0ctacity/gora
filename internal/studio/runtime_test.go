@@ -6,7 +6,138 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"gioui.org/layout"
+	"gioui.org/op"
+	"gioui.org/unit"
+	"gioui.org/widget/material"
+
+	"gora/internal/document"
+	"gora/internal/interaction"
+	"gora/internal/render"
 )
+
+func TestRepeatedButtonActivationAcrossPersistentRebuilds(t *testing.T) {
+	repositoryRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(repositoryRoot, filepath.Join(repositoryRoot, "examples", "interactivity", "app.gora"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cache render.GioCache
+	theme := material.NewTheme()
+	router := interaction.NewRouter()
+	nextResult := func() (Snapshot, render.GioResult) {
+		snapshot := runtime.Snapshot()
+		var operations op.Ops
+		result := cache.Layout(layout.Context{
+			Ops: &operations, Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}, Constraints: layout.Exact(snapshot.Viewport),
+		}, theme, snapshot.Root, snapshot.Viewport, renderState(snapshot))
+		router.Update(result.Interactions)
+		return snapshot, result
+	}
+	activate := func(name string, pointerID int) {
+		t.Helper()
+		_, result := nextResult()
+		var region *render.InteractionRegion
+		for index := range result.Interactions {
+			inspectionName := ""
+			for _, inspection := range result.Inspections {
+				if inspection.Handle == result.Interactions[index].Handle {
+					inspectionName = inspection.Name
+					break
+				}
+			}
+			if inspectionName == name {
+				region = &result.Interactions[index]
+				break
+			}
+		}
+		if region == nil {
+			t.Fatalf("missing interaction region %q: %+v", name, result.Interactions)
+		}
+		visible := region.Bounds.Intersect(region.Clip)
+		point := image.Pt((visible.Min.X+visible.Max.X)/2, (visible.Min.Y+visible.Max.Y)/2)
+		if !router.Press(pointerID, point) {
+			t.Fatalf("press %q was rejected", name)
+		}
+		activation, ok := router.Release(pointerID, point)
+		if !ok {
+			t.Fatalf("release %q did not activate", name)
+		}
+		if err := runtime.Activate(activation); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	activate("annual-plan", 1)
+	if got := runtime.Snapshot().StateValues["screen:main"]["plan"]; got != "annual" {
+		t.Fatalf("annual plan = %#v", got)
+	}
+	activate("monthly-plan", 2)
+	if got := runtime.Snapshot().StateValues["screen:main"]["plan"]; got != "monthly" {
+		t.Fatalf("monthly plan = %#v", got)
+	}
+	activate("increment", 3)
+	activate("decrement", 4)
+	if got := runtime.Snapshot().StateValues["screen:main/team-seats"]["count"]; got != float64(3) {
+		t.Fatalf("stepper count = %#v", got)
+	}
+	activate("toggle-details", 5)
+	activate("toggle-details", 6)
+	if got := runtime.Snapshot().StateValues["screen:main"]["details"]; got != false {
+		t.Fatalf("details = %#v", got)
+	}
+}
+
+func TestRuntimeOwnsStateAcrossActivationReloadAndReset(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.gora")
+	source := []byte(`
+gora: 1
+kind: app
+viewport: { width: 200, height: 100 }
+state:
+  count: { type: number, default: 1 }
+entry: main
+screens:
+  main:
+    type: text
+    props: { content: { ref: state.count } }
+`)
+	if err := os.WriteFile(path, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.Snapshot().Root.Props["content"]; got != "1" {
+		t.Fatalf("initial content = %#v", got)
+	}
+	if err := runtime.Activate(interaction.Activation{Scope: "screen:main", Actions: []document.Action{{Action: "increment", State: "count", By: float64(2)}}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.Snapshot().Root.Props["content"]; got != "3" {
+		t.Fatalf("mutated content = %#v", got)
+	}
+	persistentRoot := runtime.Snapshot().Root
+	runtime.SetTransient(interaction.Transient{Focused: "button"})
+	if transientRoot := runtime.Snapshot().Root; transientRoot != persistentRoot {
+		t.Fatal("transient interaction rebuilt persistent geometry")
+	}
+	runtime.Reload()
+	if got := runtime.Snapshot().Root.Props["content"]; got != "3" {
+		t.Fatalf("reloaded content = %#v", got)
+	}
+	runtime.ResetState()
+	snapshot := runtime.Snapshot()
+	if got := snapshot.Root.Props["content"]; got != "1" || snapshot.Transient != (interaction.Transient{}) {
+		t.Fatalf("reset snapshot = %#v", snapshot)
+	}
+}
 
 func TestReloadPreservesLastGoodFrame(t *testing.T) {
 	dir := t.TempDir()

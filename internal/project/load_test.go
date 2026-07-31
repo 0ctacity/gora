@@ -118,6 +118,216 @@ screens:
 	}
 }
 
+func TestLoadResolvesPercentageDimensionsFromTokensAndParameters(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "theme.gora"), `
+gora: 1
+kind: tokens
+tokens:
+  dimension:
+    half: { percent: 50 }
+`)
+	writeFile(t, filepath.Join(root, "card.gora"), `
+gora: 1
+kind: component
+viewport: { width: 400, height: 240 }
+parameters:
+  basis:
+    type: dimension
+    default: { percent: 30 }
+previews:
+  default: {}
+root:
+  type: surface
+  place:
+    basis: { ref: parameter.basis }
+`)
+	writeFile(t, filepath.Join(root, "app.gora"), `
+gora: 1
+kind: app
+imports:
+  components:
+    card: ./card.gora
+  tokens:
+    theme: ./theme.gora
+viewport: { width: 800, height: 600 }
+entry: main
+screens:
+  main:
+    type: stack
+    children:
+      - type: instance
+        props:
+          component: card
+          width: { ref: theme.dimension.half }
+`)
+
+	loaded, diagnostics := Load(root, filepath.Join(root, "app.gora"), 800)
+	if len(diagnostics) != 0 {
+		t.Fatalf("Load returned diagnostics: %+v", diagnostics)
+	}
+	child := loaded.Screens["main"].Children[0]
+	if got := child.Props["width"]; !samePercent(got, 50) {
+		t.Fatalf("resolved token width = %#v, want 50 percent", got)
+	}
+	if got := child.Place["basis"]; !samePercent(got, 30) {
+		t.Fatalf("resolved parameter basis = %#v, want 30 percent", got)
+	}
+}
+
+func TestLoadBindsStateScopesAcrossComponentAndSlotBoundaries(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "counter.gora"), `
+gora: 1
+kind: component
+viewport: { width: 320, height: 180 }
+state:
+  count: { type: number, default: 1 }
+previews:
+  five:
+    state: { count: 5 }
+root:
+  type: stack
+  children:
+    - type: text
+      props: { content: { ref: state.count } }
+    - type: slot
+      props: { name: default }
+`)
+	writeFile(t, filepath.Join(root, "app.gora"), `
+gora: 1
+kind: app
+imports:
+  components: { counter: counter.gora }
+viewport: { width: 800, height: 600 }
+state:
+  title: { type: text, default: Caller }
+entry: main
+screens:
+  main:
+    type: instance
+    name: primary-counter
+    props: { component: counter }
+    children:
+      - type: slot_content
+        children:
+          - type: text
+            props: { content: { ref: state.title } }
+`)
+
+	loaded, diagnostics := Load(root, filepath.Join(root, "app.gora"), 800)
+	if len(diagnostics) != 0 {
+		t.Fatalf("Load returned diagnostics: %+v", diagnostics)
+	}
+	if len(loaded.StateScopes) != 2 {
+		t.Fatalf("state scopes = %+v", loaded.StateScopes)
+	}
+	componentText := loaded.Screens["main"].Children[0].Props["content"]
+	if componentText != (StateReference{Scope: "screen:main/primary-counter", Name: "count"}) {
+		t.Fatalf("component ref = %#v", componentText)
+	}
+	slotText := loaded.Screens["main"].Children[1].Props["content"]
+	if slotText != (StateReference{Scope: "screen:main", Name: "title"}) {
+		t.Fatalf("slot ref = %#v", slotText)
+	}
+}
+
+func TestLoadRejectsUnnamedStatefulComponentInstance(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "toggle.gora"), `
+gora: 1
+kind: component
+viewport: { width: 100, height: 100 }
+state:
+  on: { type: boolean, default: false }
+previews: { default: {} }
+root: { type: spacer }
+`)
+	writeFile(t, filepath.Join(root, "app.gora"), `
+gora: 1
+kind: app
+imports:
+  components: { toggle: toggle.gora }
+viewport: { width: 100, height: 100 }
+entry: main
+screens:
+  main:
+    type: instance
+    props: { component: toggle }
+`)
+
+	_, diagnostics := Load(root, filepath.Join(root, "app.gora"), 100)
+	for _, diagnostic := range diagnostics {
+		if diagnostic.Code == "state.instance_name" {
+			return
+		}
+	}
+	t.Fatalf("missing state.instance_name diagnostic: %+v", diagnostics)
+}
+
+func TestLoadRejectsResolvedInteractionTypeMismatches(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "app.gora"), `
+gora: 1
+kind: app
+viewport: { width: 100, height: 100 }
+state:
+  on: { type: boolean, default: false }
+  label: { type: text, default: bad }
+  count: { type: number, default: 1 }
+entry: main
+screens:
+  main:
+    type: button
+    props: { label: Save, disabled: { ref: state.count } }
+    on:
+      activate:
+        - { action: set, state: on, value: { ref: state.label } }
+        - { action: increment, state: count, by: { ref: state.label } }
+    variants:
+      - when: { state: count, equals: { ref: state.label } }
+        props: { opacity: 0.5 }
+    children:
+      - { type: text, props: { content: Save } }
+`)
+
+	_, diagnostics := Load(root, filepath.Join(root, "app.gora"), 100)
+	want := map[string]bool{"button.disabled_type": false, "action.resolved_type": false, "variant.resolved_type": false}
+	for _, diagnostic := range diagnostics {
+		if _, ok := want[diagnostic.Code]; ok {
+			want[diagnostic.Code] = true
+		}
+	}
+	for code, found := range want {
+		if !found {
+			t.Fatalf("missing %s diagnostic: %+v", code, diagnostics)
+		}
+	}
+}
+
+func samePercent(value any, want float64) bool {
+	mapping, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	switch got := mapping["percent"].(type) {
+	case int64:
+		return float64(got) == want
+	case float64:
+		return got == want
+	default:
+		return false
+	}
+}
+
 func TestLoadRejectsImportOutsideRoot(t *testing.T) {
 	t.Parallel()
 

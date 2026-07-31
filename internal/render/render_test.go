@@ -81,6 +81,182 @@ func TestStackDistributesRemainingSpaceByGrowWeight(t *testing.T) {
 	}
 }
 
+func TestStackResolvesPercentageAndAspectRatio(t *testing.T) {
+	root := &project.Node{
+		Handle: "stack", Type: "stack",
+		Props: map[string]any{"direction": "horizontal", "alignment": "start"},
+		Children: []*project.Node{{
+			Handle: "media", Type: "surface",
+			Props: map[string]any{
+				"width":        map[string]any{"percent": float64(50)},
+				"aspect_ratio": map[string]any{"width": int64(2), "height": int64(1)},
+			},
+		}},
+	}
+
+	result := Render(root, image.Pt(200, 120), State{})
+	if got := result.Bounds["media"]; got != image.Rect(0, 0, 100, 50) {
+		t.Fatalf("percentage ratio bounds = %v, want (0,0)-(100,50)", got)
+	}
+}
+
+func TestStackWrapsWithDirectionalGaps(t *testing.T) {
+	root := &project.Node{
+		Handle: "stack", Type: "stack",
+		Props: map[string]any{
+			"direction": "horizontal", "wrap": true,
+			"gap": int64(1), "column_gap": int64(10), "row_gap": int64(5),
+		},
+		Children: []*project.Node{
+			{Handle: "a", Type: "surface", Props: map[string]any{"width": int64(45), "height": int64(20)}},
+			{Handle: "b", Type: "surface", Props: map[string]any{"width": int64(45), "height": int64(20)}},
+			{Handle: "c", Type: "surface", Props: map[string]any{"width": int64(45), "height": int64(20)}},
+		},
+	}
+
+	result := Render(root, image.Pt(100, 60), State{})
+	if got := result.Bounds["b"]; got != image.Rect(55, 0, 100, 20) {
+		t.Fatalf("second wrapped item = %v", got)
+	}
+	if got := result.Bounds["c"]; got != image.Rect(0, 25, 45, 45) {
+		t.Fatalf("third wrapped item = %v", got)
+	}
+}
+
+func TestStackShrinksProportionallyAndFreezesAtMinimum(t *testing.T) {
+	root := &project.Node{
+		Handle: "stack", Type: "stack", Props: map[string]any{"direction": "horizontal"},
+		Children: []*project.Node{
+			{Handle: "a", Type: "surface", Props: map[string]any{"min_width": int64(55)}, Place: map[string]any{"basis": int64(60), "shrink": int64(1)}},
+			{Handle: "b", Type: "surface", Place: map[string]any{"basis": int64(60), "shrink": int64(1)}},
+		},
+	}
+
+	result := Render(root, image.Pt(100, 20), State{})
+	if got := result.Bounds["a"].Dx(); got != 55 {
+		t.Fatalf("minimum-frozen width = %d, want 55", got)
+	}
+	if got := result.Bounds["b"].Dx(); got != 45 {
+		t.Fatalf("remaining shrink width = %d, want 45", got)
+	}
+}
+
+func TestStackRedistributesGrowthAfterMaximumFreeze(t *testing.T) {
+	root := &project.Node{
+		Handle: "stack", Type: "stack", Props: map[string]any{"direction": "horizontal"},
+		Children: []*project.Node{
+			{Handle: "a", Type: "surface", Place: map[string]any{"basis": int64(20), "grow": int64(1)}},
+			{Handle: "b", Type: "surface", Props: map[string]any{"max_width": int64(30)}, Place: map[string]any{"basis": int64(20), "grow": int64(1)}},
+		},
+	}
+	result := Render(root, image.Pt(100, 20), State{})
+	if got := result.Bounds["a"].Dx(); got != 70 {
+		t.Fatalf("redistributed grow width = %d, want 70", got)
+	}
+	if got := result.Bounds["b"].Dx(); got != 30 {
+		t.Fatalf("maximum-frozen width = %d, want 30", got)
+	}
+}
+
+func TestStackChildAlignmentOverridesContainer(t *testing.T) {
+	root := &project.Node{
+		Handle: "stack", Type: "stack",
+		Props: map[string]any{"direction": "horizontal", "alignment": "start"},
+		Children: []*project.Node{{
+			Handle: "child", Type: "surface", Props: map[string]any{"width": int64(20), "height": int64(10)},
+			Place: map[string]any{"alignment": "end"},
+		}},
+	}
+
+	result := Render(root, image.Pt(80, 40), State{})
+	if got := result.Bounds["child"]; got != image.Rect(0, 30, 20, 40) {
+		t.Fatalf("child alignment bounds = %v", got)
+	}
+}
+
+func TestStackMeasuresNestedAutoSurface(t *testing.T) {
+	root := &project.Node{
+		Handle: "stack", Type: "stack", Props: map[string]any{"direction": "horizontal", "alignment": "start"},
+		Children: []*project.Node{{
+			Handle: "card", Type: "surface",
+			Props:    map[string]any{"padding": map[string]any{"top": int64(5), "right": int64(5), "bottom": int64(5), "left": int64(5)}},
+			Children: []*project.Node{{Handle: "content", Type: "spacer", Props: map[string]any{"width": int64(30), "height": int64(10)}}},
+		}},
+	}
+
+	result := Render(root, image.Pt(100, 50), State{})
+	if got := result.Bounds["card"]; got != image.Rect(0, 0, 40, 20) {
+		t.Fatalf("nested auto surface bounds = %v", got)
+	}
+}
+
+func TestStackPercentageAboveHundredOverflows(t *testing.T) {
+	root := &project.Node{
+		Handle: "stack", Type: "stack", Props: map[string]any{"direction": "horizontal", "alignment": "start"},
+		Children: []*project.Node{{
+			Handle: "overflow", Type: "spacer",
+			Props: map[string]any{"width": map[string]any{"percent": int64(125)}, "height": int64(10)},
+		}},
+	}
+	result := Render(root, image.Pt(80, 20), State{})
+	if got := result.Bounds["overflow"]; got != image.Rect(0, 0, 100, 10) {
+		t.Fatalf("overflow percentage bounds = %v", got)
+	}
+}
+
+func TestVerticalStackWrapsIntoColumns(t *testing.T) {
+	root := &project.Node{
+		Handle: "stack", Type: "stack",
+		Props: map[string]any{"direction": "vertical", "wrap": true, "row_gap": int64(10), "column_gap": int64(5)},
+		Children: []*project.Node{
+			{Handle: "a", Type: "spacer", Props: map[string]any{"width": int64(15), "height": int64(20)}},
+			{Handle: "b", Type: "spacer", Props: map[string]any{"width": int64(15), "height": int64(20)}},
+			{Handle: "c", Type: "spacer", Props: map[string]any{"width": int64(15), "height": int64(20)}},
+		},
+	}
+	result := Render(root, image.Pt(60, 50), State{})
+	if got := result.Bounds["c"]; got != image.Rect(20, 0, 35, 20) {
+		t.Fatalf("third vertical item = %v", got)
+	}
+}
+
+func TestStackBoundaryFitAndOneUnitOverflow(t *testing.T) {
+	makeRoot := func() *project.Node {
+		return &project.Node{
+			Handle: "stack", Type: "stack", Props: map[string]any{"direction": "horizontal", "wrap": true, "gap": int64(5)},
+			Children: []*project.Node{
+				{Handle: "a", Type: "spacer", Props: map[string]any{"width": int64(30), "height": int64(10)}},
+				{Handle: "b", Type: "spacer", Props: map[string]any{"width": int64(30), "height": int64(10)}},
+				{Handle: "c", Type: "spacer", Props: map[string]any{"width": int64(30), "height": int64(10)}},
+			},
+		}
+	}
+	if got := Render(makeRoot(), image.Pt(100, 30), State{}).Bounds["c"].Min.Y; got != 0 {
+		t.Fatalf("boundary-fit item y = %d, want 0", got)
+	}
+	if got := Render(makeRoot(), image.Pt(99, 30), State{}).Bounds["c"].Min.Y; got != 15 {
+		t.Fatalf("one-unit-overflow item y = %d, want 15", got)
+	}
+}
+
+func TestScrollUsesIntrinsicContentExtentAndClampsOffset(t *testing.T) {
+	root := &project.Node{
+		Handle: "scroll", Name: "feed", Type: "scroll", Props: map[string]any{"axis": "vertical"},
+		Children: []*project.Node{{
+			Handle: "content", Type: "stack", Props: map[string]any{"direction": "vertical"},
+			Children: []*project.Node{
+				{Handle: "a", Type: "spacer", Props: map[string]any{"height": int64(50)}},
+				{Handle: "b", Type: "spacer", Props: map[string]any{"height": int64(50)}},
+				{Handle: "c", Type: "spacer", Props: map[string]any{"height": int64(50)}},
+			},
+		}},
+	}
+	result := Render(root, image.Pt(100, 100), State{Scroll: map[string]image.Point{"feed": image.Pt(0, 100)}})
+	if got := result.Bounds["content"]; got != image.Rect(0, -50, 100, 100) {
+		t.Fatalf("intrinsic scrolled content bounds = %v", got)
+	}
+}
+
 func TestCaptureScalesPixelsWithoutStudioOverlays(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "capture.png")
 	root := &project.Node{Handle: "root", Type: "surface", Props: map[string]any{"background": "#123456"}}

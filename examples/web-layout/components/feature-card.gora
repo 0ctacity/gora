@@ -1,0 +1,46 @@
+gora: 1
+kind: component
+imports:
+  tokens:
+    theme: ../theme.gora
+viewport: { width: 360, height: 260 }
+parameters:
+  eyebrow: { type: text, required: true }
+  title: { type: text, required: true }
+  description: { type: text, required: true }
+  basis: { type: dimension, default: { percent: 30 } }
+previews:
+  default:
+    parameters:
+      eyebrow: PLATFORM
+      title: Deterministic layout
+      description: One geometry model drives Studio and capture.
+root:
+  type: surface
+  name: feature-card
+  props:
+    min_width: 230
+    aspect_ratio: { width: 4, height: 3 }
+    background: { ref: theme.color.panel }
+    padding: { top: 24, right: 24, bottom: 24, left: 24 }
+    radius: 18
+    border: { thickness: 1, color: "#E4E7F0" }
+    shadow: { ref: theme.shadow.panel }
+  place:
+    basis: { ref: parameter.basis }
+    grow: 1
+    shrink: 1
+  children:
+    - type: stack
+      props: { direction: vertical, gap: 12, alignment: start }
+      children:
+        - type: text
+          props: { text: { ref: parameter.eyebrow }, size: 10, weight: 700, letter_spacing: 1.2, color: { ref: theme.color.primary }, font: ../../dashboard/assets/StudioSans.ttf }
+        - type: text
+          props: { text: { ref: parameter.title }, size: 22, weight: 700, color: { ref: theme.color.ink }, font: ../../dashboard/assets/StudioSans.ttf }
+        - type: text
+          props: { text: { ref: parameter.description }, size: 13, line_height: 20, wrap: true, color: { ref: theme.color.muted }, font: ../../dashboard/assets/StudioSans.ttf }
+        - type: spacer
+          place: { grow: 1 }
+        - type: surface
+          props: { width: 42, height: 4, background: { ref: theme.color.accent }, radius: 2 }

@@ -41,6 +41,7 @@ type Document struct {
 	Previews    map[string]Preview
 	Root        *Node
 	Tokens      map[string]map[string]any
+	State       map[string]StateDeclaration
 }
 
 type Imports struct {
@@ -78,6 +79,42 @@ type Preview struct {
 	Parameters map[string]any
 	Children   []*Node
 	Source     Source
+	State      map[string]any
+}
+
+type StateDeclaration struct {
+	Type    string
+	Default any
+	Values  []string
+	Source  Source
+}
+
+type Action struct {
+	Action string
+	State  string
+	Value  any
+	By     any
+	Source Source
+}
+
+type Events struct {
+	Activate []Action
+}
+
+type Condition struct {
+	State       string
+	Interaction string
+	Operator    string
+	Value       any
+	Source      Source
+}
+
+type Variant struct {
+	When    Condition
+	Props   map[string]any
+	Place   map[string]any
+	Visible *bool
+	Source  Source
 }
 
 type Node struct {
@@ -88,6 +125,8 @@ type Node struct {
 	Responsive map[string]Responsive
 	Children   []*Node
 	Source     Source
+	On         Events
+	Variants   []Variant
 }
 
 type Responsive struct {

@@ -1,0 +1,171 @@
+gora: 1
+kind: app
+name: Interaction Lab
+
+imports:
+  components:
+    stepper: ./components/stepper.gora
+
+viewport: { width: 1180, height: 760, background: "#F5F7FB" }
+
+breakpoints:
+  narrow: { max_width: 719 }
+  wide: { min_width: 720 }
+
+state:
+  plan: { type: enum, values: [monthly, annual], default: monthly }
+  details: { type: boolean, default: false }
+  status: { type: text, default: Ready }
+
+entry: main
+screens:
+  main:
+    type: scroll
+    name: page-scroll
+    props: { axis: vertical, scrollbar: true }
+    children:
+      - type: surface
+        props:
+          padding: { top: 48, right: 56, bottom: 64, left: 56 }
+          background: "#F5F7FB"
+        responsive:
+          narrow:
+            props:
+              padding: { top: 28, right: 22, bottom: 40, left: 22 }
+        children:
+          - type: stack
+            props: { direction: vertical, gap: 28 }
+            children:
+              - type: stack
+                props: { direction: vertical, gap: 8 }
+                children:
+                  - type: text
+                    props: { content: Interaction foundation, size: 13, weight: 700, color: "#675FF2", letter_spacing: 1.2 }
+                  - type: text
+                    props: { content: Choose a plan. Shape local state., size: 38, weight: 700, color: "#172033", wrap: true }
+                    responsive:
+                      narrow: { props: { size: 29 } }
+                  - type: text
+                    props: { content: "Pointer, keyboard, reload and capture all share one deterministic state model.", size: 16, color: "#657087", wrap: true }
+
+              - type: stack
+                name: plan-picker
+                props: { direction: horizontal, wrap: true, gap: 12 }
+                children:
+                  - type: button
+                    name: monthly-plan
+                    props:
+                      label: Select monthly plan
+                      padding: { top: 12, right: 18, bottom: 12, left: 18 }
+                      background: "#FFFFFF"
+                      border: { thickness: 1, color: "#D8DEEA" }
+                      radius: 12
+                    on:
+                      activate: [{ action: set, state: plan, value: monthly }]
+                    variants:
+                      - when: { state: plan, equals: monthly }
+                        props: { background: "#172033", border: { thickness: 1, color: "#172033" } }
+                      - when: { interaction: hovered }
+                        props: { background: "#EEF0FF" }
+                      - when: { interaction: pressed }
+                        props: { background: "#DDD9FF" }
+                      - when: { interaction: focused }
+                        props: { border: { thickness: 2, color: "#675FF2" } }
+                    children:
+                      - type: text
+                        props: { content: Monthly, size: 15, weight: 700, color: "#675FF2" }
+                        variants:
+                          - when: { state: plan, equals: monthly }
+                            props: { color: "#FFFFFF" }
+                  - type: button
+                    name: annual-plan
+                    props:
+                      label: Select annual plan
+                      padding: { top: 12, right: 18, bottom: 12, left: 18 }
+                      background: "#FFFFFF"
+                      border: { thickness: 1, color: "#D8DEEA" }
+                      radius: 12
+                    on:
+                      activate:
+                        - { action: set, state: plan, value: annual }
+                        - { action: set, state: status, value: Two months saved }
+                    variants:
+                      - when: { state: plan, equals: annual }
+                        props: { background: "#675FF2", border: { thickness: 1, color: "#675FF2" } }
+                      - when: { interaction: hovered }
+                        props: { background: "#EEF0FF" }
+                      - when: { interaction: pressed }
+                        props: { background: "#DDD9FF" }
+                      - when: { interaction: focused }
+                        props: { border: { thickness: 2, color: "#172033" } }
+                    children:
+                      - type: text
+                        props: { content: Annual · save 17%, size: 15, weight: 700, color: "#675FF2" }
+                        variants:
+                          - when: { state: plan, equals: annual }
+                            props: { color: "#FFFFFF" }
+
+              - type: stack
+                props: { direction: horizontal, wrap: true, gap: 24, alignment: stretch }
+                children:
+                  - type: instance
+                    name: team-seats
+                    props:
+                      component: stepper
+                      parameters: { title: Team seats }
+                      width: { percent: 48 }
+                    responsive:
+                      narrow: { props: { width: { percent: 100 } } }
+                  - type: surface
+                    props:
+                      width: { percent: 48 }
+                      padding: { top: 24, right: 24, bottom: 24, left: 24 }
+                      background: "#172033"
+                      radius: 18
+                    responsive:
+                      narrow: { props: { width: { percent: 100 } } }
+                    children:
+                      - type: stack
+                        props: { direction: vertical, gap: 14 }
+                        children:
+                          - type: text
+                            props: { content: Current plan, size: 13, color: "#AEB8CA" }
+                          - type: text
+                            props: { content: { ref: state.plan }, size: 28, weight: 700, color: "#FFFFFF" }
+                          - type: text
+                            props: { content: { ref: state.status }, size: 15, color: "#AEB8CA" }
+
+              - type: button
+                name: toggle-details
+                props:
+                  label: Show or hide implementation details
+                  padding: { top: 12, right: 18, bottom: 12, left: 18 }
+                  background: "#E9ECF4"
+                  radius: 12
+                on:
+                  activate: [{ action: toggle, state: details }]
+                variants:
+                  - when: { interaction: hovered }
+                    props: { background: "#DDE2ED" }
+                  - when: { interaction: pressed }
+                    props: { background: "#CED5E3" }
+                  - when: { interaction: focused }
+                    props: { border: { thickness: 2, color: "#675FF2" } }
+                children:
+                  - type: text
+                    props: { content: Toggle implementation details, size: 15, weight: 700, color: "#172033" }
+
+              - type: surface
+                name: details-panel
+                props:
+                  padding: { top: 22, right: 24, bottom: 22, left: 24 }
+                  background: "#EEF0FF"
+                  radius: 14
+                variants:
+                  - when: { state: details, equals: false }
+                    visible: false
+                  - when: { state: details, equals: true }
+                    visible: true
+                children:
+                  - type: text
+                    props: { content: State remains local to each screen and named component instance. Reload reconciles compatible values; Reset state restores fixture defaults., size: 15, color: "#454E66", wrap: true }

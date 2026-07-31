@@ -12,6 +12,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 
 	"gora/internal/document"
+	"gora/internal/interaction"
 	"gora/internal/project"
 	"gora/internal/render"
 	"gora/internal/session"
@@ -25,24 +26,33 @@ type Snapshot struct {
 	Invalid     bool
 	Diagnostics []document.Diagnostic
 	Scroll      map[string]image.Point
+	Transient   interaction.Transient
+	StateValues map[string]map[string]any
+	Revision    uint64
+	HasState    bool
 }
 
 type Runtime struct {
-	mu               sync.RWMutex
-	reloadMu         sync.Mutex
-	root             string
-	entry            string
-	loaded           *project.Loaded
-	selected         string
-	viewport         image.Point
-	viewportExplicit bool
-	diagnostics      []document.Diagnostic
-	invalid          bool
-	scroll           map[string]image.Point
+	mu                sync.RWMutex
+	reloadMu          sync.Mutex
+	root              string
+	entry             string
+	loaded            *project.Loaded
+	selected          string
+	viewport          image.Point
+	viewportExplicit  bool
+	diagnostics       []document.Diagnostic
+	invalid           bool
+	scroll            map[string]image.Point
+	state             *interaction.Store
+	effectiveRoot     *project.Node
+	effectiveSource   *project.Node
+	effectiveScreen   string
+	effectiveRevision uint64
 }
 
 func NewRuntime(root, entry string) (*Runtime, error) {
-	runtime := &Runtime{root: root, entry: entry, scroll: make(map[string]image.Point)}
+	runtime := &Runtime{root: root, entry: entry, scroll: make(map[string]image.Point), state: interaction.NewStore()}
 	runtime.Reload()
 	runtime.mu.RLock()
 	defer runtime.mu.RUnlock()
@@ -90,16 +100,35 @@ func (runtime *Runtime) Reload() {
 	} else {
 		runtime.selected = loaded.Selected
 	}
+	if runtime.state == nil {
+		runtime.state = interaction.NewStore()
+	}
+	specs := make([]interaction.ScopeSpec, len(loaded.StateScopes))
+	for index, scope := range loaded.StateScopes {
+		specs[index] = interaction.ScopeSpec{ID: scope.ID, Context: scope.Context, State: scope.State, Initial: scope.Initial}
+	}
+	if loaded.Document.Kind == document.KindComponent {
+		runtime.state.ReconcileContext(loaded.Selected, specs)
+	} else {
+		runtime.state.Reconcile(specs)
+	}
+	runtime.effectiveRoot = nil
 	runtime.pruneScroll(loaded)
 }
 
 func (runtime *Runtime) Snapshot() Snapshot {
-	runtime.mu.RLock()
-	defer runtime.mu.RUnlock()
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.state == nil {
+		runtime.state = interaction.NewStore()
+	}
 	snapshot := Snapshot{
 		Viewport: runtime.viewport, Screen: runtime.selected, Invalid: runtime.invalid,
 		Diagnostics: append([]document.Diagnostic(nil), runtime.diagnostics...),
 		Scroll:      cloneScroll(runtime.scroll),
+		Transient:   runtime.state.Transient(),
+		StateValues: runtime.state.AllValues(),
+		Revision:    runtime.state.Revision(),
 	}
 	if runtime.loaded == nil {
 		return snapshot
@@ -114,7 +143,53 @@ func (runtime *Runtime) Snapshot() Snapshot {
 		snapshot.Root = runtime.loaded.Root
 		snapshot.Screens = append(snapshot.Screens, runtime.loaded.Previews...)
 	}
+	for _, scope := range runtime.loaded.StateScopes {
+		if scope.Context == runtime.selected {
+			snapshot.HasState = true
+			break
+		}
+	}
+	if snapshot.Root != nil && (runtime.effectiveRoot == nil || runtime.effectiveSource != snapshot.Root || runtime.effectiveScreen != runtime.selected || runtime.effectiveRevision != snapshot.Revision) {
+		runtime.effectiveSource = snapshot.Root
+		runtime.effectiveScreen = runtime.selected
+		runtime.effectiveRevision = snapshot.Revision
+		runtime.effectiveRoot = interaction.ResolvePersistentTree(snapshot.Root, snapshot.StateValues)
+	}
+	snapshot.Root = runtime.effectiveRoot
 	return snapshot
+}
+
+func (runtime *Runtime) Activate(activation interaction.Activation) error {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.state == nil {
+		return fmt.Errorf("interaction state is unavailable")
+	}
+	if err := runtime.state.Apply(activation.Scope, activation.Actions); err != nil {
+		return err
+	}
+	runtime.effectiveRoot = nil
+	return nil
+}
+
+func (runtime *Runtime) SetTransient(transient interaction.Transient) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.state == nil {
+		runtime.state = interaction.NewStore()
+	}
+	if runtime.state.Transient() != transient {
+		runtime.state.SetTransient(transient)
+	}
+}
+
+func (runtime *Runtime) ResetState() {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.state != nil {
+		runtime.state.ResetContext(runtime.selected)
+		runtime.effectiveRoot = nil
+	}
 }
 
 func (runtime *Runtime) SelectScreen(screen string) bool {
@@ -233,7 +308,7 @@ func (runtime *Runtime) Capture(path string, scale int) (string, error) {
 	if err := render.ValidateOutput(path); err != nil {
 		return "", err
 	}
-	if err := render.Capture(path, snapshot.Root, snapshot.Viewport, render.State{Scroll: snapshot.Scroll}, scale); err != nil {
+	if err := render.Capture(path, snapshot.Root, snapshot.Viewport, renderState(snapshot), scale); err != nil {
 		return "", err
 	}
 	if snapshot.Invalid {
