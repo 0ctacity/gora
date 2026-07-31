@@ -1,0 +1,24 @@
+gora: 1
+kind: tokens
+tokens:
+  color:
+    ink: "#18202B"
+    muted: "#667085"
+    panel: "#FFFFFF"
+    accent: "#635BFF"
+    border: "#D9DEE7"
+  dimension:
+    space_sm: 8
+    space_md: 16
+  font_face:
+    studio: { src: assets/StudioSans.ttf }
+  text_style:
+    heading: { font: studio, size: 26, weight: 700, line_height: 32 }
+  shadow:
+    panel: { x: 0, y: 8, blur: 24, color: "#10182814" }
+  linear_gradient:
+    accent:
+      angle: 135
+      stops:
+        - { offset: 0, color: "#635BFF" }
+        - { offset: 1, color: "#9B8CFF" }

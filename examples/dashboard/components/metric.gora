@@ -1,0 +1,43 @@
+gora: 1
+kind: component
+imports:
+  tokens:
+    theme: ../theme.gora
+viewport: { width: 300, height: 150 }
+parameters:
+  label: { type: text, required: true }
+  value: { type: text, required: true }
+  delta: { type: text, default: "+0%" }
+slots:
+  default: { required: false }
+previews:
+  default:
+    parameters: { label: Net revenue, value: "$84,240", delta: "+12.4%" }
+root:
+  type: surface
+  name: metric-panel
+  props:
+    background: { ref: theme.color.panel }
+    padding: { top: 17, right: 18, bottom: 16, left: 18 }
+    radius: 15
+    shadow: { ref: theme.shadow.panel }
+    border: { thickness: 1, color: "#E8EBF1" }
+  children:
+    - type: overlay
+      children:
+        - type: stack
+          props: { direction: vertical, gap: 7 }
+          children:
+            - type: text
+              props: { text: { ref: parameter.label }, size: 11, weight: 600, color: "#7B8596", font: ../assets/StudioSans.ttf }
+            - type: text
+              props: { text: { ref: parameter.value }, size: 25, weight: 700, color: "#182230", font: ../assets/StudioSans.ttf }
+            - type: text
+              props: { text: { ref: parameter.delta }, size: 11, weight: 600, color: "#16A36A", font: ../assets/StudioSans.ttf }
+        - type: surface
+          props: { width: 30, height: 30, background: "#F1EFFF", radius: 9 }
+          place: { alignment: top_right }
+          children:
+            - type: text
+              props: { text: "+", size: 14, weight: 700, color: "#635BFF", font: ../assets/StudioSans.ttf }
+              place: { alignment: center }

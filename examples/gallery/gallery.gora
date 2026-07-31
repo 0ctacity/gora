@@ -1,0 +1,90 @@
+gora: 1
+kind: app
+name: Primitive and Component Gallery
+imports:
+  components:
+    info_card: components/info-card.gora
+  tokens:
+    theme: theme.gora
+viewport: { width: 980, height: 760, background: "#EEF1F6" }
+breakpoints:
+  compact: { max_width: 699 }
+  wide: { min_width: 700 }
+entry: gallery
+screens:
+  gallery:
+    type: scroll
+    name: gallery-scroll
+    props: { axis: vertical, scrollbar: true }
+    children:
+      - type: stack
+        props:
+          direction: vertical
+          gap: { ref: theme.dimension.space_md }
+          height: 1100
+          padding: { top: 24, right: 24, bottom: 24, left: 24 }
+        children:
+          - type: text
+            props:
+              text: Gora v1 Gallery
+              size: 30
+              weight: 700
+              color: { ref: theme.color.ink }
+              font: assets/StudioSans.ttf
+          - type: divider
+            props: { orientation: horizontal, thickness: 1, color: "#D9DEE7", height: 1 }
+          - type: grid
+            props:
+              columns: [1fr, 1fr]
+              gap: 16
+              height: 380
+            responsive:
+              compact:
+                props:
+                  columns: [1fr]
+            children:
+              - type: instance
+                name: gallery-card
+                props:
+                  component: info_card
+                  parameters: { title: Revenue, value: "$84,240", tone: accent }
+                children:
+                  - type: slot_content
+                    props: { slot: default }
+                    children:
+                      - type: text
+                        props: { text: "12.4% this month", size: 13, color: "#667085" }
+              - type: surface
+                props:
+                  background: "#FFFFFF"
+                  padding: { top: 16, right: 16, bottom: 16, left: 16 }
+                  radius: 14
+                children:
+                  - type: overlay
+                    children:
+                      - type: image
+                        props: { src: assets/sample.png, fit: cover, height: 180 }
+                      - type: surface
+                        props: { width: 120, height: 34, background: "#18202BCC", radius: 17 }
+                        place: { x: 12, y: 12 }
+                        children:
+                          - type: text
+                            props: { text: Raster image, size: 12, color: "#FFFFFF" }
+              - type: image
+                props: { src: assets/sample.webp, fit: contain, height: 160 }
+              - type: image
+                props: { src: assets/sample.jpg, fit: cover, height: 160 }
+          - type: stack
+            props: { direction: horizontal, gap: 12, height: 80 }
+            children:
+              - type: surface
+                props: { width: 180, background: { ref: theme.linear_gradient.accent }, radius: 12 }
+                children:
+                  - type: text
+                    props: { text: Surface, size: 16, color: "#FFFFFF" }
+              - type: spacer
+                props: { width: 24 }
+              - type: divider
+                props: { orientation: vertical, thickness: 2, color: "#D9DEE7", width: 2 }
+              - type: text
+                props: { text: "stack · spacer · divider · text", size: 15, color: "#667085" }

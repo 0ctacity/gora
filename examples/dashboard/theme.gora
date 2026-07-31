@@ -1,0 +1,29 @@
+gora: 1
+kind: tokens
+tokens:
+  color:
+    ink: "#182230"
+    muted: "#7B8596"
+    canvas: "#F4F6FA"
+    panel: "#FFFFFF"
+    primary: "#635BFF"
+    positive: "#16A36A"
+  dimension:
+    gutter: 24
+  font_face:
+    studio: { src: assets/StudioSans.ttf }
+  text_style:
+    display: { size: 32, weight: 700, line_height: 38 }
+  shadow:
+    panel: { x: 0, y: 8, blur: 24, color: "#1822300D" }
+  linear_gradient:
+    accent:
+      angle: 135
+      stops:
+        - { offset: 0, color: "#7C73FF" }
+        - { offset: 1, color: "#554CDE" }
+    hero:
+      angle: 135
+      stops:
+        - { offset: 0, color: "#4F46E5" }
+        - { offset: 1, color: "#8B5CF6" }

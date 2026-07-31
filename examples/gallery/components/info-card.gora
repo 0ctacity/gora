@@ -1,0 +1,51 @@
+gora: 1
+kind: component
+name: Info Card
+imports:
+  tokens:
+    theme: ../theme.gora
+viewport: { width: 360, height: 180, background: transparent }
+parameters:
+  title: { type: text, required: true }
+  value: { type: text, required: true }
+  tone: { type: enum, values: [normal, accent], default: normal }
+slots:
+  default: { required: false }
+previews:
+  default:
+    parameters: { title: Revenue, value: "$84,240", tone: accent }
+    children:
+      - type: slot_content
+        props: { slot: default }
+        children:
+          - type: text
+            props: { text: "12.4% from last month", size: 13, color: "#667085" }
+  quiet:
+    parameters: { title: Active users, value: "18,429", tone: normal }
+root:
+  type: surface
+  name: card-surface
+  props:
+    background: { ref: theme.color.panel }
+    padding: { top: 18, right: 18, bottom: 18, left: 18 }
+    radius: 14
+    shadow: { ref: theme.shadow.panel }
+  children:
+    - type: stack
+      props: { direction: vertical, gap: 8 }
+      children:
+        - type: text
+          name: card-title
+          props:
+            text: { ref: parameter.title }
+            size: 14
+            color: { ref: theme.color.muted }
+            font: ../assets/StudioSans.ttf
+        - type: text
+          props:
+            text: { ref: parameter.value }
+            style: { ref: theme.text_style.heading }
+            size: 28
+            color: { ref: theme.color.ink }
+        - type: slot
+          props: { name: default }
