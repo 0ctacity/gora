@@ -45,16 +45,42 @@ Diagnostics are sorted by file, line, column, and code.
 ## `gora run`
 
 ```text
-gora run <file> [--root <dir>]
+gora run <file> [--root <dir>] [--studio|--headless]
 ```
 
-Apps and components open in the native Studio. Token modules are
-validation-only. A second invocation for the same canonical root and document
-focuses the existing session.
+Apps and components run in one of three mutually exclusive hosts. Token modules
+are validation-only.
 
-An initially invalid app or component still opens Studio with diagnostics and
-no preview; the process exits with status `1` when that Studio closes. This
-allows the file to be repaired through live reload without restarting Gora.
+- With no host flag, Gora opens a content-only native app window. The document
+  viewport follows the logical size of that window, and document scrolling,
+  buttons, keyboard focus, state, capture, and live reload remain active.
+- `--studio` opens the authoring Studio described below.
+- `--headless` runs the same live runtime and owner-only session service without
+  creating a visible platform window. It watches dependencies and retains the
+  current viewport, selection, scroll offsets, and interaction state for
+  automation and future MCP integration.
+
+The flags `--studio` and `--headless` cannot be combined. Session identity
+includes the canonical root, document, and host mode, so app, Studio, and
+headless sessions may coexist. Repeating `run` in the same mode focuses the
+existing visible window or reuses the existing headless process.
+
+A plain app run rejects an initially invalid document with status `1` and does
+not open a window. Studio and headless runs remain alive for an initially
+invalid document: Studio shows diagnostics, while headless exposes the live
+invalid session for repair through file watching. Both retain a later
+last-good frame if a reload becomes invalid.
+
+## Content-only app window
+
+The default host contains only document pixels. It has no toolbar,
+checkerboard, inspection highlight, guides, capture field, or diagnostic
+chrome. Its initial logical size is the document viewport. Native resizing
+updates the document viewport and responsive result. `gora render --from app`
+captures its current live selection, state, scroll offsets, and resized
+viewport without window chrome.
+
+## Studio
 
 Studio owns:
 
@@ -104,21 +130,23 @@ scoped values. Inspection overlays are Studio-only.
 
 ```text
 gora render <file> --output <new.png> \
-  [--scale <positive-integer>] [--root <dir>]
+  [--scale <positive-integer>] [--root <dir>] \
+  [--from app|studio|headless]
 ```
 
-Rendering requires the matching live Studio session. It captures the session's
-current screen or fixture, explicit viewport, responsive result, scroll
-offsets, persistent values, and current button interaction visuals. Zoom,
-checkerboards, inspection highlighting, guides, diagnostics, and all Studio
-chrome are excluded.
+Rendering requires the matching live host session. `--from` defaults to `app`.
+It captures that session's current screen or fixture, viewport, responsive
+result, scroll offsets, persistent values, and current button interaction
+visuals. Studio zoom, checkerboards, inspection highlighting, guides,
+diagnostics, native window chrome, and Studio chrome are excluded.
 
 The command refuses an existing output file. If the current source is invalid
-but Studio has a last-good frame, the command captures that visible frame and
+but the selected host has a last-good frame, the command captures that frame and
 prints a warning to standard error.
 
 ## Session security
 
-The local Unix socket is keyed by the canonical root and document. Its parent
-directory is owner-only (`0700`) and its socket is owner-only (`0600`). Stale
-sockets are removed after connection failure and on clean shutdown.
+The local Unix socket is keyed by the canonical root, document, and host mode.
+Its parent directory is owner-only (`0700`) and its socket is owner-only
+(`0600`). Stale sockets are removed after connection failure and on clean
+shutdown.

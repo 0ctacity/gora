@@ -39,6 +39,21 @@ func TestListenRemovesStaleSocket(t *testing.T) {
 	defer server.Close()
 }
 
+func TestSocketPathSeparatesRuntimeModes(t *testing.T) {
+	dir := socketTempDir(t)
+	app, err := SocketPath(dir, filepath.Join(dir, "app.gora"), "app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	studio, err := SocketPath(dir, filepath.Join(dir, "app.gora"), "studio")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app == studio {
+		t.Fatal("app and Studio session paths match")
+	}
+}
+
 func socketTempDir(t *testing.T) string {
 	t.Helper()
 	directory, err := os.MkdirTemp("/tmp", "gora-session-test-")

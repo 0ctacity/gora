@@ -31,7 +31,7 @@ type scope struct {
 	current      map[string]any
 }
 
-// Store owns all document state for a live Studio session.
+// Store owns all document state for a live runtime session.
 type Store struct {
 	scopes    map[string]*scope
 	transient Transient

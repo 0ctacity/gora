@@ -10,6 +10,8 @@ viewport: { width: 1280, height: 800, background: "#F4F6FA" }
 breakpoints:
   compact: { max_width: 759 }
   wide: { min_width: 760 }
+state:
+  active_tab: { type: enum, values: [overview, revenue, customers, reports], default: overview }
 entry: overview
 screens:
   overview:
@@ -45,40 +47,110 @@ screens:
                 props: { height: 1, thickness: 1, color: "#FFFFFF1F" }
               - type: text
                 props: { text: WORKSPACE, size: 10, weight: 700, letter_spacing: 1.4, color: "#8490A3", font: assets/StudioSans.ttf }
-              - type: surface
+              - type: button
+                name: overview-tab
                 props:
+                  label: Open overview
                   height: 42
-                  background: "#635BFF"
+                  background: transparent
                   padding: { top: 0, right: 12, bottom: 0, left: 12 }
                   radius: 10
+                on:
+                  activate: [{ action: set, state: active_tab, value: overview }]
+                variants:
+                  - when: { state: active_tab, equals: overview }
+                    props: { background: "#635BFF" }
+                  - when: { interaction: hovered }
+                    props: { background: "#FFFFFF14" }
+                  - when: { interaction: pressed }
+                    props: { background: "#FFFFFF24" }
+                  - when: { interaction: focused }
+                    props: { border: { thickness: 2, color: "#9D97FF" } }
                 children:
                   - type: text
-                    props: { text: Overview, size: 14, weight: 600, color: "#FFFFFF", font: assets/StudioSans.ttf }
+                    props: { text: Overview, size: 14, weight: 600, color: "#B9C1CE", font: assets/StudioSans.ttf }
                     place: { alignment: left }
-              - type: surface
+                    variants:
+                      - when: { state: active_tab, equals: overview }
+                        props: { color: "#FFFFFF" }
+              - type: button
+                name: revenue-tab
                 props:
-                  height: 38
+                  label: Open revenue
+                  height: 42
+                  background: transparent
                   padding: { top: 0, right: 12, bottom: 0, left: 12 }
+                  radius: 10
+                on:
+                  activate: [{ action: set, state: active_tab, value: revenue }]
+                variants:
+                  - when: { state: active_tab, equals: revenue }
+                    props: { background: "#635BFF" }
+                  - when: { interaction: hovered }
+                    props: { background: "#FFFFFF14" }
+                  - when: { interaction: pressed }
+                    props: { background: "#FFFFFF24" }
+                  - when: { interaction: focused }
+                    props: { border: { thickness: 2, color: "#9D97FF" } }
                 children:
                   - type: text
-                    props: { text: Revenue, size: 14, color: "#B9C1CE", font: assets/StudioSans.ttf }
+                    props: { text: Revenue, size: 14, weight: 600, color: "#B9C1CE", font: assets/StudioSans.ttf }
                     place: { alignment: left }
-              - type: surface
+                    variants:
+                      - when: { state: active_tab, equals: revenue }
+                        props: { color: "#FFFFFF" }
+              - type: button
+                name: customers-tab
                 props:
-                  height: 38
+                  label: Open customers
+                  height: 42
+                  background: transparent
                   padding: { top: 0, right: 12, bottom: 0, left: 12 }
+                  radius: 10
+                on:
+                  activate: [{ action: set, state: active_tab, value: customers }]
+                variants:
+                  - when: { state: active_tab, equals: customers }
+                    props: { background: "#635BFF" }
+                  - when: { interaction: hovered }
+                    props: { background: "#FFFFFF14" }
+                  - when: { interaction: pressed }
+                    props: { background: "#FFFFFF24" }
+                  - when: { interaction: focused }
+                    props: { border: { thickness: 2, color: "#9D97FF" } }
                 children:
                   - type: text
-                    props: { text: Customers, size: 14, color: "#B9C1CE", font: assets/StudioSans.ttf }
+                    props: { text: Customers, size: 14, weight: 600, color: "#B9C1CE", font: assets/StudioSans.ttf }
                     place: { alignment: left }
-              - type: surface
+                    variants:
+                      - when: { state: active_tab, equals: customers }
+                        props: { color: "#FFFFFF" }
+              - type: button
+                name: reports-tab
                 props:
-                  height: 38
+                  label: Open reports
+                  height: 42
+                  background: transparent
                   padding: { top: 0, right: 12, bottom: 0, left: 12 }
+                  radius: 10
+                on:
+                  activate: [{ action: set, state: active_tab, value: reports }]
+                variants:
+                  - when: { state: active_tab, equals: reports }
+                    props: { background: "#635BFF" }
+                  - when: { interaction: hovered }
+                    props: { background: "#FFFFFF14" }
+                  - when: { interaction: pressed }
+                    props: { background: "#FFFFFF24" }
+                  - when: { interaction: focused }
+                    props: { border: { thickness: 2, color: "#9D97FF" } }
                 children:
                   - type: text
-                    props: { text: Reports, size: 14, color: "#B9C1CE", font: assets/StudioSans.ttf }
+                    props: { text: Reports, size: 14, weight: 600, color: "#B9C1CE", font: assets/StudioSans.ttf }
                     place: { alignment: left }
+                    variants:
+                      - when: { state: active_tab, equals: reports }
+                        props: { color: "#FFFFFF" }
               - type: spacer
                 place: { grow: 1 }
               - type: surface
@@ -105,8 +177,11 @@ screens:
                           - type: text
                             props: { text: Administrator, size: 10, color: "#8490A3", font: assets/StudioSans.ttf }
       - type: scroll
-        name: overview-scroll
+        name: overview-panel
         props: { axis: vertical, scrollbar: true }
+        variants:
+          - when: { state: active_tab, not_equals: overview }
+            visible: false
         children:
           - type: stack
             props:
@@ -347,18 +422,298 @@ screens:
                                     props: { text: Growth campaign, size: 14, weight: 700, color: "#FFFFFF", font: assets/StudioSans.ttf }
                                   - type: text
                                     props: { text: 68% of quarterly target reached, size: 11, color: "#CBD2DC", font: assets/StudioSans.ttf }
-  reports:
-    type: surface
-    props:
-      background: "#F4F6FA"
-      padding: { top: 32, right: 32, bottom: 32, left: 32 }
-    children:
-      - type: stack
-        props: { direction: vertical, gap: 18 }
+      - type: scroll
+        name: revenue-panel
+        props: { axis: vertical, scrollbar: true }
+        variants:
+          - when: { state: active_tab, not_equals: revenue }
+            visible: false
         children:
-          - type: text
-            props: { text: Reports, size: 30, weight: 700, color: "#182230", font: assets/StudioSans.ttf }
-          - type: divider
-            props: { height: 1, thickness: 1, color: "#E0E4EB" }
-          - type: text
-            props: { text: "Monthly performance packs and customer cohorts.", size: 15, color: "#6E7889", font: assets/StudioSans.ttf }
+          - type: stack
+            props:
+              direction: vertical
+              gap: 20
+              height: 900
+              padding: { top: 28, right: 28, bottom: 28, left: 28 }
+            children:
+              - type: stack
+                props: { direction: vertical, gap: 5, height: 66 }
+                children:
+                  - type: text
+                    props: { text: Revenue intelligence, size: 28, weight: 700, color: "#182230", font: assets/StudioSans.ttf }
+                  - type: text
+                    props: { text: "Track recurring growth, channel mix, and forecast health.", size: 13, color: "#7B8596", font: assets/StudioSans.ttf }
+              - type: grid
+                props: { columns: [1fr, 1fr, 1fr], gap: 16, height: 148 }
+                children:
+                  - type: instance
+                    props: { component: metric, parameters: { label: Monthly recurring revenue, value: "$312,840", delta: "+11.8% this quarter" } }
+                  - type: instance
+                    props: { component: metric, parameters: { label: Average contract value, value: "$18,620", delta: "+6.4% this quarter" } }
+                  - type: instance
+                    props: { component: metric, parameters: { label: Forecast attainment, value: "92.6%", delta: "+4.2 pts this month" } }
+              - type: surface
+                props:
+                  height: 330
+                  background: "#FFFFFF"
+                  padding: { top: 22, right: 24, bottom: 20, left: 24 }
+                  radius: 16
+                  border: { thickness: 1, color: "#E8EBF1" }
+                children:
+                  - type: stack
+                    props: { direction: vertical, gap: 16 }
+                    children:
+                      - type: stack
+                        props: { direction: horizontal, height: 36, alignment: center }
+                        children:
+                          - type: stack
+                            props: { direction: vertical, gap: 3 }
+                            children:
+                              - type: text
+                                props: { text: Recurring revenue, size: 16, weight: 700, color: "#182230", font: assets/StudioSans.ttf }
+                              - type: text
+                                props: { text: Actual versus target · last 8 months, size: 11, color: "#8A94A6", font: assets/StudioSans.ttf }
+                          - type: spacer
+                            place: { grow: 1 }
+                          - type: text
+                            props: { text: "$312.8k current", size: 12, weight: 700, color: "#635BFF", font: assets/StudioSans.ttf }
+                      - type: overlay
+                        props: { height: 220 }
+                        children:
+                          - type: surface
+                            props: { width: 78, height: 96, background: "#E4E1FF", radius: 9 }
+                            place: { x: 22, y: 110 }
+                          - type: surface
+                            props: { width: 78, height: 118, background: "#D8D4FF", radius: 9 }
+                            place: { x: 130, y: 88 }
+                          - type: surface
+                            props: { width: 78, height: 132, background: "#C8C3FF", radius: 9 }
+                            place: { x: 238, y: 74 }
+                          - type: surface
+                            props: { width: 78, height: 154, background: "#AAA3FF", radius: 9 }
+                            place: { x: 346, y: 52 }
+                          - type: surface
+                            props: { width: 78, height: 176, background: "#8279FF", radius: 9 }
+                            place: { x: 454, y: 30 }
+                          - type: surface
+                            props: { width: 78, height: 194, background: "#635BFF", radius: 9 }
+                            place: { x: 562, y: 12 }
+              - type: grid
+                props: { columns: [1fr, 1fr, 1fr], gap: 16, height: 210 }
+                children:
+                  - type: surface
+                    props: { background: "#FFFFFF", padding: { top: 20, right: 20, bottom: 20, left: 20 }, radius: 15, border: { thickness: 1, color: "#E8EBF1" } }
+                    children:
+                      - type: stack
+                        props: { direction: vertical, gap: 9 }
+                        children:
+                          - type: text
+                            props: { text: Enterprise, size: 14, weight: 700, color: "#182230", font: assets/StudioSans.ttf }
+                          - type: text
+                            props: { text: "$168.4k", size: 25, weight: 700, color: "#635BFF", font: assets/StudioSans.ttf }
+                          - type: text
+                            props: { text: 54% of recurring revenue, size: 11, color: "#7B8596", font: assets/StudioSans.ttf }
+                  - type: surface
+                    props: { background: "#FFFFFF", padding: { top: 20, right: 20, bottom: 20, left: 20 }, radius: 15, border: { thickness: 1, color: "#E8EBF1" } }
+                    children:
+                      - type: stack
+                        props: { direction: vertical, gap: 9 }
+                        children:
+                          - type: text
+                            props: { text: Mid-market, size: 14, weight: 700, color: "#182230", font: assets/StudioSans.ttf }
+                          - type: text
+                            props: { text: "$96.7k", size: 25, weight: 700, color: "#635BFF", font: assets/StudioSans.ttf }
+                          - type: text
+                            props: { text: 31% of recurring revenue, size: 11, color: "#7B8596", font: assets/StudioSans.ttf }
+                  - type: surface
+                    props: { background: "#FFFFFF", padding: { top: 20, right: 20, bottom: 20, left: 20 }, radius: 15, border: { thickness: 1, color: "#E8EBF1" } }
+                    children:
+                      - type: stack
+                        props: { direction: vertical, gap: 9 }
+                        children:
+                          - type: text
+                            props: { text: Self-serve, size: 14, weight: 700, color: "#182230", font: assets/StudioSans.ttf }
+                          - type: text
+                            props: { text: "$47.7k", size: 25, weight: 700, color: "#635BFF", font: assets/StudioSans.ttf }
+                          - type: text
+                            props: { text: 15% of recurring revenue, size: 11, color: "#7B8596", font: assets/StudioSans.ttf }
+
+      - type: scroll
+        name: customers-panel
+        props: { axis: vertical, scrollbar: true }
+        variants:
+          - when: { state: active_tab, not_equals: customers }
+            visible: false
+        children:
+          - type: stack
+            props:
+              direction: vertical
+              gap: 20
+              height: 900
+              padding: { top: 28, right: 28, bottom: 28, left: 28 }
+            children:
+              - type: stack
+                props: { direction: vertical, gap: 5, height: 66 }
+                children:
+                  - type: text
+                    props: { text: Customer portfolio, size: 28, weight: 700, color: "#182230", font: assets/StudioSans.ttf }
+                  - type: text
+                    props: { text: "Understand account health, expansion, and retention risk.", size: 13, color: "#7B8596", font: assets/StudioSans.ttf }
+              - type: grid
+                props: { columns: [1fr, 1fr, 1fr], gap: 16, height: 148 }
+                children:
+                  - type: instance
+                    props: { component: metric, parameters: { label: Active accounts, value: "18,429", delta: "+8.1% this month" } }
+                  - type: instance
+                    props: { component: metric, parameters: { label: Net retention, value: "114.6%", delta: "+3.2 pts this quarter" } }
+                  - type: instance
+                    props: { component: metric, parameters: { label: At-risk revenue, value: "$28,940", delta: "-12.5% this month" } }
+              - type: surface
+                props:
+                  height: 310
+                  background: "#FFFFFF"
+                  padding: { top: 22, right: 24, bottom: 20, left: 24 }
+                  radius: 16
+                  border: { thickness: 1, color: "#E8EBF1" }
+                children:
+                  - type: stack
+                    props: { direction: vertical, gap: 13 }
+                    children:
+                      - type: stack
+                        props: { direction: horizontal, height: 30, alignment: center }
+                        children:
+                          - type: text
+                            props: { text: Priority accounts, size: 16, weight: 700, color: "#182230", font: assets/StudioSans.ttf }
+                          - type: spacer
+                            place: { grow: 1 }
+                          - type: text
+                            props: { text: Health score, size: 11, weight: 600, color: "#8A94A6", font: assets/StudioSans.ttf }
+                      - type: divider
+                        props: { height: 1, thickness: 1, color: "#EEF0F4" }
+                      - type: text
+                        props: { text: "Luma Labs                Enterprise        $18,420           96 Excellent\nArc Systems             Enterprise        $12,880           91 Excellent\nFieldwork Co.            Mid-market         $9,640           84 Healthy\nMonument                 Mid-market         $7,920           72 Watch\nNorthwind                Enterprise         $6,480           64 At risk", size: 12, line_height: 43, color: "#445065", font: assets/StudioSans.ttf }
+              - type: grid
+                props: { columns: [1fr, 1fr], gap: 18, height: 250 }
+                children:
+                  - type: surface
+                    props: { background: "#172033", padding: { top: 22, right: 22, bottom: 22, left: 22 }, radius: 16 }
+                    children:
+                      - type: stack
+                        props: { direction: vertical, gap: 12 }
+                        children:
+                          - type: text
+                            props: { text: Expansion pipeline, size: 15, weight: 700, color: "#FFFFFF", font: assets/StudioSans.ttf }
+                          - type: text
+                            props: { text: "$74,200", size: 29, weight: 700, color: "#FFFFFF", font: assets/StudioSans.ttf }
+                          - type: text
+                            props: { text: 14 accounts show strong expansion signals., size: 12, color: "#B9C1CE", font: assets/StudioSans.ttf }
+                  - type: surface
+                    props: { background: "#F1EFFF", padding: { top: 22, right: 22, bottom: 22, left: 22 }, radius: 16 }
+                    children:
+                      - type: stack
+                        props: { direction: vertical, gap: 12 }
+                        children:
+                          - type: text
+                            props: { text: Retention focus, size: 15, weight: 700, color: "#182230", font: assets/StudioSans.ttf }
+                          - type: text
+                            props: { text: 23 accounts, size: 29, weight: 700, color: "#635BFF", font: assets/StudioSans.ttf }
+                          - type: text
+                            props: { text: Renewal conversations due in the next 30 days., size: 12, color: "#6E7889", font: assets/StudioSans.ttf }
+
+      - type: scroll
+        name: reports-panel
+        props: { axis: vertical, scrollbar: true }
+        variants:
+          - when: { state: active_tab, not_equals: reports }
+            visible: false
+        children:
+          - type: stack
+            props:
+              direction: vertical
+              gap: 20
+              height: 900
+              padding: { top: 28, right: 28, bottom: 28, left: 28 }
+            children:
+              - type: stack
+                props: { direction: vertical, gap: 5, height: 66 }
+                children:
+                  - type: text
+                    props: { text: Reports library, size: 28, weight: 700, color: "#182230", font: assets/StudioSans.ttf }
+                  - type: text
+                    props: { text: Review scheduled packs and reusable performance views., size: 13, color: "#7B8596", font: assets/StudioSans.ttf }
+              - type: grid
+                props: { columns: [1fr, 1fr], gap: 18, height: 420 }
+                children:
+                  - type: surface
+                    props: { background: "#FFFFFF", padding: { top: 22, right: 22, bottom: 22, left: 22 }, radius: 16, border: { thickness: 1, color: "#E8EBF1" } }
+                    children:
+                      - type: stack
+                        props: { direction: vertical, gap: 11 }
+                        children:
+                          - type: text
+                            props: { text: Executive performance, size: 16, weight: 700, color: "#182230", font: assets/StudioSans.ttf }
+                          - type: text
+                            props: { text: "Revenue, pipeline, retention, and forecast summary.", size: 12, color: "#7B8596", font: assets/StudioSans.ttf }
+                          - type: spacer
+                            place: { grow: 1 }
+                          - type: text
+                            props: { text: Updated today · Monthly, size: 11, weight: 600, color: "#635BFF", font: assets/StudioSans.ttf }
+                  - type: surface
+                    props: { background: "#FFFFFF", padding: { top: 22, right: 22, bottom: 22, left: 22 }, radius: 16, border: { thickness: 1, color: "#E8EBF1" } }
+                    children:
+                      - type: stack
+                        props: { direction: vertical, gap: 11 }
+                        children:
+                          - type: text
+                            props: { text: Customer health, size: 16, weight: 700, color: "#182230", font: assets/StudioSans.ttf }
+                          - type: text
+                            props: { text: "Cohort retention, expansion signals, and renewal risk.", size: 12, color: "#7B8596", font: assets/StudioSans.ttf }
+                          - type: spacer
+                            place: { grow: 1 }
+                          - type: text
+                            props: { text: Updated yesterday · Weekly, size: 11, weight: 600, color: "#635BFF", font: assets/StudioSans.ttf }
+                  - type: surface
+                    props: { background: "#FFFFFF", padding: { top: 22, right: 22, bottom: 22, left: 22 }, radius: 16, border: { thickness: 1, color: "#E8EBF1" } }
+                    children:
+                      - type: stack
+                        props: { direction: vertical, gap: 11 }
+                        children:
+                          - type: text
+                            props: { text: Channel efficiency, size: 16, weight: 700, color: "#182230", font: assets/StudioSans.ttf }
+                          - type: text
+                            props: { text: "Acquisition cost, conversion, and revenue by source.", size: 12, color: "#7B8596", font: assets/StudioSans.ttf }
+                          - type: spacer
+                            place: { grow: 1 }
+                          - type: text
+                            props: { text: Updated 3 days ago · Monthly, size: 11, weight: 600, color: "#635BFF", font: assets/StudioSans.ttf }
+                  - type: surface
+                    props: { background: "#172033", padding: { top: 22, right: 22, bottom: 22, left: 22 }, radius: 16 }
+                    children:
+                      - type: stack
+                        props: { direction: vertical, gap: 11 }
+                        children:
+                          - type: text
+                            props: { text: Board pack, size: 16, weight: 700, color: "#FFFFFF", font: assets/StudioSans.ttf }
+                          - type: text
+                            props: { text: Quarterly narrative with financial and customer context., size: 12, color: "#B9C1CE", font: assets/StudioSans.ttf }
+                          - type: spacer
+                            place: { grow: 1 }
+                          - type: text
+                            props: { text: Due in 6 days · Quarterly, size: 11, weight: 600, color: "#9D97FF", font: assets/StudioSans.ttf }
+              - type: surface
+                props:
+                  height: 230
+                  background: "#FFFFFF"
+                  padding: { top: 22, right: 24, bottom: 22, left: 24 }
+                  radius: 16
+                  border: { thickness: 1, color: "#E8EBF1" }
+                children:
+                  - type: stack
+                    props: { direction: vertical, gap: 13 }
+                    children:
+                      - type: text
+                        props: { text: Scheduled delivery, size: 16, weight: 700, color: "#182230", font: assets/StudioSans.ttf }
+                      - type: divider
+                        props: { height: 1, thickness: 1, color: "#EEF0F4" }
+                      - type: text
+                        props: { text: "Monday 09:00      Executive performance      Leadership team\nWednesday 08:30    Customer health              Customer success\nMonth end 17:00    Channel efficiency            Growth team", size: 12, line_height: 43, color: "#445065", font: assets/StudioSans.ttf }

@@ -312,7 +312,7 @@ func (runtime *Runtime) Capture(path string, scale int) (string, error) {
 		return "", err
 	}
 	if snapshot.Invalid {
-		return "source is invalid; captured the visible last-good frame", nil
+		return "source is invalid; captured the last-good frame", nil
 	}
 	return "", nil
 }

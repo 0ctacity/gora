@@ -24,10 +24,19 @@ const (
 	ExitFailure    = 2
 )
 
+type LaunchMode string
+
+const (
+	LaunchApp      LaunchMode = "app"
+	LaunchStudio   LaunchMode = "studio"
+	LaunchHeadless LaunchMode = "headless"
+)
+
 type LaunchConfig struct {
 	Root       string
 	Document   string
 	SocketPath string
+	Mode       LaunchMode
 }
 
 type Launcher func(LaunchConfig) error
@@ -122,8 +131,20 @@ func runCommand(args []string, stderr io.Writer, launch Launcher) int {
 	flags := flag.NewFlagSet("run", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	root := flags.String("root", "", "containment root")
+	studioMode := flags.Bool("studio", false, "open Studio")
+	headlessMode := flags.Bool("headless", false, "run without a visible window")
 	if err := flags.Parse(options); err != nil || flags.NArg() != 0 {
 		return ExitFailure
+	}
+	if *studioMode && *headlessMode {
+		fmt.Fprintln(stderr, "--studio and --headless are mutually exclusive")
+		return ExitFailure
+	}
+	mode := LaunchApp
+	if *studioMode {
+		mode = LaunchStudio
+	} else if *headlessMode {
+		mode = LaunchHeadless
 	}
 	resolvedRoot, resolvedFile, err := canonicalPair(*root, file)
 	if err != nil {
@@ -140,7 +161,7 @@ func runCommand(args []string, stderr io.Writer, launch Launcher) int {
 		fmt.Fprintln(stderr, "token modules are validation-only; run an app or component document")
 		return ExitFailure
 	}
-	socket, err := session.SocketPath(resolvedRoot, resolvedFile)
+	socket, err := session.SocketPath(resolvedRoot, resolvedFile, string(mode))
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return ExitFailure
@@ -156,12 +177,15 @@ func runCommand(args []string, stderr io.Writer, launch Launcher) int {
 			fmt.Fprintf(stderr, "%s:%d:%d: %s: %s\n", diagnostic.File, diagnostic.Line, diagnostic.Column, diagnostic.Code, diagnostic.Message)
 		}
 		exit = ExitValidation
+		if mode == LaunchApp {
+			return exit
+		}
 	}
 	if launch == nil {
-		fmt.Fprintln(stderr, "Studio launcher is unavailable")
+		fmt.Fprintln(stderr, "runtime launcher is unavailable")
 		return ExitFailure
 	}
-	if err := launch(LaunchConfig{Root: resolvedRoot, Document: resolvedFile, SocketPath: socket}); err != nil {
+	if err := launch(LaunchConfig{Root: resolvedRoot, Document: resolvedFile, SocketPath: socket, Mode: mode}); err != nil {
 		fmt.Fprintln(stderr, err)
 		return ExitFailure
 	}
@@ -178,11 +202,16 @@ func renderCommand(args []string, stderr io.Writer) int {
 	root := flags.String("root", "", "containment root")
 	output := flags.String("output", "", "new PNG output")
 	scaleText := flags.String("scale", "1", "positive integer scale")
+	from := flags.String("from", string(LaunchApp), "live app, studio, or headless session")
 	if err := flags.Parse(options); err != nil || flags.NArg() != 0 {
 		return ExitFailure
 	}
 	if *output == "" {
 		fmt.Fprintln(stderr, "render requires --output <new.png>")
+		return ExitFailure
+	}
+	if *from != string(LaunchApp) && *from != string(LaunchStudio) && *from != string(LaunchHeadless) {
+		fmt.Fprintln(stderr, "--from must be app, studio, or headless")
 		return ExitFailure
 	}
 	scale, err := strconv.Atoi(*scaleText)
@@ -199,18 +228,18 @@ func renderCommand(args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return ExitFailure
 	}
-	socket, err := session.SocketPath(resolvedRoot, resolvedFile)
+	socket, err := session.SocketPath(resolvedRoot, resolvedFile, *from)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return ExitFailure
 	}
 	response, err := session.Send(socket, session.Request{Action: "render", Output: *output, Scale: scale}, 30*time.Second)
 	if err != nil {
-		fmt.Fprintf(stderr, "no matching live Studio session: %v\n", err)
+		fmt.Fprintf(stderr, "no matching live %s session: %v\n", *from, err)
 		return ExitFailure
 	}
 	if !response.OK {
-		fmt.Fprintln(stderr, "live Studio session rejected the capture request")
+		fmt.Fprintf(stderr, "live %s session rejected the capture request\n", *from)
 		return ExitFailure
 	}
 	if response.Warning != "" {
@@ -287,7 +316,7 @@ func sortDiagnostics(diagnostics []document.Diagnostic) {
 
 func usage(output io.Writer) {
 	fmt.Fprintln(output, "usage:")
-	fmt.Fprintln(output, "  gora run <file> [--root <dir>]")
+	fmt.Fprintln(output, "  gora run <file> [--root <dir>] [--studio|--headless]")
 	fmt.Fprintln(output, "  gora validate <file> [--root <dir>] [--format text|json]")
-	fmt.Fprintln(output, "  gora render <file> --output <new.png> [--scale <positive-integer>] [--root <dir>]")
+	fmt.Fprintln(output, "  gora render <file> --output <new.png> [--scale <positive-integer>] [--root <dir>] [--from app|studio|headless]")
 }

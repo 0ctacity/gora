@@ -1,9 +1,10 @@
 # Gora
 
 Gora is a cross-platform preview runtime for strict, local `.gora` UI documents.
-It turns a small YAML document into a native Studio canvas with live reload,
-responsive breakpoints, inspection, scrolling, deterministic local state,
-semantic buttons, and deterministic PNG capture.
+It turns a small YAML document into a live native app window, an optional Studio
+canvas, or a headless automation session with responsive breakpoints,
+scrolling, deterministic local state, semantic buttons, and deterministic PNG
+capture.
 
 V1 is deliberately a preview tool. It does not generate production UI code and
 does not include navigation, text inputs/forms, animation, remote assets, SVG,
@@ -30,10 +31,22 @@ Validate an example:
 ./gora validate examples/dashboard/app.gora --root examples/dashboard
 ```
 
-Open it in Studio:
+Open the rendered app directly:
 
 ```sh
 ./gora run examples/dashboard/app.gora --root examples/dashboard
+```
+
+Open the same document in Studio:
+
+```sh
+./gora run examples/dashboard/app.gora --root examples/dashboard --studio
+```
+
+Run it without a visible window for automation and future MCP integration:
+
+```sh
+./gora run examples/dashboard/app.gora --root examples/dashboard --headless
 ```
 
 To exercise percentage sizing, aspect ratios, intrinsic containers, and
@@ -48,17 +61,18 @@ To exercise local state, component-instance isolation, pointer and keyboard
 activation, interaction variants, and Reset state:
 
 ```sh
-./gora run examples/interactivity/app.gora --root .
+./gora run examples/interactivity/app.gora --root . --studio
 ```
 
-While that Studio session is open, capture its current screen, viewport,
-responsive state, and scroll position:
+While a session is open, capture its current screen, viewport, responsive
+state, and scroll position. `--from` defaults to `app`:
 
 ```sh
 ./gora render examples/dashboard/app.gora \
   --root examples/dashboard \
   --output /tmp/gora-dashboard.png \
-  --scale 2
+  --scale 2 \
+  --from app
 ```
 
 The output path must not already exist.

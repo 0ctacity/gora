@@ -37,7 +37,7 @@ type Server struct {
 	once     sync.Once
 }
 
-func SocketPath(root, document string) (string, error) {
+func SocketPath(root, document, mode string) (string, error) {
 	cache, err := os.UserCacheDir()
 	if err != nil {
 		return "", err
@@ -56,7 +56,7 @@ func SocketPath(root, document string) (string, error) {
 	if err := os.Chmod(directory, 0o700); err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256([]byte(root + "\x00" + document))
+	sum := sha256.Sum256([]byte(root + "\x00" + document + "\x00" + mode))
 	return filepath.Join(directory, hex.EncodeToString(sum[:16])+".sock"), nil
 }
 
