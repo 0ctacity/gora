@@ -86,12 +86,16 @@ type StateDeclaration struct {
 	Type    string
 	Default any
 	Values  []string
+	Min     *float64
+	Max     *float64
+	Step    *float64
 	Source  Source
 }
 
 type Action struct {
 	Action string
 	State  string
+	To     string
 	Value  any
 	By     any
 	Source Source

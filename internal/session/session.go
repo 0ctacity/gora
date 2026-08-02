@@ -23,9 +23,10 @@ type Request struct {
 }
 
 type Response struct {
-	OK      bool   `json:"ok"`
-	Error   string `json:"error,omitempty"`
-	Warning string `json:"warning,omitempty"`
+	OK      bool            `json:"ok"`
+	Error   string          `json:"error,omitempty"`
+	Warning string          `json:"warning,omitempty"`
+	Data    json.RawMessage `json:"data,omitempty"`
 }
 
 type Handler func(context.Context, Request) Response

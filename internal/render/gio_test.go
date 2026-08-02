@@ -89,6 +89,85 @@ func TestCPUAndGioUseIdenticalStackGeometry(t *testing.T) {
 	}
 }
 
+func TestCPUAndGioUseIdenticalSemanticSliderGeometry(t *testing.T) {
+	minimum, maximum, step := 0.0, 100.0, 5.0
+	root := &project.Node{
+		Handle: "slider", Type: "slider", Name: "volume-slider", Binding: "volume",
+		BindingState: &document.StateDeclaration{Type: "number", Min: &minimum, Max: &maximum, Step: &step},
+		Props:        map[string]any{"label": "Volume", "value": float64(50), "orientation": "horizontal"},
+		Children: []*project.Node{
+			{Handle: "track", Type: "slider_track", Props: map[string]any{"height": float64(4)}},
+			{Handle: "fill", Type: "slider_fill", Props: map[string]any{"height": float64(4)}},
+			{Handle: "thumb", Type: "slider_thumb", Props: map[string]any{"width": float64(12), "height": float64(12)}},
+		},
+	}
+	viewport := image.Pt(200, 30)
+	cpu := Render(root, viewport, State{})
+	var operations op.Ops
+	gio := LayoutGio(layout.Context{Ops: &operations, Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}, Constraints: layout.Exact(viewport)}, material.NewTheme(), root, viewport, State{})
+	for _, handle := range []string{"slider", "track", "fill", "thumb"} {
+		if cpu.Bounds[handle] != gio.Bounds[handle] {
+			t.Fatalf("%s bounds: CPU=%v Gio=%v", handle, cpu.Bounds[handle], gio.Bounds[handle])
+		}
+	}
+	if got := cpu.Bounds["thumb"]; got.Min.X != 94 || got.Max.X != 106 || got.Min.Y != 9 || got.Max.Y != 21 {
+		t.Fatalf("thumb bounds = %v", got)
+	}
+	if got := cpu.Bounds["fill"]; got.Min.X != 0 || got.Max.X != 100 {
+		t.Fatalf("fill bounds = %v", got)
+	}
+}
+
+func TestCPUAndGioUseIdenticalTabsAndOpenSelectGeometry(t *testing.T) {
+	tabs := &project.Node{Handle: "tabs", Type: "tabs", Props: map[string]any{"orientation": "horizontal", "gap": float64(8), "panel_gap": float64(10)}, Children: []*project.Node{
+		{Handle: "tab-a", Type: "tab", Props: map[string]any{"width": float64(70), "height": float64(28)}, Children: []*project.Node{{Handle: "tab-a-label", Type: "text", Props: map[string]any{"text": "A"}}}},
+		{Handle: "tab-b", Type: "tab", Props: map[string]any{"width": float64(80), "height": float64(28)}, Children: []*project.Node{{Handle: "tab-b-label", Type: "text", Props: map[string]any{"text": "B"}}}},
+		{Handle: "panel-a", Type: "tab_panel", Hidden: true},
+		{Handle: "panel-b", Type: "tab_panel", Children: []*project.Node{{Handle: "panel-content", Type: "surface"}}},
+	}}
+	viewport := image.Pt(240, 140)
+	cpu := Render(tabs, viewport, State{})
+	var operations op.Ops
+	gio := LayoutGio(layout.Context{Ops: &operations, Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}, Constraints: layout.Exact(viewport)}, material.NewTheme(), tabs, viewport, State{})
+	for _, handle := range []string{"tabs", "tab-a", "tab-b", "panel-b", "panel-content"} {
+		if cpu.Bounds[handle] != gio.Bounds[handle] {
+			t.Fatalf("%s bounds: CPU=%v Gio=%v", handle, cpu.Bounds[handle], gio.Bounds[handle])
+		}
+	}
+	if cpu.Bounds["tab-b"].Min.X != 78 || cpu.Bounds["panel-b"].Min.Y != 38 {
+		t.Fatalf("tabs geometry = tab-b %v panel %v", cpu.Bounds["tab-b"], cpu.Bounds["panel-b"])
+	}
+}
+
+func TestOpenSelectPopupUsesViewportClampedTopLayer(t *testing.T) {
+	selectNode := &project.Node{Handle: "select", Type: "select", Props: map[string]any{"width": float64(100), "height": float64(30), "open": true}, Children: []*project.Node{
+		{Handle: "trigger", Type: "select_trigger", Children: []*project.Node{{Handle: "trigger-label", Type: "text", Props: map[string]any{"text": "Design"}}}},
+		{Handle: "popup", Type: "select_popup", Props: map[string]any{"gap": float64(2), "max_height": float64(70), "match_trigger_width": true}, Children: []*project.Node{
+			{Handle: "option-a", Type: "option", Props: map[string]any{"height": float64(24)}, Children: []*project.Node{{Handle: "option-a-label", Type: "text", Props: map[string]any{"text": "Design"}}}},
+			{Handle: "option-b", Type: "option", Props: map[string]any{"height": float64(24)}, Children: []*project.Node{{Handle: "option-b-label", Type: "text", Props: map[string]any{"text": "Engineering"}}}},
+		}},
+	}}
+	root := &project.Node{Handle: "overlay", Type: "overlay", Children: []*project.Node{
+		selectNode,
+		{Handle: "later", Type: "surface", Props: map[string]any{"width": float64(140), "height": float64(80)}},
+	}}
+	viewport := image.Pt(160, 100)
+	cpu := Render(root, viewport, State{})
+	var operations op.Ops
+	gio := LayoutGio(layout.Context{Ops: &operations, Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}, Constraints: layout.Exact(viewport)}, material.NewTheme(), root, viewport, State{})
+	for _, handle := range []string{"trigger", "popup", "option-a", "option-b"} {
+		if cpu.Bounds[handle] != gio.Bounds[handle] {
+			t.Fatalf("%s bounds: CPU=%v Gio=%v", handle, cpu.Bounds[handle], gio.Bounds[handle])
+		}
+	}
+	if got := cpu.Bounds["popup"]; got.Min.Y != 30 || got.Max.X != 100 || got.Max.Y > viewport.Y {
+		t.Fatalf("popup bounds = %v", got)
+	}
+	if cpu.Geometry["popup"].PaintOrder <= cpu.Geometry["later"].PaintOrder {
+		t.Fatalf("popup paint order=%d later=%d", cpu.Geometry["popup"].PaintOrder, cpu.Geometry["later"].PaintOrder)
+	}
+}
+
 func TestGioLabelLoadsDocumentLocalFontIntoNativeShaper(t *testing.T) {
 	theme := material.NewTheme()
 	renderer := gioRenderer{theme: theme, opacity: 1}
@@ -159,7 +238,7 @@ func TestScrollClipsDoNotPaintBeyondVisibleViewport(t *testing.T) {
 	}
 }
 
-func TestGioCacheBuildsImmutableSceneOnceAndRepositionsScrolledInspection(t *testing.T) {
+func TestGioCacheBuildsImmutableSceneOnceAndRepositionsScrolledGeometry(t *testing.T) {
 	root := &project.Node{
 		Handle: "feed-scroll",
 		Name:   "feed",
@@ -197,10 +276,8 @@ func TestGioCacheBuildsImmutableSceneOnceAndRepositionsScrolledInspection(t *tes
 	if got := second.Bounds["feed-content"]; got != image.Rect(0, -40, 100, 260) {
 		t.Fatalf("scrolled content bounds = %v", got)
 	}
-	for _, inspection := range second.Inspections {
-		if inspection.Handle == "feed-content" && inspection.Clip != image.Rect(0, 0, 100, 100) {
-			t.Fatalf("scrolled inspection clip = %v", inspection.Clip)
-		}
+	if geometry := second.Geometry["feed-content"]; geometry.Clip != image.Rect(0, 0, 100, 100) {
+		t.Fatalf("scrolled geometry clip = %v", geometry.Clip)
 	}
 }
 
@@ -248,8 +325,8 @@ func TestGioCacheReplaysTransientButtonPaintWithoutGeometryRebuild(t *testing.T)
 	if cache.builds != 1 {
 		t.Fatalf("scene builds = %d, want 1", cache.builds)
 	}
-	if len(hovered.Inspections) == 0 || hovered.Inspections[0].Props["background"] != "#FF0000" || !hovered.Inspections[0].Hovered {
-		t.Fatalf("hovered inspection = %+v", hovered.Inspections)
+	if hovered.Tree == nil || hovered.Tree.Props["background"] != "#FF0000" || !hovered.Tree.Hovered {
+		t.Fatalf("hovered runtime tree = %+v", hovered.Tree)
 	}
 }
 

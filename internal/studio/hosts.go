@@ -39,7 +39,7 @@ func StartApp(root, entry, socketPath string) error {
 		app.Title(filepath.Base(entry)),
 		app.Size(unit.Dp(snapshot.Viewport.X), unit.Dp(snapshot.Viewport.Y)),
 	)
-	server, err := session.Listen(socketPath, runtime.SessionHandler(func() {
+	server, err := session.Listen(socketPath, runtime.SessionHandler("app", func() {
 		window.Perform(system.ActionRaise)
 		window.Invalidate()
 	}))
@@ -94,6 +94,7 @@ func layoutAppContent(gtx layout.Context, theme *material.Theme, runtime *Runtim
 		runtime.SetViewport(logicalSize.X, logicalSize.Y)
 	}
 	snapshot := runtime.Snapshot()
+	state.router.SyncTransient(snapshot.Transient)
 	state.canvasViewport = pixelSize
 	state.canvasSize = pixelSize
 	state.canvasPan = image.Point{}
@@ -107,9 +108,9 @@ func layoutAppContent(gtx layout.Context, theme *material.Theme, runtime *Runtim
 	previewGtx.Constraints = layout.Exact(pixelSize)
 	result := state.preview.Layout(previewGtx, theme, snapshot.Root, snapshot.Viewport, renderState(snapshot))
 	layoutPreviewScrollbar(previewGtx, theme, runtime, state, snapshot, result, window)
-	state.inspections = result.Inspections
-	state.interactions = append(state.interactions[:0], result.Interactions...)
-	state.router.Update(state.interactions)
+	state.runtimeTree = result.Tree
+	runtime.PublishTree(result.Tree)
+	state.router.Update(state.runtimeTree)
 	if state.router.Transient() != snapshot.Transient {
 		runtime.SetTransient(state.router.Transient())
 		window.Invalidate()
@@ -183,7 +184,7 @@ func runHeadless(ctx context.Context, root, entry, socketPath string) error {
 	if err != nil {
 		return err
 	}
-	server, err := session.Listen(socketPath, runtime.SessionHandler(nil))
+	server, err := session.Listen(socketPath, runtime.SessionHandler("headless", nil))
 	if err != nil {
 		return err
 	}
@@ -203,7 +204,5 @@ func runtimeAllowInvalid(root, entry string) (*Runtime, error) {
 	if err == nil {
 		return runtime, nil
 	}
-	runtime = &Runtime{root: root, entry: entry, scroll: make(map[string]image.Point), state: interaction.NewStore()}
-	runtime.Reload()
-	return runtime, nil
+	return NewRuntimeAllowInvalid(root, entry), nil
 }

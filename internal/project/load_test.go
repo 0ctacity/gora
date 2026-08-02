@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"gora/internal/document"
 )
 
 func TestLoadResolvesComponentsTokensParametersAndResponsiveProps(t *testing.T) {
@@ -116,6 +118,54 @@ screens:
 	if len(screen.Breadcrumb) != 1 || screen.Breadcrumb[0] != "revenue-card" {
 		t.Fatalf("breadcrumb = %#v, want [revenue-card]", screen.Breadcrumb)
 	}
+}
+
+func TestLoadRejectsDuplicateResolvedChoiceValues(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "chooser.gora"), `
+gora: 1
+kind: component
+parameters:
+  first: { type: text, required: true }
+  second: { type: text, required: true }
+state:
+  choice: { type: text, default: a }
+viewport: { width: 300, height: 200 }
+previews:
+  default: { parameters: { first: a, second: b } }
+root:
+  type: radio_group
+  name: choices
+  props: { label: Choices, bind: choice }
+  children:
+    - type: radio
+      name: first-choice
+      props: { label: First, value: { ref: parameter.first } }
+      children: [{ type: text, props: { content: First } }]
+    - type: radio
+      name: second-choice
+      props: { label: Second, value: { ref: parameter.second } }
+      children: [{ type: text, props: { content: Second } }]
+`)
+	writeFile(t, filepath.Join(root, "app.gora"), `
+gora: 1
+kind: app
+imports: { components: { chooser: chooser.gora } }
+viewport: { width: 600, height: 400 }
+entry: main
+screens:
+  main:
+    type: instance
+    name: chooser-instance
+    props: { component: chooser, parameters: { first: same, second: same } }
+`)
+	_, diagnostics := Load(root, filepath.Join(root, "app.gora"), 600)
+	for _, diagnostic := range diagnostics {
+		if diagnostic.Code == "control.value_duplicate" {
+			return
+		}
+	}
+	t.Fatalf("missing duplicate resolved choice diagnostic: %+v", diagnostics)
 }
 
 func TestLoadResolvesPercentageDimensionsFromTokensAndParameters(t *testing.T) {
@@ -287,6 +337,7 @@ entry: main
 screens:
   main:
     type: button
+    name: save
     props: { label: Save, disabled: { ref: state.count } }
     on:
       activate:
@@ -313,6 +364,96 @@ screens:
 	}
 }
 
+func TestLoadResolvesAndValidatesComponentLinkTargetsAgainstAppScreens(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "nav-item.gora"), `
+gora: 1
+kind: component
+viewport: { width: 200, height: 50 }
+parameters:
+  target: { type: text, required: true }
+previews:
+  default:
+    parameters: { target: reports }
+root:
+  type: link
+  name: nav-link
+  props: { label: Open screen, to: { ref: parameter.target } }
+  children:
+    - { type: text, props: { text: Open screen } }
+`)
+	writeFile(t, filepath.Join(root, "app.gora"), `
+gora: 1
+kind: app
+viewport: { width: 400, height: 300 }
+imports:
+  components: { nav: nav-item.gora }
+entry: home
+screens:
+  home:
+    type: instance
+    props: { component: nav, parameters: { target: reports } }
+  reports: { type: spacer }
+`)
+
+	loaded, diagnostics := Load(root, filepath.Join(root, "app.gora"), 400)
+	if len(diagnostics) != 0 {
+		t.Fatalf("Load diagnostics: %+v", diagnostics)
+	}
+	if got := loaded.Screens["home"]; got == nil || got.Type != "link" || got.Props["to"] != "reports" {
+		t.Fatalf("resolved link = %+v", got)
+	}
+
+	writeFile(t, filepath.Join(root, "invalid.gora"), `
+gora: 1
+kind: app
+viewport: { width: 400, height: 300 }
+imports:
+  components: { nav: nav-item.gora }
+entry: home
+screens:
+  home:
+    type: instance
+    props: { component: nav, parameters: { target: missing } }
+`)
+	_, diagnostics = Load(root, filepath.Join(root, "invalid.gora"), 400)
+	requireProjectDiagnostic(t, diagnostics, "link.target")
+}
+
+func TestLoadPreservesResponsiveHiddenNodes(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "app.gora"), `
+gora: 1
+kind: app
+viewport: { width: 400, height: 300 }
+breakpoints:
+  compact: { max_width: 500 }
+entry: home
+screens:
+  home:
+    type: stack
+    children:
+      - type: text
+        name: compact-hidden
+        props: { text: Hidden }
+        responsive:
+          compact: { visible: false }
+`)
+
+	loaded, diagnostics := Load(root, filepath.Join(root, "app.gora"), 400)
+	if len(diagnostics) != 0 {
+		t.Fatalf("Load diagnostics: %+v", diagnostics)
+	}
+	child := loaded.Screens["home"].Children[0]
+	if child.Name != "compact-hidden" || !child.Hidden {
+		t.Fatalf("hidden child = %+v", child)
+	}
+}
+
 func samePercent(value any, want float64) bool {
 	mapping, ok := value.(map[string]any)
 	if !ok {
@@ -326,6 +467,16 @@ func samePercent(value any, want float64) bool {
 	default:
 		return false
 	}
+}
+
+func requireProjectDiagnostic(t *testing.T, diagnostics []document.Diagnostic, code string) {
+	t.Helper()
+	for _, diagnostic := range diagnostics {
+		if diagnostic.Code == code {
+			return
+		}
+	}
+	t.Fatalf("missing %s diagnostic: %+v", code, diagnostics)
 }
 
 func TestLoadRejectsImportOutsideRoot(t *testing.T) {

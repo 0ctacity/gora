@@ -42,17 +42,20 @@ type StateScope struct {
 }
 
 type Node struct {
-	Handle     string
-	Type       string
-	Name       string
-	Props      map[string]any
-	Place      map[string]any
-	Children   []*Node
-	Source     document.Source
-	Breadcrumb []string
-	Scope      string
-	On         document.Events
-	Variants   []document.Variant
+	Handle       string
+	Type         string
+	Name         string
+	Hidden       bool
+	Props        map[string]any
+	Place        map[string]any
+	Children     []*Node
+	Source       document.Source
+	Breadcrumb   []string
+	Scope        string
+	Binding      string
+	BindingState *document.StateDeclaration
+	On           document.Events
+	Variants     []document.Variant
 }
 
 type loader struct {
@@ -64,6 +67,8 @@ type loader struct {
 	diagnostics  []document.Diagnostic
 	nextHandle   int
 	stateScopes  map[string]StateScope
+	appScreens   map[string]*document.Node
+	overlay      map[string][]byte
 }
 
 type resolveContext struct {
@@ -83,6 +88,15 @@ func Load(root, entry string, viewportWidth int) (*Loaded, []document.Diagnostic
 }
 
 func LoadSelection(root, entry string, viewportWidth int, selection string) (*Loaded, []document.Diagnostic) {
+	return loadSelection(root, entry, viewportWidth, selection, nil)
+}
+
+// LoadSelectionOverlay resolves a project against in-memory source replacements.
+func LoadSelectionOverlay(root, entry string, viewportWidth int, selection string, overlay map[string][]byte) (*Loaded, []document.Diagnostic) {
+	return loadSelection(root, entry, viewportWidth, selection, overlay)
+}
+
+func loadSelection(root, entry string, viewportWidth int, selection string, overlay map[string][]byte) (*Loaded, []document.Diagnostic) {
 	canonicalRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		return nil, []document.Diagnostic{loadDiagnostic(root, "project.root", err.Error())}
@@ -91,7 +105,7 @@ func LoadSelection(root, entry string, viewportWidth int, selection string) (*Lo
 	if err != nil {
 		return nil, []document.Diagnostic{loadDiagnostic(root, "project.root", err.Error())}
 	}
-	canonicalEntry, err := canonicalPath(canonicalRoot, entry)
+	canonicalEntry, err := canonicalPathOverlay(canonicalRoot, entry, overlay)
 	if err != nil {
 		return nil, []document.Diagnostic{entryDiagnostic(entry, err)}
 	}
@@ -106,6 +120,7 @@ func LoadSelection(root, entry string, viewportWidth int, selection string) (*Lo
 		loading:      make(map[string]bool),
 		dependencies: make(map[string]struct{}),
 		stateScopes:  make(map[string]StateScope),
+		overlay:      overlay,
 	}
 	doc := l.loadDocument(canonicalEntry)
 	if doc == nil || len(l.diagnostics) != 0 {
@@ -113,6 +128,9 @@ func LoadSelection(root, entry string, viewportWidth int, selection string) (*Lo
 	}
 
 	components, tokens := l.importsFor(doc)
+	if doc.Kind == document.KindApp {
+		l.appScreens = doc.Screens
+	}
 	ctx := resolveContext{doc: doc, components: components, tokens: tokens}
 	loaded := &Loaded{
 		Document: doc,
@@ -275,7 +293,7 @@ func (l *loader) trackAssets(node *Node) {
 			l.add(node.Source.File, node.Source.Line, node.Source.Column, "asset.path", fmt.Sprintf("%s requires %s", node.Type, key))
 			continue
 		}
-		path, err := canonicalPath(l.root, filepath.Join(filepath.Dir(node.Source.File), raw))
+		path, err := canonicalPathOverlay(l.root, filepath.Join(filepath.Dir(node.Source.File), raw), l.overlay)
 		if err != nil {
 			l.add(node.Source.File, node.Source.Line, node.Source.Column, "asset.path", err.Error())
 			continue
@@ -469,7 +487,11 @@ func (l *loader) loadDocument(path string) *document.Document {
 	l.loading[path] = true
 	defer delete(l.loading, path)
 
-	src, err := os.ReadFile(path)
+	src, ok := l.overlay[filepath.Clean(path)]
+	var err error
+	if !ok {
+		src, err = os.ReadFile(path)
+	}
 	if err != nil {
 		l.add(path, 1, 1, "import.read", err.Error())
 		return nil
@@ -488,7 +510,7 @@ func (l *loader) loadDocument(path string) *document.Document {
 			l.add(path, 1, 1, "import.extension", fmt.Sprintf("component import %q must use the .gora extension", alias))
 			continue
 		}
-		resolved, err := canonicalPath(l.root, filepath.Join(filepath.Dir(path), importPath))
+		resolved, err := canonicalPathOverlay(l.root, filepath.Join(filepath.Dir(path), importPath), l.overlay)
 		if err != nil {
 			l.add(path, 1, 1, "import.path", fmt.Sprintf("component import %q: %v", alias, err))
 			continue
@@ -503,7 +525,7 @@ func (l *loader) loadDocument(path string) *document.Document {
 			l.add(path, 1, 1, "import.extension", fmt.Sprintf("token import %q must use the .gora extension", alias))
 			continue
 		}
-		resolved, err := canonicalPath(l.root, filepath.Join(filepath.Dir(path), importPath))
+		resolved, err := canonicalPathOverlay(l.root, filepath.Join(filepath.Dir(path), importPath), l.overlay)
 		if err != nil {
 			l.add(path, 1, 1, "import.path", fmt.Sprintf("token import %q: %v", alias, err))
 			continue
@@ -527,7 +549,7 @@ func (l *loader) trackTokenAssets(doc *document.Document) {
 			l.add(doc.File, 1, 1, "asset.path", fmt.Sprintf("font_face token %q requires src", name))
 			continue
 		}
-		path, err := canonicalPath(l.root, filepath.Join(filepath.Dir(doc.File), source))
+		path, err := canonicalPathOverlay(l.root, filepath.Join(filepath.Dir(doc.File), source), l.overlay)
 		if err != nil {
 			l.add(doc.File, 1, 1, "asset.path", err.Error())
 			continue
@@ -555,13 +577,13 @@ func (l *loader) importsFor(doc *document.Document) (map[string]*document.Docume
 	components := make(map[string]*document.Document)
 	tokens := make(map[string]*document.Document)
 	for alias, importPath := range doc.Imports.Components {
-		path, err := canonicalPath(l.root, filepath.Join(filepath.Dir(doc.File), importPath))
+		path, err := canonicalPathOverlay(l.root, filepath.Join(filepath.Dir(doc.File), importPath), l.overlay)
 		if err == nil {
 			components[alias] = l.cache[path]
 		}
 	}
 	for alias, importPath := range doc.Imports.Tokens {
-		path, err := canonicalPath(l.root, filepath.Join(filepath.Dir(doc.File), importPath))
+		path, err := canonicalPathOverlay(l.root, filepath.Join(filepath.Dir(doc.File), importPath), l.overlay)
 		if err == nil {
 			tokens[alias] = l.cache[path]
 		}
@@ -591,17 +613,19 @@ func (l *loader) resolveNode(source *document.Node, ctx resolveContext) *Node {
 		props = mergeMaps(style, props)
 	}
 	validateResolvedValues(source, props, place, l)
-	if !visible {
-		return nil
-	}
-
 	if source.Type == "instance" {
-		return l.resolveInstance(source, props, place, ctx)
+		resolved := l.resolveInstance(source, props, place, ctx)
+		if resolved != nil {
+			resolved.Hidden = resolved.Hidden || !visible
+		}
+		return resolved
 	}
 	if source.Type == "slot" {
 		name, _ := props["name"].(string)
 		if content, ok := ctx.slots[name]; ok {
-			return groupNode(source, content, ctx.breadcrumb, l)
+			group := groupNode(source, content, ctx.breadcrumb, l)
+			group.Hidden = !visible
+			return group
 		}
 		var defaults []*Node
 		for _, child := range source.Children {
@@ -609,7 +633,9 @@ func (l *loader) resolveNode(source *document.Node, ctx resolveContext) *Node {
 				defaults = append(defaults, resolved)
 			}
 		}
-		return groupNode(source, defaults, ctx.breadcrumb, l)
+		group := groupNode(source, defaults, ctx.breadcrumb, l)
+		group.Hidden = !visible
+		return group
 	}
 	if source.Type == "slot_content" {
 		l.add(source.Source.File, source.Source.Line, source.Source.Column, "component.slot_content", "slot_content is only valid as a direct child of an instance")
@@ -620,13 +646,19 @@ func (l *loader) resolveNode(source *document.Node, ctx resolveContext) *Node {
 		Handle:     l.handle(),
 		Type:       source.Type,
 		Name:       source.Name,
+		Hidden:     !visible,
 		Props:      props,
 		Place:      place,
 		Source:     source.Source,
 		Breadcrumb: append([]string(nil), ctx.breadcrumb...),
 		Scope:      ctx.scope,
+		Binding:    stringProp(props, "bind"),
 		On:         resolveEvents(source.On, ctx, l),
 		Variants:   resolveVariants(source.Variants, ctx, l),
+	}
+	if declaration, ok := ctx.doc.State[node.Binding]; ok {
+		copy := declaration
+		node.BindingState = &copy
 	}
 	l.validateResolvedInteraction(node, ctx)
 	for _, child := range source.Children {
@@ -638,16 +670,159 @@ func (l *loader) resolveNode(source *document.Node, ctx resolveContext) *Node {
 			}
 		}
 	}
+	propagateControlBinding(node, node.Binding, node.BindingState)
+	l.validateResolvedControls(node)
 	return node
 }
 
+func propagateControlBinding(node *Node, binding string, declaration *document.StateDeclaration) {
+	if node == nil || binding == "" {
+		return
+	}
+	for _, child := range node.Children {
+		if child == nil {
+			continue
+		}
+		switch child.Type {
+		case "radio", "tab", "tab_panel", "select_trigger", "select_popup", "option", "slider_track", "slider_fill", "slider_thumb", "stepper_decrement", "stepper_value", "stepper_increment":
+			child.Binding = binding
+			child.BindingState = declaration
+			propagateControlBinding(child, binding, declaration)
+		}
+	}
+}
+
+func stringProp(values map[string]any, key string) string {
+	value, _ := values[key].(string)
+	return value
+}
+
+func (l *loader) validateResolvedControls(node *Node) {
+	if node == nil {
+		return
+	}
+	if disabled, exists := node.Props["disabled"]; exists && !resolvedStateType(disabled, "boolean", l) {
+		l.add(node.Source.File, node.Source.Line, node.Source.Column, "control.disabled_type", node.Type+" disabled must resolve to boolean")
+	}
+	allowed := map[string][]string{
+		"toggle": {"boolean"}, "checkbox": {"boolean"},
+		"radio_group": {"text", "number", "enum"}, "tabs": {"text", "number", "enum"}, "select": {"text", "number", "enum"},
+		"slider": {"number"}, "stepper": {"number"},
+	}
+	if expected := allowed[node.Type]; len(expected) != 0 {
+		if node.BindingState == nil || !containsString(expected, node.BindingState.Type) {
+			l.add(node.Source.File, node.Source.Line, node.Source.Column, "control.binding", node.Type+" binding resolves to an incompatible state type")
+		}
+	}
+	switch node.Type {
+	case "radio_group":
+		l.validateResolvedChoices(node, directChildren(node, "radio"))
+	case "tabs":
+		l.validateResolvedChoices(node, directChildren(node, "tab"))
+		l.validateResolvedTabPanels(node)
+	case "select":
+		l.validateResolvedChoices(node, descendants(node, "option"))
+	}
+}
+
+func (l *loader) validateResolvedChoices(owner *Node, choices []*Node) {
+	if owner.BindingState == nil {
+		return
+	}
+	seen := make(map[string]bool)
+	for _, choice := range choices {
+		value, exists := choice.Props["value"]
+		if !exists || !resolvedStateValueMatches(*owner.BindingState, value, l) {
+			l.add(choice.Source.File, choice.Source.Line, choice.Source.Column, "control.value", choice.Type+" value resolves to the wrong bound-state type")
+			continue
+		}
+		key := fmt.Sprintf("%T:%v", value, value)
+		if seen[key] {
+			l.add(choice.Source.File, choice.Source.Line, choice.Source.Column, "control.value_duplicate", owner.Type+" values must be unique after resolution")
+		}
+		seen[key] = true
+	}
+}
+
+func (l *loader) validateResolvedTabPanels(node *Node) {
+	tabs := make(map[string]bool)
+	panels := make(map[string]bool)
+	for _, child := range node.Children {
+		if child == nil {
+			continue
+		}
+		key := fmt.Sprintf("%T:%v", child.Props["value"], child.Props["value"])
+		switch child.Type {
+		case "tab":
+			tabs[key] = true
+		case "tab_panel":
+			panels[key] = true
+		}
+	}
+	if len(tabs) != len(panels) {
+		l.add(node.Source.File, node.Source.Line, node.Source.Column, "tabs.pairing", "tabs require one matching panel per resolved tab value")
+		return
+	}
+	for key := range tabs {
+		if !panels[key] {
+			l.add(node.Source.File, node.Source.Line, node.Source.Column, "tabs.pairing", "tabs require one matching panel per resolved tab value")
+			return
+		}
+	}
+}
+
+func directChildren(node *Node, nodeType string) []*Node {
+	var result []*Node
+	for _, child := range node.Children {
+		if child != nil && child.Type == nodeType {
+			result = append(result, child)
+		}
+	}
+	return result
+}
+
+func descendants(node *Node, nodeType string) []*Node {
+	var result []*Node
+	for _, child := range node.Children {
+		if child == nil {
+			continue
+		}
+		if child.Type == nodeType {
+			result = append(result, child)
+		}
+		result = append(result, descendants(child, nodeType)...)
+	}
+	return result
+}
+
 func (l *loader) validateResolvedInteraction(node *Node, ctx resolveContext) {
-	if node.Type == "button" {
+	if node.Type == "button" || node.Type == "link" {
 		if disabled, exists := node.Props["disabled"]; exists && !resolvedStateType(disabled, "boolean", l) {
-			l.add(node.Source.File, node.Source.Line, node.Source.Column, "button.disabled_type", "button disabled must resolve to boolean state")
+			l.add(node.Source.File, node.Source.Line, node.Source.Column, node.Type+".disabled_type", node.Type+" disabled must resolve to boolean state")
+		}
+	}
+	if node.Type == "link" {
+		target, ok := node.Props["to"].(string)
+		if !ok || strings.TrimSpace(target) == "" {
+			l.add(node.Source.File, node.Source.Line, node.Source.Column, "link.target", "link target must resolve to text")
+		} else if l.appScreens != nil {
+			if _, exists := l.appScreens[target]; !exists {
+				l.addSuggestions(node.Source.File, node.Source.Line, node.Source.Column, "link.target", fmt.Sprintf("link target %q does not exist", target), stringKeys(l.appScreens))
+			}
 		}
 	}
 	for _, action := range node.On.Activate {
+		if action.Action == "navigate" || action.Action == "replace" {
+			if l.appScreens != nil {
+				if _, exists := l.appScreens[action.To]; !exists {
+					l.addSuggestions(action.Source.File, action.Source.Line, action.Source.Column, "action.target", fmt.Sprintf("navigation target %q does not exist", action.To), stringKeys(l.appScreens))
+				}
+			}
+			continue
+		}
+		if action.Action == "back" || action.Action == "forward" {
+			continue
+		}
 		declaration, ok := ctx.doc.State[action.State]
 		if !ok {
 			continue
@@ -1266,13 +1441,24 @@ func previewSlots(preview document.Preview, ctx resolveContext, l *loader) map[s
 }
 
 func canonicalPath(root, path string) (string, error) {
+	return canonicalPathOverlay(root, path, nil)
+}
+
+func canonicalPathOverlay(root, path string, overlay map[string][]byte) (string, error) {
 	absolute, err := filepath.Abs(path)
 	if err != nil {
 		return "", err
 	}
 	resolved, err := filepath.EvalSymlinks(absolute)
 	if err != nil {
-		return "", err
+		if _, ok := overlay[filepath.Clean(absolute)]; !ok || !os.IsNotExist(err) {
+			return "", err
+		}
+		parent, parentErr := filepath.EvalSymlinks(filepath.Dir(absolute))
+		if parentErr != nil {
+			return "", parentErr
+		}
+		resolved = filepath.Join(parent, filepath.Base(absolute))
 	}
 	relative, err := filepath.Rel(root, resolved)
 	if err != nil {

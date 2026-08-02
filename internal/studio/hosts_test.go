@@ -14,6 +14,7 @@ import (
 	"gioui.org/unit"
 	"gioui.org/widget/material"
 
+	"gora/internal/semantic"
 	"gora/internal/session"
 )
 
@@ -39,7 +40,7 @@ func TestLayoutAppContentUsesNativeWindowViewport(t *testing.T) {
 	if viewport := runtime.Snapshot().Viewport; viewport != image.Pt(640, 480) {
 		t.Fatalf("viewport = %v", viewport)
 	}
-	if len(state.interactions) == 0 {
+	if len(semantic.Flatten(state.runtimeTree)) <= 1 {
 		t.Fatal("content-only app did not expose document interactions")
 	}
 }

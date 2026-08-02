@@ -1,0 +1,147 @@
+gora: 1
+kind: component
+viewport: { width: 232, height: 800, background: "#151D29" }
+previews:
+  default: {}
+root:
+  type: surface
+  name: navigation
+  props:
+    width: 232
+    background: "#151D29"
+    padding: { top: 24, right: 18, bottom: 22, left: 18 }
+  children:
+    - type: stack
+      props: { direction: vertical, gap: 14 }
+      children:
+        - type: stack
+          props: { direction: horizontal, gap: 10, height: 34, alignment: center }
+          children:
+            - type: surface
+              props: { width: 30, height: 30, background: "#635BFF", radius: 9 }
+              children:
+                - type: text
+                  props: { text: N, size: 16, weight: 700, color: "#FFFFFF", font: ../assets/StudioSans.ttf }
+                  place: { alignment: center }
+            - type: text
+              props: { text: NORTHSTAR, size: 15, weight: 700, color: "#FFFFFF", font: ../assets/StudioSans.ttf }
+        - type: divider
+          props: { height: 1, thickness: 1, color: "#FFFFFF1F" }
+        - type: text
+          props: { text: WORKSPACE, size: 10, weight: 700, letter_spacing: 1.4, color: "#8490A3", font: ../assets/StudioSans.ttf }
+        - type: link
+          name: overview-link
+          props: { label: Open overview, to: overview, height: 42, background: transparent, padding: { top: 0, right: 12, bottom: 0, left: 12 }, radius: 10 }
+          variants:
+            - when: { interaction: current }
+              props: { background: "#635BFF" }
+            - when: { interaction: hovered }
+              props: { background: "#FFFFFF14" }
+            - when: { interaction: pressed }
+              props: { background: "#FFFFFF24" }
+            - when: { interaction: focused }
+              props: { border: { thickness: 2, color: "#9D97FF" } }
+          children:
+            - type: text
+              props: { text: Overview, size: 14, weight: 600, color: "#FFFFFF", font: ../assets/StudioSans.ttf }
+              place: { alignment: left }
+        - type: link
+          name: revenue-link
+          props: { label: Open revenue, to: revenue, height: 42, background: transparent, padding: { top: 0, right: 12, bottom: 0, left: 12 }, radius: 10 }
+          variants:
+            - when: { interaction: current }
+              props: { background: "#635BFF" }
+            - when: { interaction: hovered }
+              props: { background: "#FFFFFF14" }
+            - when: { interaction: pressed }
+              props: { background: "#FFFFFF24" }
+            - when: { interaction: focused }
+              props: { border: { thickness: 2, color: "#9D97FF" } }
+          children:
+            - type: text
+              props: { text: Revenue, size: 14, weight: 600, color: "#FFFFFF", font: ../assets/StudioSans.ttf }
+              place: { alignment: left }
+        - type: link
+          name: customers-link
+          props: { label: Open customers, to: customers, height: 42, background: transparent, padding: { top: 0, right: 12, bottom: 0, left: 12 }, radius: 10 }
+          variants:
+            - when: { interaction: current }
+              props: { background: "#635BFF" }
+            - when: { interaction: hovered }
+              props: { background: "#FFFFFF14" }
+            - when: { interaction: pressed }
+              props: { background: "#FFFFFF24" }
+            - when: { interaction: focused }
+              props: { border: { thickness: 2, color: "#9D97FF" } }
+          children:
+            - type: text
+              props: { text: Customers, size: 14, weight: 600, color: "#FFFFFF", font: ../assets/StudioSans.ttf }
+              place: { alignment: left }
+        - type: link
+          name: reports-link
+          props: { label: Open reports, to: reports, height: 42, background: transparent, padding: { top: 0, right: 12, bottom: 0, left: 12 }, radius: 10 }
+          variants:
+            - when: { interaction: current }
+              props: { background: "#635BFF" }
+            - when: { interaction: hovered }
+              props: { background: "#FFFFFF14" }
+            - when: { interaction: pressed }
+              props: { background: "#FFFFFF24" }
+            - when: { interaction: focused }
+              props: { border: { thickness: 2, color: "#9D97FF" } }
+          children:
+            - type: text
+              props: { text: Reports, size: 14, weight: 600, color: "#FFFFFF", font: ../assets/StudioSans.ttf }
+              place: { alignment: left }
+        - type: stack
+          props: { direction: horizontal, gap: 8, height: 34 }
+          children:
+            - type: button
+              name: history-back
+              props: { label: Go back, width: 42, background: "#FFFFFF0D", radius: 9 }
+              on:
+                activate: [{ action: back }]
+              variants:
+                - when: { interaction: hovered }
+                  props: { background: "#FFFFFF1F" }
+                - when: { interaction: focused }
+                  props: { border: { thickness: 2, color: "#9D97FF" } }
+              children:
+                - type: text
+                  props: { text: "←", size: 17, color: "#FFFFFF", font: ../assets/StudioSans.ttf }
+                  place: { alignment: center }
+            - type: button
+              name: history-forward
+              props: { label: Go forward, width: 42, background: "#FFFFFF0D", radius: 9 }
+              on:
+                activate: [{ action: forward }]
+              variants:
+                - when: { interaction: hovered }
+                  props: { background: "#FFFFFF1F" }
+                - when: { interaction: focused }
+                  props: { border: { thickness: 2, color: "#9D97FF" } }
+              children:
+                - type: text
+                  props: { text: "→", size: 17, color: "#FFFFFF", font: ../assets/StudioSans.ttf }
+                  place: { alignment: center }
+        - type: spacer
+          place: { grow: 1 }
+        - type: surface
+          props: { height: 64, background: "#FFFFFF0D", padding: { top: 10, right: 12, bottom: 10, left: 12 }, radius: 12 }
+          children:
+            - type: stack
+              props: { direction: horizontal, gap: 10, alignment: center }
+              children:
+                - type: surface
+                  props: { width: 34, height: 34, background: "#2D3748", radius: 17 }
+                  children:
+                    - type: text
+                      props: { text: AD, size: 11, weight: 700, color: "#FFFFFF", font: ../assets/StudioSans.ttf }
+                      place: { alignment: center }
+                - type: stack
+                  props: { direction: vertical, gap: 2 }
+                  children:
+                    - type: text
+                      props: { text: Ada Diaz, size: 13, weight: 600, color: "#FFFFFF", font: ../assets/StudioSans.ttf }
+                    - type: text
+                      props: { text: Administrator, size: 10, color: "#8490A3", font: ../assets/StudioSans.ttf }

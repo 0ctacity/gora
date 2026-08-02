@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -30,6 +31,7 @@ const (
 	LaunchApp      LaunchMode = "app"
 	LaunchStudio   LaunchMode = "studio"
 	LaunchHeadless LaunchMode = "headless"
+	LaunchMCP      LaunchMode = "mcp"
 )
 
 type LaunchConfig struct {
@@ -37,6 +39,7 @@ type LaunchConfig struct {
 	Document   string
 	SocketPath string
 	Mode       LaunchMode
+	Listen     string
 }
 
 type Launcher func(LaunchConfig) error
@@ -59,11 +62,99 @@ func Run(args []string, stdout, stderr io.Writer, launch Launcher) int {
 		return runCommand(args[1:], stderr, launch)
 	case "render":
 		return renderCommand(args[1:], stderr)
+	case "inspect":
+		return inspectCommand(args[1:], stdout, stderr)
+	case "mcp":
+		return mcpCommand(args[1:], stderr, launch)
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n", args[0])
 		usage(stderr)
 		return ExitFailure
 	}
+}
+
+func mcpCommand(args []string, stderr io.Writer, launch Launcher) int {
+	flags := flag.NewFlagSet("mcp", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	listen := flags.String("listen", "127.0.0.1:8787", "loopback listen address")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
+		return ExitFailure
+	}
+	host, port, err := net.SplitHostPort(*listen)
+	if err != nil || host != "127.0.0.1" || port == "" {
+		fmt.Fprintln(stderr, "--listen must use 127.0.0.1:<port>")
+		return ExitFailure
+	}
+	parsedPort, err := strconv.Atoi(port)
+	if err != nil || parsedPort < 1 || parsedPort > 65535 {
+		fmt.Fprintln(stderr, "--listen must use a valid TCP port")
+		return ExitFailure
+	}
+	if launch == nil {
+		fmt.Fprintln(stderr, "MCP server launcher is unavailable")
+		return ExitFailure
+	}
+	if err := launch(LaunchConfig{Mode: LaunchMCP, Listen: *listen}); err != nil {
+		fmt.Fprintln(stderr, err)
+		return ExitFailure
+	}
+	return ExitSuccess
+}
+
+func inspectCommand(args []string, stdout, stderr io.Writer) int {
+	file, options, ok := splitFile(args, stderr, "inspect")
+	if !ok {
+		return ExitFailure
+	}
+	flags := flag.NewFlagSet("inspect", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	root := flags.String("root", "", "containment root")
+	from := flags.String("from", string(LaunchApp), "live app, studio, or headless session")
+	if err := flags.Parse(options); err != nil || flags.NArg() != 0 {
+		return ExitFailure
+	}
+	if *from != string(LaunchApp) && *from != string(LaunchStudio) && *from != string(LaunchHeadless) {
+		fmt.Fprintln(stderr, "--from must be app, studio, or headless")
+		return ExitFailure
+	}
+	resolvedRoot, resolvedFile, err := canonicalPair(*root, file)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return ExitFailure
+	}
+	socket, err := session.SocketPath(resolvedRoot, resolvedFile, *from)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return ExitFailure
+	}
+	response, err := session.Send(socket, session.Request{Action: "inspect"}, 30*time.Second)
+	if err != nil {
+		fmt.Fprintf(stderr, "no matching live %s session: %v\n", *from, err)
+		return ExitFailure
+	}
+	if len(response.Data) == 0 {
+		fmt.Fprintln(stderr, "live session returned no inspection tree")
+		return ExitFailure
+	}
+	var status struct {
+		Valid bool            `json:"valid"`
+		Root  json.RawMessage `json:"root"`
+	}
+	if err := json.Unmarshal(response.Data, &status); err != nil {
+		fmt.Fprintln(stderr, "invalid live inspection response:", err)
+		return ExitFailure
+	}
+	if _, err := stdout.Write(append(append([]byte(nil), response.Data...), '\n')); err != nil {
+		fmt.Fprintln(stderr, err)
+		return ExitFailure
+	}
+	if response.Warning != "" {
+		fmt.Fprintln(stderr, "warning:", response.Warning)
+	}
+	if !status.Valid && (len(status.Root) == 0 || string(status.Root) == "null") {
+		return ExitValidation
+	}
+	return ExitSuccess
 }
 
 func validateCommand(args []string, stdout, stderr io.Writer) int {
@@ -319,4 +410,6 @@ func usage(output io.Writer) {
 	fmt.Fprintln(output, "  gora run <file> [--root <dir>] [--studio|--headless]")
 	fmt.Fprintln(output, "  gora validate <file> [--root <dir>] [--format text|json]")
 	fmt.Fprintln(output, "  gora render <file> --output <new.png> [--scale <positive-integer>] [--root <dir>] [--from app|studio|headless]")
+	fmt.Fprintln(output, "  gora inspect <file> [--root <dir>] [--from app|studio|headless]")
+	fmt.Fprintln(output, "  gora mcp [--listen 127.0.0.1:<port>]")
 }

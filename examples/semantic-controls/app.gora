@@ -1,0 +1,182 @@
+gora: 1
+kind: app
+name: Semantic Controls Lab
+
+viewport: { width: 960, height: 760, background: "#F4F6FA" }
+
+breakpoints:
+  narrow: { max_width: 639 }
+  wide: { min_width: 640 }
+
+state:
+  notifications: { type: boolean, default: true }
+  accepted: { type: boolean, default: false }
+  plan: { type: enum, values: [monthly, annual], default: monthly }
+  section: { type: enum, values: [profile, security], default: profile }
+  team: { type: text, default: legacy }
+  volume: { type: number, default: 40, min: 0, max: 100, step: 5 }
+  balance: { type: number, default: 25, min: 0, max: 100, step: 5 }
+  seats: { type: number, default: 3, min: 1, max: 10, step: 1 }
+
+entry: controls
+screens:
+  controls:
+    type: scroll
+    name: controls-scroll
+    props: { axis: vertical, scrollbar: true }
+    children:
+      - type: surface
+        props:
+          padding: { top: 36, right: 40, bottom: 56, left: 40 }
+          background: "#F4F6FA"
+        responsive:
+          narrow:
+            props: { padding: { top: 24, right: 20, bottom: 40, left: 20 } }
+        children:
+          - type: stack
+            props: { direction: vertical, gap: 24 }
+            children:
+              - type: text
+                props: { content: Semantic controls, size: 34, weight: 700, color: "#172033" }
+
+              - type: stack
+                props: { direction: horizontal, wrap: true, gap: 16, alignment: stretch }
+                children:
+                  - type: toggle
+                    name: notifications-toggle
+                    props: { label: Notifications, bind: notifications, padding: { top: 14, right: 18, bottom: 14, left: 18 }, background: "#FFFFFF", radius: 12 }
+                    variants:
+                      - { when: { interaction: checked }, props: { background: "#DDF7E9" } }
+                      - { when: { interaction: focused }, props: { border: { thickness: 2, color: "#675FF2" } } }
+                    children:
+                      - type: text
+                        props: { content: Notifications switch, size: 15, weight: 600, color: "#172033" }
+                  - type: checkbox
+                    name: terms-checkbox
+                    props: { label: Accept terms, bind: accepted, padding: { top: 14, right: 18, bottom: 14, left: 18 }, background: "#FFFFFF", radius: 12 }
+                    variants:
+                      - { when: { interaction: checked }, props: { background: "#EEEAFE" } }
+                    children:
+                      - type: text
+                        props: { content: Accept terms, size: 15, weight: 600, color: "#172033" }
+
+              - type: radio_group
+                name: billing-cycle
+                props: { label: Billing cycle, bind: plan, direction: horizontal, wrap: true, gap: 12 }
+                children:
+                  - type: radio
+                    name: monthly-radio
+                    props: { label: Monthly, value: monthly, padding: { top: 12, right: 18, bottom: 12, left: 18 }, background: "#FFFFFF", radius: 10 }
+                    variants:
+                      - { when: { interaction: selected }, props: { background: "#172033" } }
+                    children:
+                      - type: text
+                        props: { content: Monthly, color: "#675FF2", weight: 600 }
+                        variants:
+                          - { when: { interaction: selected }, props: { color: "#FFFFFF" } }
+                  - type: radio
+                    name: annual-radio
+                    props: { label: Annual, value: annual, padding: { top: 12, right: 18, bottom: 12, left: 18 }, background: "#FFFFFF", radius: 10 }
+                    variants:
+                      - { when: { interaction: selected }, props: { background: "#675FF2" } }
+                    children:
+                      - type: text
+                        props: { content: Annual, color: "#675FF2", weight: 600 }
+                        variants:
+                          - { when: { interaction: selected }, props: { color: "#FFFFFF" } }
+
+              - type: tabs
+                name: account-tabs
+                props: { label: Account sections, bind: section, orientation: horizontal, gap: 8, panel_gap: 16 }
+                children:
+                  - type: tab
+                    name: profile-tab
+                    props: { label: Profile, value: profile, padding: { top: 10, right: 16, bottom: 10, left: 16 }, background: "#FFFFFF", radius: 9 }
+                    variants:
+                      - { when: { interaction: selected }, props: { background: "#675FF2" } }
+                    children:
+                      - type: text
+                        props: { content: Profile, color: "#172033", weight: 600 }
+                        variants:
+                          - { when: { interaction: selected }, props: { color: "#FFFFFF" } }
+                  - type: tab
+                    name: security-tab
+                    props: { label: Security, value: security, padding: { top: 10, right: 16, bottom: 10, left: 16 }, background: "#FFFFFF", radius: 9 }
+                    variants:
+                      - { when: { interaction: selected }, props: { background: "#675FF2" } }
+                    children:
+                      - type: text
+                        props: { content: Security, color: "#172033", weight: 600 }
+                        variants:
+                          - { when: { interaction: selected }, props: { color: "#FFFFFF" } }
+                  - type: tab_panel
+                    props: { value: profile }
+                    children:
+                      - type: surface
+                        props: { padding: { top: 18, right: 18, bottom: 18, left: 18 }, background: "#FFFFFF", radius: 12 }
+                        children: [{ type: text, props: { content: Profile preferences stay local., color: "#454E66" } }]
+                  - type: tab_panel
+                    props: { value: security }
+                    children:
+                      - type: surface
+                        props: { padding: { top: 18, right: 18, bottom: 18, left: 18 }, background: "#FFFFFF", radius: 12 }
+                        children: [{ type: text, props: { content: Security settings can contain controls., color: "#454E66" } }]
+
+              - type: select
+                name: team-select
+                props: { label: Team, bind: team }
+                children:
+                  - type: select_trigger
+                    children:
+                      - type: surface
+                        props: { padding: { top: 12, right: 16, bottom: 12, left: 16 }, background: "#FFFFFF", border: { thickness: 1, color: "#D7DDEA" }, radius: 10 }
+                        children: [{ type: text, props: { content: { ref: state.team }, color: "#172033", weight: 600 } }]
+                  - type: select_popup
+                    props: { max_height: 180, match_trigger_width: true, padding: { top: 8, right: 8, bottom: 8, left: 8 }, gap: 4, background: "#FFFFFF", radius: 10, shadow: { x: 0, y: 8, blur: 20, color: "#17203324" } }
+                    children:
+                      - type: option
+                        name: design-option
+                        props: { label: Design, value: design, padding: { top: 10, right: 12, bottom: 10, left: 12 }, background: "#FFFFFF", radius: 8 }
+                        variants:
+                          - { when: { interaction: selected }, props: { background: "#EEEAFE" } }
+                          - { when: { interaction: active }, props: { background: "#E2E6F0" } }
+                        children: [{ type: text, props: { content: Design, color: "#172033" } }]
+                      - type: option
+                        name: engineering-option
+                        props: { label: Engineering, value: engineering, disabled: true, padding: { top: 10, right: 12, bottom: 10, left: 12 }, background: "#FFFFFF", radius: 8 }
+                        variants:
+                          - { when: { interaction: selected }, props: { background: "#EEEAFE" } }
+                          - { when: { interaction: active }, props: { background: "#E2E6F0" } }
+                        children: [{ type: text, props: { content: Engineering, color: "#172033" } }]
+
+              - type: stack
+                props: { direction: horizontal, wrap: true, gap: 24 }
+                children:
+                  - type: slider
+                    name: volume-slider
+                    props: { label: Volume, bind: volume, orientation: horizontal, width: 360, height: 44 }
+                    children:
+                      - { type: slider_track, props: { height: 8, background: "#D7DDEA", radius: 4 } }
+                      - { type: slider_fill, props: { height: 8, background: "#675FF2", radius: 4 } }
+                      - { type: slider_thumb, props: { width: 24, height: 24, background: "#FFFFFF", border: { thickness: 2, color: "#675FF2" }, radius: 12 } }
+                  - type: slider
+                    name: balance-slider
+                    props: { label: Balance, bind: balance, orientation: vertical, width: 44, height: 180 }
+                    children:
+                      - { type: slider_track, props: { width: 8, background: "#D7DDEA", radius: 4 } }
+                      - { type: slider_fill, props: { width: 8, background: "#22A06B", radius: 4 } }
+                      - { type: slider_thumb, props: { width: 24, height: 24, background: "#FFFFFF", border: { thickness: 2, color: "#22A06B" }, radius: 12 } }
+
+              - type: stepper
+                name: seat-stepper
+                props: { label: Seats, bind: seats, gap: 10 }
+                children:
+                  - type: stepper_decrement
+                    props: { padding: { top: 10, right: 14, bottom: 10, left: 14 }, background: "#E2E6F0", radius: 8 }
+                    children: [{ type: text, props: { content: "−", size: 18, weight: 700, color: "#172033" } }]
+                  - type: stepper_value
+                    props: { padding: { top: 10, right: 18, bottom: 10, left: 18 }, background: "#FFFFFF", radius: 8 }
+                    children: [{ type: text, props: { content: { ref: state.seats }, size: 17, weight: 700, color: "#172033" } }]
+                  - type: stepper_increment
+                    props: { padding: { top: 10, right: 14, bottom: 10, left: 14 }, background: "#675FF2", radius: 8 }
+                    children: [{ type: text, props: { content: "+", size: 18, weight: 700, color: "#FFFFFF" } }]

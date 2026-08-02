@@ -7,9 +7,10 @@ import (
 
 	"gora/internal/project"
 	"gora/internal/render"
+	"gora/internal/semantic"
 )
 
-func TestNorthstarSidebarButtonsSwitchDashboardPanels(t *testing.T) {
+func TestNorthstarSidebarLinksExposeRealScreenNavigation(t *testing.T) {
 	repositoryRoot, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
@@ -18,80 +19,32 @@ func TestNorthstarSidebarButtonsSwitchDashboardPanels(t *testing.T) {
 	if len(diagnostics) != 0 {
 		t.Fatalf("load diagnostics: %+v", diagnostics)
 	}
+	if len(loaded.Screens) != 4 {
+		t.Fatalf("screens = %v", loaded.Screens)
+	}
+	root := ResolvePersistentTree(loaded.Screens["overview"], nil)
+	result := render.Render(root, image.Pt(1280, 800), render.State{Screen: "overview"})
+	links := make(map[string]*semantic.Node)
+	for _, node := range semantic.Flatten(result.Tree) {
+		if node.Role == "link" {
+			links[node.Name] = node
+		}
+	}
 	store := NewStore()
-	specs := make([]ScopeSpec, len(loaded.StateScopes))
-	for index, scope := range loaded.StateScopes {
-		specs[index] = ScopeSpec{ID: scope.ID, Context: scope.Context, State: scope.State, Initial: scope.Initial}
-	}
-	store.Reconcile(specs)
-	initialRoot := ResolvePersistentTree(loaded.Screens[loaded.Selected], store.AllValues())
-	if findNamedNode(initialRoot, "overview-panel") == nil {
-		t.Fatal("dashboard did not start on the overview tab")
-	}
-
-	tabs := []struct {
-		button string
-		panel  string
-	}{
-		{button: "overview-tab", panel: "overview-panel"},
-		{button: "revenue-tab", panel: "revenue-panel"},
-		{button: "customers-tab", panel: "customers-panel"},
-		{button: "reports-tab", panel: "reports-panel"},
-	}
-	for _, tab := range tabs {
-		root := ResolvePersistentTree(loaded.Screens[loaded.Selected], store.AllValues())
-		result := render.Render(root, image.Pt(1280, 800), render.State{Values: store.AllValues()})
-		var target *render.InteractionRegion
-		for index := range result.Interactions {
-			if nodeName(root, result.Interactions[index].Handle) == tab.button {
-				target = &result.Interactions[index]
-				break
-			}
+	for _, target := range []string{"overview", "revenue", "customers", "reports"} {
+		link := links[target+"-link"]
+		if link == nil {
+			t.Fatalf("missing %s link", target)
 		}
-		if target == nil {
-			t.Fatalf("missing sidebar button %q", tab.button)
+		if link.Current != (target == "overview") {
+			t.Fatalf("%s current = %t", target, link.Current)
 		}
-		if err := store.Apply(target.Scope, target.Actions); err != nil {
+		navigation, err := store.ApplyActivation(link.Scope, link.Actions)
+		if err != nil {
 			t.Fatal(err)
 		}
-		root = ResolvePersistentTree(loaded.Screens[loaded.Selected], store.AllValues())
-		if findNamedNode(root, tab.panel) == nil {
-			t.Fatalf("activating %q did not show %q", tab.button, tab.panel)
-		}
-		for _, other := range tabs {
-			if other.panel != tab.panel && findNamedNode(root, other.panel) != nil {
-				t.Fatalf("activating %q left %q visible", tab.button, other.panel)
-			}
+		if navigation == nil || navigation.Action != "navigate" || navigation.To != target {
+			t.Fatalf("%s navigation = %+v", target, navigation)
 		}
 	}
-}
-
-func nodeName(root *project.Node, handle string) string {
-	if root == nil {
-		return ""
-	}
-	if root.Handle == handle {
-		return root.Name
-	}
-	for _, child := range root.Children {
-		if name := nodeName(child, handle); name != "" {
-			return name
-		}
-	}
-	return ""
-}
-
-func findNamedNode(root *project.Node, name string) *project.Node {
-	if root == nil {
-		return nil
-	}
-	if root.Name == name {
-		return root
-	}
-	for _, child := range root.Children {
-		if found := findNamedNode(child, name); found != nil {
-			return found
-		}
-	}
-	return nil
 }

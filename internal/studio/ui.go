@@ -33,6 +33,7 @@ import (
 	"gora/internal/interaction"
 	"gora/internal/project"
 	"gora/internal/render"
+	"gora/internal/semantic"
 	"gora/internal/session"
 )
 
@@ -58,14 +59,13 @@ type uiState struct {
 	canvasSize        image.Point
 	canvasPan         image.Point
 	scrollbar         widget.Scrollbar
-	inspections       []render.Inspection
+	runtimeTree       *semantic.Node
 	preview           render.GioCache
 	checkerboard      checkerboardCache
 	previewScroll     previewScrollbarModel
 	previewScrollRoot *project.Node
 	router            *interaction.Router
 	interactionInput  struct{}
-	interactions      []render.InteractionRegion
 	inspectPointerID  int
 	inspectPressed    bool
 	inspectPending    bool
@@ -92,7 +92,7 @@ func Start(root, entry, socketPath string) error {
 	}
 	window := new(app.Window)
 	window.Option(app.Title("Gora Studio — "+filepath.Base(entry)), app.Size(unit.Dp(1200), unit.Dp(820)))
-	server, err := session.Listen(socketPath, runtime.SessionHandler(func() {
+	server, err := session.Listen(socketPath, runtime.SessionHandler("studio", func() {
 		window.Perform(system.ActionRaise)
 		window.Invalidate()
 	}))
@@ -152,6 +152,7 @@ func eventLoop(window *app.Window, runtime *Runtime, server *session.Server, cle
 
 func layoutStudio(gtx layout.Context, theme *material.Theme, runtime *Runtime, state *uiState, window *app.Window) layout.Dimensions {
 	snapshot := runtime.Snapshot()
+	state.router.SyncTransient(snapshot.Transient)
 	handleActions(gtx, runtime, state, snapshot, window)
 	snapshot = runtime.Snapshot()
 	if !state.zoomInitialized && snapshot.Root != nil {
@@ -220,12 +221,12 @@ func layoutStudioCanvas(gtx layout.Context, theme *material.Theme, runtime *Runt
 		paintHighlight(previewGtx, result.Bounds[state.selectedHandle])
 	}
 	layoutPreviewScrollbar(previewGtx, theme, runtime, state, snapshot, result, window)
-	state.inspections = result.Inspections
-	state.interactions = append(state.interactions[:0], result.Interactions...)
+	state.runtimeTree = result.Tree
+	runtime.PublishTree(result.Tree)
 	if state.router == nil {
 		state.router = interaction.NewRouter()
 	}
-	state.router.Update(state.interactions)
+	state.router.Update(state.runtimeTree)
 	if state.router.Transient() != snapshot.Transient {
 		runtime.SetTransient(state.router.Transient())
 		window.Invalidate()
@@ -265,8 +266,9 @@ func layoutPreview(gtx layout.Context, theme *material.Theme, snapshot Snapshot)
 
 func renderState(snapshot Snapshot) render.State {
 	return render.State{
-		Scroll: snapshot.Scroll, Values: snapshot.StateValues,
+		Screen: snapshot.Screen, Scroll: snapshot.Scroll, Values: snapshot.StateValues,
 		Hovered: snapshot.Transient.Hovered, Pressed: snapshot.Transient.Pressed, Focused: snapshot.Transient.Focused,
+		OpenSelect: snapshot.Transient.OpenSelect, ActiveOption: snapshot.Transient.ActiveOption,
 	}
 }
 
@@ -357,10 +359,7 @@ func previewScrollbar(snapshot Snapshot, result render.GioResult) (previewScroll
 		return previewScrollbarModel{}, false
 	}
 	axis := stringProp(scrollNode.Props["axis"], "vertical")
-	key := scrollNode.Name
-	if key == "" {
-		key = scrollNode.Handle
-	}
+	key := project.ScrollKey(scrollNode)
 	viewport := bounds.Dy()
 	contentSize := max(viewport, intProp(scrollNode.Children[0].Props["height"], viewport))
 	offset := snapshot.Scroll[key].Y
@@ -501,15 +500,16 @@ func handleActions(gtx layout.Context, runtime *Runtime, state *uiState, snapsho
 	}
 	if state.inspectPending && state.inspecting && snapshot.Root != nil {
 		state.inspectPending = false
-		for index := len(state.inspections) - 1; index >= 0; index-- {
-			inspection := state.inspections[index]
-			if state.inspectPoint.In(inspection.Bounds.Intersect(inspection.Clip)) {
-				state.selectedHandle = inspection.Handle
+		nodes := semantic.Flatten(state.runtimeTree)
+		for index := len(nodes) - 1; index >= 0; index-- {
+			node := nodes[index]
+			if node.Bounds != nil && node.Clip != nil && state.inspectPoint.In(node.Bounds.ImageRectangle().Intersect(node.Clip.ImageRectangle())) {
+				state.selectedHandle = node.Handle
 				state.selected = fmt.Sprintf("%s %q role=%s label=%q enabled=%t hovered=%t pressed=%t focused=%t scope=%s state=%v actions=%v bounds=%v clip=%v props=%v · %s:%d · %v",
-					inspection.Type, inspection.Name,
-					inspection.Role, inspection.Label, inspection.Enabled, inspection.Hovered, inspection.Pressed, inspection.Focused,
-					inspection.Scope, inspection.State, inspection.Actions, inspection.Bounds, inspection.Clip, inspection.Props,
-					filepath.Base(inspection.Source), inspection.Line, inspection.Breadcrumb)
+					node.Type, node.Name,
+					node.Role, node.Label, node.Enabled, node.Hovered, node.Pressed, node.Focused,
+					node.Scope, node.State, node.Effects, node.Bounds.ImageRectangle(), node.Clip.ImageRectangle(), node.Props,
+					filepath.Base(node.Source.File), node.Source.Line, node.Breadcrumb)
 				break
 			}
 		}
@@ -594,6 +594,14 @@ func handleDocumentInteraction(gtx layout.Context, runtime *Runtime, state *uiSt
 		{Focus: &state.interactionInput, Name: key.NameEnter},
 		{Focus: &state.interactionInput, Name: key.NameSpace},
 		{Focus: &state.interactionInput, Name: key.NameEscape},
+		{Focus: &state.interactionInput, Name: key.NameLeftArrow},
+		{Focus: &state.interactionInput, Name: key.NameRightArrow},
+		{Focus: &state.interactionInput, Name: key.NameUpArrow},
+		{Focus: &state.interactionInput, Name: key.NameDownArrow},
+		{Focus: &state.interactionInput, Name: key.NameHome},
+		{Focus: &state.interactionInput, Name: key.NameEnd},
+		{Focus: &state.interactionInput, Name: key.NamePageUp},
+		{Focus: &state.interactionInput, Name: key.NamePageDown},
 	}
 	for _, filter := range filters {
 		for {
@@ -617,6 +625,22 @@ func handleDocumentInteraction(gtx layout.Context, runtime *Runtime, state *uiSt
 				name = "Space"
 			case key.NameEscape:
 				name = "Escape"
+			case key.NameLeftArrow:
+				name = "ArrowLeft"
+			case key.NameRightArrow:
+				name = "ArrowRight"
+			case key.NameUpArrow:
+				name = "ArrowUp"
+			case key.NameDownArrow:
+				name = "ArrowDown"
+			case key.NameHome:
+				name = "Home"
+			case key.NameEnd:
+				name = "End"
+			case key.NamePageUp:
+				name = "PageUp"
+			case key.NamePageDown:
+				name = "PageDown"
 			}
 			var activation interaction.Activation
 			var activated bool
@@ -632,6 +656,13 @@ func handleDocumentInteraction(gtx layout.Context, runtime *Runtime, state *uiSt
 					mutated = true
 				}
 			}
+		}
+	}
+	if change, ok := state.router.TakeValueChange(); ok {
+		if _, err := runtime.SetControlValue(change.ID, change.Value); err != nil {
+			state.status = err.Error()
+		} else {
+			mutated = true
 		}
 	}
 	transient := state.router.Transient()

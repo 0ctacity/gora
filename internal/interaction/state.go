@@ -2,6 +2,7 @@ package interaction
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
 
@@ -19,9 +20,11 @@ type ScopeSpec struct {
 
 // Transient is the non-persistent interaction state of the selected context.
 type Transient struct {
-	Hovered string
-	Pressed string
-	Focused string
+	Hovered      string
+	Pressed      string
+	Focused      string
+	OpenSelect   string
+	ActiveOption string
 }
 
 type scope struct {
@@ -70,7 +73,7 @@ func (s *Store) reconcile(context string, specs []ScopeSpec, preserveOtherContex
 			if override, ok := spec.Initial[name]; ok {
 				value = override
 			}
-			value = normalizeValue(value)
+			value = normalizeForDeclaration(declaration, value)
 			initial[name] = value
 			current[name] = value
 
@@ -78,7 +81,7 @@ func (s *Store) reconcile(context string, specs []ScopeSpec, preserveOtherContex
 				oldDeclaration, declared := previous.declarations[name]
 				oldValue, present := previous.current[name]
 				if declared && present && oldDeclaration.Type == declaration.Type && valueMatches(declaration, oldValue) {
-					current[name] = oldValue
+					current[name] = normalizeForDeclaration(declaration, oldValue)
 				}
 			}
 		}
@@ -112,7 +115,7 @@ func (s *Store) Apply(scopeID string, actions []document.Action) error {
 			if err != nil {
 				return fmt.Errorf("action %d: %w", index, err)
 			}
-			value = normalizeValue(value)
+			value = normalizeForDeclaration(declaration, value)
 			if !valueMatches(declaration, value) {
 				return fmt.Errorf("action %d value does not match %s state %q", index, declaration.Type, action.State)
 			}
@@ -143,7 +146,7 @@ func (s *Store) Apply(scopeID string, actions []document.Action) error {
 			if action.Action == "decrement" {
 				amount = -amount
 			}
-			working[action.State] = value + amount
+			working[action.State] = normalizeForDeclaration(declaration, value+amount)
 		case "reset":
 			working[action.State] = scope.initial[action.State]
 		default:
@@ -157,10 +160,71 @@ func (s *Store) Apply(scopeID string, actions []document.Action) error {
 	return nil
 }
 
+// ApplyActivation commits all lexical state effects atomically, then returns
+// the optional navigation command for the runtime to perform.
+func (s *Store) ApplyActivation(scopeID string, actions []document.Action) (*document.Action, error) {
+	stateActions := make([]document.Action, 0, len(actions))
+	var navigation *document.Action
+	for _, action := range actions {
+		switch action.Action {
+		case "navigate", "replace", "back", "forward":
+			command := action
+			navigation = &command
+		default:
+			stateActions = append(stateActions, action)
+		}
+	}
+	if len(stateActions) != 0 {
+		if err := s.Apply(scopeID, stateActions); err != nil {
+			return nil, err
+		}
+	}
+	return navigation, nil
+}
+
 func (s *Store) Values(scopeID string) map[string]any {
 	if scope, ok := s.scopes[scopeID]; ok {
 		return cloneValues(scope.current)
 	}
+	return nil
+}
+
+// SetValues atomically replaces selected values in one lexical scope.
+func (s *Store) SetValues(scopeID string, values map[string]any) error {
+	scope, ok := s.scopes[scopeID]
+	if !ok {
+		return fmt.Errorf("unknown state scope %q", scopeID)
+	}
+	working := cloneValues(scope.current)
+	for name, value := range values {
+		declaration, ok := scope.declarations[name]
+		if !ok {
+			return fmt.Errorf("unknown state %q in scope %q", name, scopeID)
+		}
+		value = normalizeForDeclaration(declaration, value)
+		if !valueMatches(declaration, value) {
+			return fmt.Errorf("value does not match %s state %q", declaration.Type, name)
+		}
+		working[name] = value
+	}
+	if !reflect.DeepEqual(scope.current, working) {
+		scope.current = working
+		s.revision++
+	}
+	return nil
+}
+
+// ResetScope restores one lexical scope to its declared initial values.
+func (s *Store) ResetScope(scopeID string) error {
+	scope, ok := s.scopes[scopeID]
+	if !ok {
+		return fmt.Errorf("unknown state scope %q", scopeID)
+	}
+	if !reflect.DeepEqual(scope.current, scope.initial) {
+		scope.current = cloneValues(scope.initial)
+		s.revision++
+	}
+	s.transient = Transient{}
 	return nil
 }
 
@@ -260,6 +324,43 @@ func normalizeValue(value any) any {
 		return number
 	}
 	return value
+}
+
+func normalizeForDeclaration(declaration document.StateDeclaration, value any) any {
+	value = normalizeValue(value)
+	if declaration.Type != "number" {
+		return value
+	}
+	number, ok := numberValue(value)
+	if !ok {
+		return value
+	}
+	if declaration.Min != nil && number < *declaration.Min {
+		number = *declaration.Min
+	}
+	if declaration.Max != nil && number > *declaration.Max {
+		number = *declaration.Max
+	}
+	if declaration.Step != nil && *declaration.Step > 0 {
+		anchor := 0.0
+		if declaration.Min != nil {
+			anchor = *declaration.Min
+		}
+		steps := (number - anchor) / *declaration.Step
+		lower := math.Floor(steps)
+		fraction := steps - lower
+		if fraction >= 0.5-1e-12 {
+			lower++
+		}
+		number = anchor + lower**declaration.Step
+		if declaration.Min != nil && number < *declaration.Min {
+			number = *declaration.Min
+		}
+		if declaration.Max != nil && number > *declaration.Max {
+			number = *declaration.Max
+		}
+	}
+	return number
 }
 
 func cloneValues(values map[string]any) map[string]any {

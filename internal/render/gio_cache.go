@@ -10,6 +10,7 @@ import (
 	"gioui.org/widget/material"
 
 	"gora/internal/project"
+	"gora/internal/semantic"
 )
 
 // GioCache lays out an immutable resolved document once and replays its paint
@@ -29,15 +30,10 @@ type gioCacheKey struct {
 }
 
 type gioScene struct {
-	operations   op.Ops
-	items        []sceneItem
-	inspections  []sceneInspection
-	interactions []sceneInteraction
-}
-
-type sceneInteraction struct {
-	region  InteractionRegion
-	scrolls []sceneScroll
+	root       *project.Node
+	operations op.Ops
+	items      []sceneItem
+	geometries []sceneGeometry
 }
 
 type sceneItem struct {
@@ -47,10 +43,11 @@ type sceneItem struct {
 	button    *sceneButton
 }
 
-type sceneInspection struct {
-	inspection Inspection
-	scrolls    []sceneScroll
-	button     *project.Node
+type sceneGeometry struct {
+	handle   string
+	geometry semantic.Geometry
+	scrolls  []sceneScroll
+	node     *project.Node
 }
 
 type sceneButton struct {
@@ -87,7 +84,7 @@ func (c *GioCache) Layout(
 		theme = material.NewTheme()
 	}
 	if root == nil || viewport.X <= 0 || viewport.Y <= 0 {
-		return GioResult{Bounds: make(map[string]image.Rectangle)}
+		return GioResult{Bounds: make(map[string]image.Rectangle), Geometry: make(map[string]semantic.Geometry)}
 	}
 	key := gioCacheKey{
 		root: root, theme: theme, viewport: viewport,
@@ -112,10 +109,10 @@ func (c *GioCache) build(
 	viewport image.Point,
 	key gioCacheKey,
 ) {
-	scene := new(gioScene)
+	scene := &gioScene{root: root}
 	buildContext := gtx
 	buildContext.Ops = &scene.operations
-	result := GioResult{Bounds: make(map[string]image.Rectangle)}
+	result := GioResult{Bounds: make(map[string]image.Rectangle), Geometry: make(map[string]semantic.Geometry)}
 	renderer := gioRenderer{
 		gtx: buildContext, theme: theme, result: result, opacity: 1, scene: scene,
 	}
@@ -141,9 +138,8 @@ func (r *gioRenderer) recordPaint(paintNode func()) {
 
 func (scene *gioScene) replay(gtx layout.Context, theme *material.Theme, state State) GioResult {
 	result := GioResult{
-		Bounds:       make(map[string]image.Rectangle, len(scene.inspections)),
-		Inspections:  make([]Inspection, 0, len(scene.inspections)),
-		Interactions: make([]InteractionRegion, 0, len(scene.interactions)),
+		Bounds:   make(map[string]image.Rectangle, len(scene.geometries)),
+		Geometry: make(map[string]semantic.Geometry, len(scene.geometries)),
 	}
 	for _, item := range scene.items {
 		translation, viewportClip, clipped := sceneTransform(item.scrolls, state)
@@ -157,7 +153,7 @@ func (scene *gioScene) replay(gtx layout.Context, theme *material.Theme, state S
 			staticClip := button.clip.Add(translation)
 			renderer := gioRenderer{gtx: gtx, theme: theme, state: state, opacity: button.opacity}
 			renderer.paintSurfaceGio(
-				buttonNodeForState(button.node, state),
+				interactiveNodeForState(button.node, state),
 				bounds,
 				staticClip.Intersect(viewportClipOrBounds(viewportClip, bounds)),
 			)
@@ -182,42 +178,30 @@ func (scene *gioScene) replay(gtx layout.Context, theme *material.Theme, state S
 		}
 		clipStack.Pop()
 	}
-	for _, cached := range scene.inspections {
+	for paintOrder, cached := range scene.geometries {
 		translation, viewportClip, clipped := sceneTransform(cached.scrolls, state)
-		inspection := cached.inspection
-		if cached.button != nil {
-			effective := buttonNodeForState(cached.button, state)
-			inspection.Props = cloneMap(effective.Props)
-			inspection.Hovered = state.Hovered == effective.Handle
-			inspection.Pressed = state.Pressed == effective.Handle
-			inspection.Focused = state.Focused == effective.Handle
-			inspection.State = cloneMap(state.Values[effective.Scope])
-		}
-		inspection.Bounds = inspection.Bounds.Add(translation)
-		inspection.Clip = inspection.Clip.Add(translation)
+		geometry := cached.geometry
+		geometry.Bounds = geometry.Bounds.Add(translation)
+		geometry.Clip = geometry.Clip.Add(translation)
 		if len(cached.scrolls) > 0 {
-			inspection.Clip = inspection.Clip.Intersect(viewportClip)
+			geometry.Clip = geometry.Clip.Intersect(viewportClip)
 		}
 		if clipped {
-			inspection.Clip = image.Rectangle{}
+			geometry.Clip = image.Rectangle{}
 		}
-		result.Bounds[inspection.Handle] = inspection.Bounds
-		result.Inspections = append(result.Inspections, inspection)
+		geometry.PaintOrder = paintOrder
+		if cached.node != nil {
+			geometry.Props = cloneMap(interactiveNodeForState(cached.node, state).Props)
+		}
+		result.Bounds[cached.handle] = geometry.Bounds
+		result.Geometry[cached.handle] = geometry
 	}
-	for _, cached := range scene.interactions {
-		translation, viewportClip, clipped := sceneTransform(cached.scrolls, state)
-		region := cached.region
-		region.Bounds = region.Bounds.Add(translation)
-		region.Clip = region.Clip.Add(translation)
-		if len(cached.scrolls) > 0 {
-			region.Clip = region.Clip.Intersect(viewportClip)
-		}
-		if clipped {
-			region.Clip = image.Rectangle{}
-		}
-		result.Interactions = append(result.Interactions, region)
-	}
+	result.Tree = semantic.Build(sceneRoot(scene), result.Geometry, semanticContext(state))
 	return result
+}
+
+func sceneRoot(scene *gioScene) *project.Node {
+	return scene.root
 }
 
 func sceneTransform(scrolls []sceneScroll, state State) (image.Point, image.Rectangle, bool) {

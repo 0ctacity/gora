@@ -1,6 +1,7 @@
 package render
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"image"
@@ -26,63 +27,42 @@ import (
 	"golang.org/x/image/math/fixed"
 	_ "golang.org/x/image/webp"
 
-	"gora/internal/document"
 	"gora/internal/project"
+	"gora/internal/semantic"
 )
 
 // State contains the ephemeral values that are intentionally absent from .gora files.
 type State struct {
-	Scroll  map[string]image.Point
-	Values  map[string]map[string]any
-	Hovered string
-	Pressed string
-	Focused string
-}
-
-type Inspection struct {
-	Handle     string
-	Type       string
-	Name       string
-	Bounds     image.Rectangle
-	Clip       image.Rectangle
-	Props      map[string]any
-	Source     string
-	Line       int
-	Column     int
-	Breadcrumb []string
-	Role       string
-	Label      string
-	Enabled    bool
-	Scope      string
-	Actions    []document.Action
-	State      map[string]any
-	Hovered    bool
-	Pressed    bool
-	Focused    bool
-}
-
-type InteractionRegion struct {
-	Handle   string
-	Bounds   image.Rectangle
-	Clip     image.Rectangle
-	Scope    string
-	Label    string
-	Disabled bool
-	Actions  []document.Action
+	Screen       string
+	Scroll       map[string]image.Point
+	Values       map[string]map[string]any
+	Hovered      string
+	Pressed      string
+	Focused      string
+	OpenSelect   string
+	ActiveOption string
 }
 
 type Result struct {
-	Image        *image.RGBA
-	Bounds       map[string]image.Rectangle
-	Inspections  []Inspection
-	Interactions []InteractionRegion
+	Image    *image.RGBA
+	Bounds   map[string]image.Rectangle
+	Geometry map[string]semantic.Geometry
+	Tree     *semantic.Node
 }
 
 type renderer struct {
-	result  *Result
-	state   State
-	scale   int
-	opacity float64
+	result     *Result
+	state      State
+	scale      int
+	opacity    float64
+	paintOrder int
+	viewport   image.Rectangle
+	topLayers  []topLayer
+}
+
+type topLayer struct {
+	node   *project.Node
+	bounds image.Rectangle
 }
 
 type cachedImage struct {
@@ -129,9 +109,17 @@ func renderScaled(root *project.Node, viewport image.Point, state State, scale i
 		scale = 1
 	}
 	canvas := image.NewRGBA(image.Rect(0, 0, viewport.X*scale, viewport.Y*scale))
-	result := Result{Image: canvas, Bounds: make(map[string]image.Rectangle)}
-	r := renderer{result: &result, state: state, scale: scale, opacity: 1}
+	result := Result{
+		Image: canvas, Bounds: make(map[string]image.Rectangle),
+		Geometry: make(map[string]semantic.Geometry),
+	}
+	r := renderer{result: &result, state: state, scale: scale, opacity: 1, viewport: image.Rect(0, 0, viewport.X, viewport.Y)}
 	r.layout(root, image.Rect(0, 0, viewport.X, viewport.Y), image.Rect(0, 0, viewport.X, viewport.Y))
+	for index := 0; index < len(r.topLayers); index++ {
+		layer := r.topLayers[index]
+		r.layoutFinal(layer.node, layer.bounds, r.viewport)
+	}
+	result.Tree = semantic.Build(root, result.Geometry, semanticContext(state))
 	return result
 }
 
@@ -164,6 +152,23 @@ func Capture(path string, root *project.Node, viewport image.Point, state State,
 	return nil
 }
 
+// CapturePNG renders a viewport through the same Gio capture path and returns
+// its encoded PNG bytes without touching the filesystem.
+func CapturePNG(root *project.Node, viewport image.Point, state State, scale int) ([]byte, error) {
+	if scale <= 0 {
+		return nil, errors.New("scale must be a positive integer")
+	}
+	captured, err := captureGio(root, viewport, state, scale)
+	if err != nil {
+		return nil, err
+	}
+	var output bytes.Buffer
+	if err := png.Encode(&output, captured); err != nil {
+		return nil, err
+	}
+	return output.Bytes(), nil
+}
+
 func (r *renderer) layout(node *project.Node, bounds, clip image.Rectangle) {
 	r.layoutNode(node, bounds, clip, false)
 }
@@ -173,40 +178,23 @@ func (r *renderer) layoutFinal(node *project.Node, bounds, clip image.Rectangle)
 }
 
 func (r *renderer) layoutNode(node *project.Node, bounds, clip image.Rectangle, final bool) {
-	if node == nil || bounds.Empty() {
+	if node == nil || node.Hidden || bounds.Empty() {
 		return
 	}
 	if !final {
 		bounds = applySize(node, bounds)
 	}
-	node = buttonNodeForState(node, r.state)
+	node = interactiveNodeForState(node, r.state)
 	incomingClip := clip
 	clip = clip.Intersect(bounds)
 	previousOpacity := r.opacity
 	r.opacity *= clamp(number(node.Props["opacity"], 1), 0, 1)
 	defer func() { r.opacity = previousOpacity }()
 	r.result.Bounds[node.Handle] = bounds
-	inspection := Inspection{
-		Handle: node.Handle, Type: node.Type, Name: node.Name, Bounds: bounds, Clip: clip,
-		Props: cloneMap(node.Props), Source: node.Source.File, Line: node.Source.Line,
-		Column: node.Source.Column, Breadcrumb: append([]string(nil), node.Breadcrumb...),
+	r.result.Geometry[node.Handle] = semantic.Geometry{
+		Bounds: bounds, Clip: clip, PaintOrder: r.paintOrder, Props: cloneMap(node.Props),
 	}
-	if node.Type == "button" {
-		disabled := boolValue(node.Props["disabled"], false)
-		label := stringValue(node.Props["label"], "")
-		inspection.Role, inspection.Label, inspection.Enabled, inspection.Scope = "button", label, !disabled, node.Scope
-		inspection.Actions = append([]document.Action(nil), node.On.Activate...)
-		inspection.State = cloneMap(r.state.Values[node.Scope])
-		inspection.Hovered = r.state.Hovered == node.Handle
-		inspection.Pressed = r.state.Pressed == node.Handle
-		inspection.Focused = r.state.Focused == node.Handle
-		r.result.Interactions = append(r.result.Interactions, InteractionRegion{
-			Handle: node.Handle, Bounds: bounds, Clip: clip, Scope: node.Scope, Label: label,
-			Disabled: disabled, Actions: append([]document.Action(nil), node.On.Activate...),
-		})
-	}
-	r.result.Inspections = append(r.result.Inspections, inspection)
-
+	r.paintOrder++
 	switch node.Type {
 	case "_viewport":
 		if gradient, ok := node.Props["background"].(map[string]any); ok {
@@ -217,14 +205,49 @@ func (r *renderer) layoutNode(node *project.Node, bounds, clip image.Rectangle, 
 		if len(node.Children) == 1 {
 			r.layout(node.Children[0], bounds, clip)
 		}
-	case "surface", "button":
+	case "surface", "button", "link", "toggle", "checkbox", "radio", "tab", "tab_panel", "option", "select_trigger",
+		"slider_track", "slider_fill", "slider_thumb", "stepper_decrement", "stepper_value", "stepper_increment":
 		r.paintSurface(node, bounds, incomingClip)
 		inner := inset(bounds, insets(node.Props["padding"]))
 		if len(node.Children) == 1 {
 			r.layout(node.Children[0], inner, chooseClip(node, incomingClip, bounds))
 		}
-	case "stack":
+	case "stack", "radio_group":
 		r.stack(node, bounds, clip)
+	case "stepper":
+		clone := *node
+		clone.Props = cloneMap(node.Props)
+		clone.Props["direction"] = "horizontal"
+		r.stack(&clone, bounds, clip)
+	case "slider":
+		r.paintSurface(node, bounds, incomingClip)
+		parts := sliderParts(node, inset(bounds, insets(node.Props["padding"])))
+		for _, child := range node.Children {
+			if childBounds, ok := parts[child.Handle]; ok && !childBounds.Empty() {
+				r.layoutFinal(child, childBounds, clip)
+			}
+		}
+	case "tabs":
+		parts := tabsParts(node, inset(bounds, insets(node.Props["padding"])), cpuIntrinsicSize)
+		for _, child := range node.Children {
+			if childBounds, ok := parts[child.Handle]; ok && !childBounds.Empty() {
+				r.layoutFinal(child, childBounds, clip)
+			}
+		}
+	case "select":
+		trigger, popup, popupBounds := selectPopupBounds(node, bounds, r.viewport, cpuIntrinsicSize)
+		if trigger != nil {
+			r.layoutFinal(trigger, bounds, clip)
+		}
+		if popup != nil && !popupBounds.Empty() {
+			r.topLayers = append(r.topLayers, topLayer{node: popup, bounds: popupBounds})
+		}
+	case "select_popup":
+		r.paintSurface(node, bounds, incomingClip)
+		clone := *node
+		clone.Props = cloneMap(node.Props)
+		clone.Props["direction"] = "vertical"
+		r.stack(&clone, bounds, clip)
 	case "grid":
 		r.grid(node, bounds, clip)
 	case "overlay":
@@ -278,8 +301,8 @@ func (r *renderer) layoutNode(node *project.Node, bounds, clip image.Rectangle, 
 	}
 }
 
-func buttonNodeForState(node *project.Node, state State) *project.Node {
-	if node == nil || node.Type != "button" {
+func interactiveNodeForState(node *project.Node, state State) *project.Node {
+	if node == nil {
 		return node
 	}
 	props := node.Props
@@ -295,6 +318,16 @@ func buttonNodeForState(node *project.Node, state State) *project.Node {
 			matched = state.Focused == node.Handle
 		case "disabled":
 			matched = boolValue(props["disabled"], false)
+		case "current":
+			matched = node.Type == "link" && stringValue(props["to"], "") == state.Screen
+		case "checked":
+			matched = boolValue(props["checked"], false)
+		case "selected":
+			matched = boolValue(props["selected"], false)
+		case "open":
+			matched = boolValue(props["open"], false)
+		case "active":
+			matched = boolValue(props["active"], false)
 		}
 		if !matched {
 			continue
@@ -313,6 +346,13 @@ func buttonNodeForState(node *project.Node, state State) *project.Node {
 	clone := *node
 	clone.Props = props
 	return &clone
+}
+
+func semanticContext(state State) semantic.Context {
+	return semantic.Context{
+		Screen: state.Screen, Values: state.Values, Hovered: state.Hovered,
+		Pressed: state.Pressed, Focused: state.Focused,
+	}
 }
 
 func (r *renderer) paintScrollbar(bounds, clip image.Rectangle, axis string, contentSize int, offset image.Point) {
@@ -479,10 +519,7 @@ func withOpacity(value color.RGBA, opacity float64) color.RGBA {
 }
 
 func scrollKey(node *project.Node) string {
-	if node.Name != "" {
-		return node.Name
-	}
-	return node.Handle
+	return project.ScrollKey(node)
 }
 
 func (r *renderer) text(node *project.Node, bounds, clip image.Rectangle) {
@@ -732,8 +769,11 @@ func fittedRect(source image.Point, target image.Rectangle, fit, alignment strin
 }
 
 func (r *renderer) stack(node *project.Node, bounds, clip image.Rectangle) {
-	for index, childBounds := range planStack(node, bounds, cpuIntrinsicSize) {
-		r.layoutFinal(node.Children[index], childBounds, clip)
+	children := visibleLayoutChildren(node.Children)
+	clone := *node
+	clone.Children = children
+	for index, childBounds := range planStack(&clone, bounds, cpuIntrinsicSize) {
+		r.layoutFinal(children[index], childBounds, clip)
 	}
 }
 
@@ -775,6 +815,7 @@ func intrinsicMainSize(node *project.Node, vertical bool) int {
 }
 
 func (r *renderer) grid(node *project.Node, bounds, clip image.Rectangle) {
+	children := visibleLayoutChildren(node.Children)
 	gap := int(number(node.Props["gap"], 0))
 	columnDefs := anySlice(node.Props["columns"])
 	if len(columnDefs) == 0 {
@@ -785,8 +826,8 @@ func (r *renderer) grid(node *project.Node, bounds, clip image.Rectangle) {
 		}
 	}
 	columns := len(columnDefs)
-	rows := max(1, int(math.Ceil(float64(len(node.Children))/float64(columns))))
-	for index, child := range node.Children {
+	rows := max(1, int(math.Ceil(float64(len(children))/float64(columns))))
+	for index, child := range children {
 		row := index / columns
 		if value, ok := child.Place["row"]; ok {
 			row = int(number(value, float64(row)))
@@ -800,7 +841,7 @@ func (r *renderer) grid(node *project.Node, bounds, clip image.Rectangle) {
 	}
 	columnSizes := tracks(columnDefs, bounds.Dx(), gap)
 	rowSizes := tracks(rowDefs, bounds.Dy(), gap)
-	for index, child := range node.Children {
+	for index, child := range children {
 		column := index % columns
 		row := index / columns
 		if value, ok := child.Place["column"]; ok {

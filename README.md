@@ -3,12 +3,14 @@
 Gora is a cross-platform preview runtime for strict, local `.gora` UI documents.
 It turns a small YAML document into a live native app window, an optional Studio
 canvas, or a headless automation session with responsive breakpoints,
-scrolling, deterministic local state, semantic buttons, and deterministic PNG
-capture.
+scrolling, deterministic local state, semantic buttons, links, toggles,
+checkboxes, radio groups, tabs, selects, sliders, and steppers, named-screen
+navigation, live semantic inspection, deterministic PNG capture, and a
+project-oriented MCP control server.
 
 V1 is deliberately a preview tool. It does not generate production UI code and
-does not include navigation, text inputs/forms, animation, remote assets, SVG,
-or MCP.
+does not include text inputs/forms, URL routing, animation, remote assets, SVG,
+or raw input injection.
 
 ## Install
 
@@ -43,11 +45,22 @@ Open the same document in Studio:
 ./gora run examples/dashboard/app.gora --root examples/dashboard --studio
 ```
 
-Run it without a visible window for automation and future MCP integration:
+Run it without a visible window for the existing live-session CLI workflow:
 
 ```sh
 ./gora run examples/dashboard/app.gora --root examples/dashboard --headless
 ```
+
+Start the persistent project-oriented MCP server:
+
+```sh
+./gora mcp
+```
+
+It serves Streamable HTTP at `http://127.0.0.1:8787/mcp`. Agents open or reuse
+projects by canonical root, then open independent app, component, or token
+views inside them. See [MCP server](docs/mcp.md) for resources, tools, editing,
+and client configuration.
 
 To exercise percentage sizing, aspect ratios, intrinsic containers, and
 wrapping stacks, open the web-layout conformance example from the repository
@@ -64,6 +77,13 @@ activation, interaction variants, and Reset state:
 ./gora run examples/interactivity/app.gora --root . --studio
 ```
 
+To exercise the complete semantic-control set, including popup top-layer
+rendering, roving keyboard focus, slider dragging, and numeric normalization:
+
+```sh
+./gora run examples/semantic-controls/app.gora --root . --studio
+```
+
 While a session is open, capture its current screen, viewport, responsive
 state, and scroll position. `--from` defaults to `app`:
 
@@ -76,6 +96,18 @@ state, and scroll position. `--from` defaults to `app`:
 ```
 
 The output path must not already exist.
+
+Inspect the current semantic tree of any live host as deterministic JSON:
+
+```sh
+./gora inspect examples/dashboard/app.gora \
+  --root examples/dashboard \
+  --from app
+```
+
+The Northstar dashboard has four real named screens. Its sidebar links update
+bounded Back/Forward history while each screen keeps its own state and named
+scroll offsets.
 
 ## Document shape
 

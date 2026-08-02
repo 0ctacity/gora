@@ -16,6 +16,7 @@ import (
 	"gioui.org/widget/material"
 
 	"gora/internal/interaction"
+	"gora/internal/semantic"
 )
 
 func TestStudioCanvasDeliversRepeatedDocumentClicksAfterStateRebuild(t *testing.T) {
@@ -46,15 +47,13 @@ func TestStudioCanvasDeliversRepeatedDocumentClicksAfterStateRebuild(t *testing.
 		inputRouter.Frame(gtx.Ops)
 	}
 	regionCenter := func(name string) f32.Point {
-		for _, region := range state.interactions {
-			for _, inspection := range state.inspections {
-				if inspection.Handle == region.Handle && inspection.Name == name {
-					visible := region.Bounds.Intersect(region.Clip)
-					logical := f32.Pt(float32(visible.Min.X+visible.Max.X)/2, float32(visible.Min.Y+visible.Max.Y)/2)
-					position := canvasPosition(state.canvasViewport, state.canvasSize, state.canvasPan)
-					scale := state.zoomValue * gtx.Metric.PxPerDp
-					return f32.Pt(float32(position.X)+logical.X*scale, float32(position.Y)+logical.Y*scale)
-				}
+		for _, node := range semantic.Flatten(state.runtimeTree) {
+			if node.Name == name && node.Bounds != nil && node.Clip != nil {
+				visible := node.Bounds.ImageRectangle().Intersect(node.Clip.ImageRectangle())
+				logical := f32.Pt(float32(visible.Min.X+visible.Max.X)/2, float32(visible.Min.Y+visible.Max.Y)/2)
+				position := canvasPosition(state.canvasViewport, state.canvasSize, state.canvasPan)
+				scale := state.zoomValue * gtx.Metric.PxPerDp
+				return f32.Pt(float32(position.X)+logical.X*scale, float32(position.Y)+logical.Y*scale)
 			}
 		}
 		t.Fatalf("missing region %q", name)

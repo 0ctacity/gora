@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"gioui.org/app"
 
 	"gora/internal/cli"
+	"gora/internal/mcpserver"
 	"gora/internal/studio"
 )
 
@@ -28,6 +32,10 @@ func main() {
 			return nil
 		case cli.LaunchHeadless:
 			return studio.RunHeadless(config.Root, config.Document, config.SocketPath)
+		case cli.LaunchMCP:
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			return mcpserver.Run(ctx, config.Listen, os.Stderr)
 		default:
 			return fmt.Errorf("unknown launch mode %q", config.Mode)
 		}

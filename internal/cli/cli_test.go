@@ -38,6 +38,38 @@ func TestUsageFailureUsesExitTwo(t *testing.T) {
 	}
 }
 
+func TestMCPCommandUsesDefaultAndCustomLoopbackListener(t *testing.T) {
+	tests := []struct {
+		args   []string
+		listen string
+	}{
+		{args: []string{"mcp"}, listen: "127.0.0.1:8787"},
+		{args: []string{"mcp", "--listen", "127.0.0.1:9191"}, listen: "127.0.0.1:9191"},
+	}
+	for _, test := range tests {
+		var launched LaunchConfig
+		var stdout, stderr bytes.Buffer
+		exit := Run(test.args, &stdout, &stderr, func(config LaunchConfig) error {
+			launched = config
+			return nil
+		})
+		if exit != 0 || launched.Mode != LaunchMCP || launched.Listen != test.listen {
+			t.Fatalf("args=%v exit=%d config=%+v stderr=%s", test.args, exit, launched, stderr.String())
+		}
+	}
+}
+
+func TestMCPCommandRejectsNonLoopbackListener(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	exit := Run([]string{"mcp", "--listen", "0.0.0.0:8787"}, &stdout, &stderr, func(LaunchConfig) error {
+		t.Fatal("non-loopback listener launched")
+		return nil
+	})
+	if exit != 2 || !bytes.Contains(stderr.Bytes(), []byte("127.0.0.1")) {
+		t.Fatalf("exit=%d stderr=%s", exit, stderr.String())
+	}
+}
+
 func TestRunRejectsTokenModuleWithoutLaunching(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "theme.gora")
@@ -183,6 +215,65 @@ func TestRenderSelectsRequestedLiveMode(t *testing.T) {
 	exit := Run([]string{"render", path, "--root", dir, "--from", "headless", "--output", filepath.Join(dir, "capture.png")}, &stdout, &stderr, nil)
 	if exit != 0 {
 		t.Fatalf("exit=%d stderr=%s", exit, stderr.String())
+	}
+}
+
+func TestInspectEmitsLiveDeterministicJSONFromRequestedMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.gora")
+	if err := os.WriteFile(path, []byte("gora: 1\nkind: app\nviewport: { width: 100, height: 80 }\nentry: main\nscreens:\n  main: { type: spacer }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root, document, err := canonicalPair(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket, err := session.SocketPath(root, document, string(LaunchHeadless))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := json.RawMessage(`{"schema_version":1,"document":"app.gora","host_mode":"headless","valid":true,"diagnostics":[],"runtime_revision":7,"available_selections":["main"],"viewport":{"width":100,"height":80},"can_back":false,"can_forward":false,"root":{"id":"screen/main","type":"spacer","enabled":true,"visible":true,"in_viewport":true,"bounds":null,"clip":null,"source":{"file":"app.gora","line":1,"column":1},"focus_order":-1,"paint_order":0}}`)
+	server, err := session.Listen(socket, func(_ context.Context, request session.Request) session.Response {
+		if request.Action != "inspect" {
+			return session.Response{Error: request.Action}
+		}
+		return session.Response{OK: true, Data: payload}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	var stdout, stderr bytes.Buffer
+	exit := Run([]string{"inspect", path, "--root", dir, "--from", "headless"}, &stdout, &stderr, nil)
+	if exit != 0 || !bytes.Equal(bytes.TrimSpace(stdout.Bytes()), payload) {
+		t.Fatalf("exit=%d stdout=%s stderr=%s", exit, stdout.String(), stderr.String())
+	}
+}
+
+func TestInspectInitialInvalidLiveTreeUsesExitOne(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.gora")
+	if err := os.WriteFile(path, []byte("gora: 1\nkind: app\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root, document, err := canonicalPair(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket, err := session.SocketPath(root, document, string(LaunchApp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := session.Listen(socket, func(context.Context, session.Request) session.Response {
+		return session.Response{OK: true, Data: json.RawMessage(`{"schema_version":1,"valid":false,"root":null}`)}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	var stdout, stderr bytes.Buffer
+	if exit := Run([]string{"inspect", path, "--root", dir}, &stdout, &stderr, nil); exit != 1 {
+		t.Fatalf("exit=%d stdout=%s stderr=%s", exit, stdout.String(), stderr.String())
 	}
 }
 

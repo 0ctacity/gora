@@ -194,6 +194,7 @@ entry: main
 screens:
   main:
     type: button
+    name: add-seat
     props: { label: Add seat, background: "#172033", disabled: false }
     on:
       activate:
@@ -274,6 +275,253 @@ screens:
 			t.Fatalf("missing %s diagnostic: %+v", code, diagnostics)
 		}
 	}
+}
+
+func TestAcceptsSemanticLinksAndNavigationActions(t *testing.T) {
+	doc, diagnostics := Parse("navigation.gora", []byte(`
+gora: 1
+kind: app
+viewport: { width: 400, height: 300 }
+state:
+  menu_open: { type: boolean, default: true }
+entry: home
+screens:
+  home:
+    type: stack
+    children:
+      - type: link
+        name: reports-link
+        props: { label: Reports, to: reports }
+        on:
+          activate:
+            - { action: set, state: menu_open, value: false }
+        variants:
+          - { when: { interaction: current }, props: { background: "#635BFF" } }
+        children:
+          - { type: text, props: { text: Reports } }
+      - type: button
+        name: forward-button
+        props: { label: Forward }
+        on:
+          activate:
+            - { action: forward }
+        children:
+          - { type: text, props: { text: Forward } }
+  reports:
+    type: button
+    name: back-button
+    props: { label: Back }
+    on:
+      activate:
+        - { action: back }
+    children:
+      - { type: text, props: { text: Back } }
+`))
+	if len(diagnostics) != 0 {
+		t.Fatalf("Parse diagnostics: %+v", diagnostics)
+	}
+	link := doc.Screens["home"].Children[0]
+	if link.Type != "link" || link.Name != "reports-link" || link.Props["to"] != "reports" {
+		t.Fatalf("link = %+v", link)
+	}
+	if got := doc.Screens["home"].Children[1].On.Activate[0]; got.Action != "forward" || got.To != "" {
+		t.Fatalf("forward action = %+v", got)
+	}
+}
+
+func TestRejectsInvalidLinkAndNavigationContracts(t *testing.T) {
+	_, diagnostics := Parse("invalid-navigation.gora", []byte(`
+gora: 1
+kind: app
+viewport: { width: 400, height: 300 }
+entry: home
+screens:
+  home:
+    type: stack
+    variants:
+      - { when: { interaction: current }, props: { background: "#635BFF" } }
+    children:
+      - type: link
+        props: { label: "", to: missing }
+        on:
+          activate:
+            - { action: navigate, to: home }
+        children:
+          - type: button
+            props: { label: Nested }
+            children:
+              - { type: text, props: { text: Nested } }
+      - type: button
+        props: { label: Multiple }
+        on:
+          activate:
+            - { action: navigate, to: missing }
+            - { action: back }
+        children:
+          - { type: text, props: { text: Multiple } }
+      - type: button
+        name: bad-fields
+        props: { label: Bad fields }
+        on:
+          activate:
+            - { action: replace }
+            - { action: forward, to: home }
+        children:
+          - { type: text, props: { text: Bad fields } }
+`))
+	for _, code := range []string{
+		"interactive.name", "link.label", "link.target", "link.nested",
+		"link.actions", "action.navigation_count", "action.target", "action.fields", "variant.interaction",
+	} {
+		requireDiagnostic(t, diagnostics, code, "")
+	}
+}
+
+func TestAcceptsSemanticControlsAndNumberDomains(t *testing.T) {
+	doc, diagnostics := Parse("controls.gora", []byte(`
+gora: 1
+kind: app
+viewport: { width: 800, height: 600 }
+state:
+  enabled: { type: boolean, default: true }
+  plan: { type: enum, values: [monthly, annual], default: monthly }
+  team: { type: text, default: design }
+  volume: { type: number, default: 40, min: 0, max: 100, step: 5 }
+entry: main
+screens:
+  main:
+    type: stack
+    children:
+      - type: toggle
+        name: enabled-toggle
+        props: { label: Enabled, bind: enabled }
+        children: [{ type: text, props: { text: Enabled } }]
+      - type: checkbox
+        name: enabled-checkbox
+        props: { label: Enabled, bind: enabled }
+        children: [{ type: text, props: { text: Enabled } }]
+      - type: radio_group
+        name: plan-radio
+        props: { label: Plan, bind: plan, direction: horizontal }
+        children:
+          - type: radio
+            name: monthly-radio
+            props: { label: Monthly, value: monthly }
+            children: [{ type: text, props: { text: Monthly } }]
+          - type: radio
+            name: annual-radio
+            props: { label: Annual, value: annual }
+            children: [{ type: text, props: { text: Annual } }]
+      - type: tabs
+        name: plan-tabs
+        props: { label: Plan, bind: plan, orientation: horizontal }
+        children:
+          - type: tab
+            name: monthly-tab
+            props: { label: Monthly, value: monthly }
+            children: [{ type: text, props: { text: Monthly } }]
+          - type: tab
+            name: annual-tab
+            props: { label: Annual, value: annual }
+            children: [{ type: text, props: { text: Annual } }]
+          - type: tab_panel
+            props: { value: monthly }
+            children: [{ type: text, props: { text: Monthly panel } }]
+          - type: tab_panel
+            props: { value: annual }
+            children: [{ type: text, props: { text: Annual panel } }]
+      - type: select
+        name: team-select
+        props: { label: Team, bind: team }
+        children:
+          - type: select_trigger
+            children: [{ type: text, props: { text: { ref: state.team } } }]
+          - type: select_popup
+            props: { max_height: 200, match_trigger_width: true }
+            children:
+              - type: option
+                name: design-option
+                props: { label: Design, value: design }
+                children: [{ type: text, props: { text: Design } }]
+              - type: option
+                name: engineering-option
+                props: { label: Engineering, value: engineering }
+                children: [{ type: text, props: { text: Engineering } }]
+      - type: slider
+        name: volume-slider
+        props: { label: Volume, bind: volume, orientation: horizontal }
+        children:
+          - { type: slider_track, props: { height: 4 } }
+          - { type: slider_fill, props: { height: 4 } }
+          - { type: slider_thumb, props: { width: 16, height: 16 } }
+      - type: stepper
+        name: volume-stepper
+        props: { label: Volume, bind: volume }
+        children:
+          - type: stepper_decrement
+            children: [{ type: text, props: { text: "-" } }]
+          - type: stepper_value
+            children: [{ type: text, props: { text: { ref: state.volume } } }]
+          - type: stepper_increment
+            children: [{ type: text, props: { text: "+" } }]
+`))
+	if len(diagnostics) != 0 {
+		t.Fatalf("Parse diagnostics: %+v", diagnostics)
+	}
+	volume := doc.State["volume"]
+	if volume.Min == nil || volume.Max == nil || volume.Step == nil || *volume.Min != 0 || *volume.Max != 100 || *volume.Step != 5 {
+		t.Fatalf("number domain = %+v", volume)
+	}
+}
+
+func TestRejectsInvalidControlBindingsAndNumberDomains(t *testing.T) {
+	_, diagnostics := Parse("invalid-controls.gora", []byte(`
+gora: 1
+kind: app
+viewport: { width: 400, height: 300 }
+state:
+  enabled: { type: boolean, default: false, min: 0 }
+  volume: { type: number, default: 3, min: 10, max: 0, step: 0 }
+entry: main
+screens:
+  main:
+    type: stack
+    children:
+      - type: toggle
+        name: bad-toggle
+        props: { label: Bad, bind: volume }
+        children: [{ type: text, props: { text: Bad } }]
+      - type: slider
+        name: bad-slider
+        props: { label: Bad, bind: enabled, orientation: diagonal }
+        children:
+          - { type: slider_track }
+          - { type: slider_thumb }
+`))
+	for _, code := range []string{"state.domain", "control.binding", "schema.prop_value"} {
+		requireDiagnostic(t, diagnostics, code, "")
+	}
+}
+
+func TestRejectsNestedSemanticControlVisuals(t *testing.T) {
+	_, diagnostics := Parse("nested.gora", []byte(`
+gora: 1
+kind: app
+viewport: { width: 400, height: 300 }
+state: { enabled: { type: boolean, default: true } }
+entry: main
+screens:
+  main:
+    type: checkbox
+    name: outer
+    props: { label: Outer, bind: enabled }
+    children:
+      - type: toggle
+        name: inner
+        props: { label: Inner, bind: enabled }
+        children: [{ type: text, props: { content: Inner } }]
+`))
+	requireDiagnostic(t, diagnostics, "control.nested", "")
 }
 
 func requireDiagnostic(t *testing.T, diagnostics []Diagnostic, code, suggestion string) {

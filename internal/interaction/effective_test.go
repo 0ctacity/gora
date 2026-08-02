@@ -41,12 +41,55 @@ func TestEffectiveTreeAppliesButtonInteractionVariantsAndVisibility(t *testing.T
 			{When: document.Condition{State: "shown", Operator: "equals", Value: false}, Visible: &hidden},
 		},
 	}
-	if got := ResolveTree(root, map[string]map[string]any{"screen:main": {"shown": false}}, Transient{Hovered: "save", Focused: "save"}); got != nil {
+	if got := ResolveTree(root, map[string]map[string]any{"screen:main": {"shown": false}}, Transient{Hovered: "save", Focused: "save"}); got == nil || !got.Hidden {
 		t.Fatalf("hidden node = %#v", got)
 	}
 	root.Variants = root.Variants[:2]
 	effective := ResolveTree(root, nil, Transient{Hovered: "save", Focused: "save"})
 	if effective.Props["background"] != "#222222" {
 		t.Fatalf("background = %#v", effective.Props["background"])
+	}
+}
+
+func TestEffectiveTreeDerivesBoundControlStateAndTabPanelVisibility(t *testing.T) {
+	root := &project.Node{
+		Handle: "tabs", Type: "tabs", Name: "plan-tabs", Scope: "screen:main", Binding: "plan",
+		Children: []*project.Node{
+			{Handle: "monthly", Type: "tab", Name: "monthly-tab", Scope: "screen:main", Props: map[string]any{"value": "monthly"}},
+			{Handle: "annual", Type: "tab", Name: "annual-tab", Scope: "screen:main", Props: map[string]any{"value": "annual"}},
+			{Handle: "monthly-panel", Type: "tab_panel", Scope: "screen:main", Props: map[string]any{"value": "monthly"}},
+			{Handle: "annual-panel", Type: "tab_panel", Scope: "screen:main", Props: map[string]any{"value": "annual"}},
+		},
+	}
+	effective := ResolvePersistentTree(root, map[string]map[string]any{"screen:main": {"plan": "annual"}})
+	if effective.Props["value"] != "annual" || effective.Children[0].Props["selected"] != false || effective.Children[1].Props["selected"] != true {
+		t.Fatalf("tab state = %#v / %#v / %#v", effective.Props, effective.Children[0].Props, effective.Children[1].Props)
+	}
+	if !effective.Children[2].Hidden || effective.Children[3].Hidden {
+		t.Fatalf("panel visibility = %v / %v", effective.Children[2].Hidden, effective.Children[3].Hidden)
+	}
+
+	toggle := &project.Node{Handle: "toggle", Type: "toggle", Scope: "screen:main", Binding: "enabled", Props: map[string]any{}}
+	checked := ResolvePersistentTree(toggle, map[string]map[string]any{"screen:main": {"enabled": true}})
+	if checked.Props["checked"] != true {
+		t.Fatalf("toggle props = %#v", checked.Props)
+	}
+}
+
+func TestEffectiveTreeShowsOnlyTheOpenSelectPopupAndActiveOption(t *testing.T) {
+	root := &project.Node{Handle: "select", Type: "select", Scope: "screen:main", Binding: "team", Children: []*project.Node{
+		{Handle: "trigger", Type: "select_trigger", Scope: "screen:main"},
+		{Handle: "popup", Type: "select_popup", Scope: "screen:main", Children: []*project.Node{
+			{Handle: "design", Type: "option", Scope: "screen:main", Props: map[string]any{"value": "design"}},
+			{Handle: "engineering", Type: "option", Scope: "screen:main", Props: map[string]any{"value": "engineering"}},
+		}},
+	}}
+	closed := ResolveTree(root, map[string]map[string]any{"screen:main": {"team": "design"}}, Transient{})
+	if !closed.Children[1].Hidden {
+		t.Fatal("closed select popup is visible")
+	}
+	open := ResolveTree(root, map[string]map[string]any{"screen:main": {"team": "design"}}, Transient{OpenSelect: "select", ActiveOption: "engineering"})
+	if open.Children[1].Hidden || open.Props["open"] != true || open.Children[1].Children[1].Props["active"] != true {
+		t.Fatalf("open select = %+v", open)
 	}
 }

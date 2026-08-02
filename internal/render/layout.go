@@ -10,23 +10,40 @@ import (
 type intrinsicMeasure func(*project.Node, image.Point) image.Point
 
 func measureIntrinsic(node *project.Node, limit image.Point, leaf intrinsicMeasure) image.Point {
-	if node == nil {
+	if node == nil || node.Hidden {
 		return image.Point{}
 	}
 	padding := insets(node.Props["padding"])
 	innerLimit := image.Pt(max(0, limit.X-padding.left-padding.right), max(0, limit.Y-padding.top-padding.bottom))
 	var preferred image.Point
 	switch node.Type {
-	case "surface", "button", "_viewport":
+	case "surface", "button", "link", "toggle", "checkbox", "radio", "tab", "tab_panel", "option", "select_trigger",
+		"slider_track", "slider_fill", "slider_thumb", "stepper_decrement", "stepper_value", "stepper_increment", "_viewport":
 		if len(node.Children) == 1 {
 			preferred = measureIntrinsic(node.Children[0], innerLimit, leaf)
 		}
 		preferred.X += padding.left + padding.right
 		preferred.Y += padding.top + padding.bottom
-	case "stack":
-		preferred = measureStackIntrinsic(node, innerLimit, leaf)
+	case "stack", "radio_group", "select_popup", "stepper":
+		if node.Type == "stepper" {
+			clone := *node
+			clone.Props = cloneMap(node.Props)
+			clone.Props["direction"] = "horizontal"
+			preferred = measureStackIntrinsic(&clone, innerLimit, leaf)
+		} else if node.Type == "select_popup" {
+			clone := *node
+			clone.Props = cloneMap(node.Props)
+			clone.Props["direction"] = "vertical"
+			preferred = measureStackIntrinsic(&clone, innerLimit, leaf)
+		} else {
+			preferred = measureStackIntrinsic(node, innerLimit, leaf)
+		}
 		preferred.X += padding.left + padding.right
 		preferred.Y += padding.top + padding.bottom
+	case "slider":
+		preferred = image.Pt(minPositive(limit.X, 160), minPositive(limit.Y, 24))
+	case "tabs":
+		preferred = measureTabsIntrinsic(node, innerLimit, leaf)
 	case "overlay":
 		for _, child := range node.Children {
 			size := measureIntrinsic(child, innerLimit, leaf)
@@ -55,6 +72,202 @@ func measureIntrinsic(node *project.Node, limit image.Point, leaf intrinsicMeasu
 	return constrainIntrinsic(node, preferred, limit)
 }
 
+func selectPopupBounds(node *project.Node, triggerBounds, viewport image.Rectangle, leaf intrinsicMeasure) (*project.Node, *project.Node, image.Rectangle) {
+	var trigger, popup *project.Node
+	for _, child := range node.Children {
+		if child == nil || child.Hidden {
+			continue
+		}
+		switch child.Type {
+		case "select_trigger":
+			trigger = child
+		case "select_popup":
+			popup = child
+		}
+	}
+	if popup == nil {
+		return trigger, nil, image.Rectangle{}
+	}
+	size := measureIntrinsic(popup, viewport.Size(), leaf)
+	maxHeight := int(number(popup.Props["max_height"], 320))
+	if maxHeight > 0 {
+		size.Y = min(size.Y, maxHeight)
+	}
+	if boolValue(popup.Props["match_trigger_width"], true) {
+		size.X = triggerBounds.Dx()
+	}
+	size.X = min(max(1, size.X), viewport.Dx())
+	size.Y = min(max(1, size.Y), viewport.Dy())
+	x := min(max(viewport.Min.X, triggerBounds.Min.X), viewport.Max.X-size.X)
+	y := triggerBounds.Max.Y
+	if y+size.Y > viewport.Max.Y {
+		y = triggerBounds.Min.Y - size.Y
+	}
+	y = min(max(viewport.Min.Y, y), viewport.Max.Y-size.Y)
+	return trigger, popup, image.Rect(x, y, x+size.X, y+size.Y)
+}
+
+func measureTabsIntrinsic(node *project.Node, limit image.Point, leaf intrinsicMeasure) image.Point {
+	orientation := stringValue(node.Props["orientation"], "horizontal")
+	gap := int(number(node.Props["gap"], 0))
+	panelGap := int(number(node.Props["panel_gap"], 0))
+	listMain, listCross := 0, 0
+	panel := image.Point{}
+	count := 0
+	for _, child := range node.Children {
+		if child == nil || child.Hidden {
+			continue
+		}
+		size := measureIntrinsic(child, limit, leaf)
+		switch child.Type {
+		case "tab":
+			if count > 0 {
+				listMain += gap
+			}
+			if orientation == "vertical" {
+				listMain += size.Y
+				listCross = max(listCross, size.X)
+			} else {
+				listMain += size.X
+				listCross = max(listCross, size.Y)
+			}
+			count++
+		case "tab_panel":
+			panel = size
+		}
+	}
+	if orientation == "vertical" {
+		return image.Pt(listCross+panelGap+panel.X, max(listMain, panel.Y))
+	}
+	return image.Pt(max(listMain, panel.X), listCross+panelGap+panel.Y)
+}
+
+func tabsParts(node *project.Node, bounds image.Rectangle, leaf intrinsicMeasure) map[string]image.Rectangle {
+	result := make(map[string]image.Rectangle, len(node.Children))
+	orientation := stringValue(node.Props["orientation"], "horizontal")
+	gap := int(number(node.Props["gap"], 0))
+	panelGap := int(number(node.Props["panel_gap"], 0))
+	tabs := make([]*project.Node, 0, len(node.Children))
+	var panel *project.Node
+	listCross := 0
+	for _, child := range node.Children {
+		if child == nil || child.Hidden {
+			continue
+		}
+		if child.Type == "tab" {
+			tabs = append(tabs, child)
+			size := measureIntrinsic(child, bounds.Size(), leaf)
+			if orientation == "vertical" {
+				listCross = max(listCross, size.X)
+			} else {
+				listCross = max(listCross, size.Y)
+			}
+		} else if child.Type == "tab_panel" {
+			panel = child
+		}
+	}
+	cursor := 0
+	for index, tab := range tabs {
+		size := measureIntrinsic(tab, bounds.Size(), leaf)
+		if orientation == "vertical" {
+			result[tab.Handle] = image.Rect(bounds.Min.X, bounds.Min.Y+cursor, bounds.Min.X+listCross, bounds.Min.Y+cursor+size.Y)
+			cursor += size.Y
+		} else {
+			result[tab.Handle] = image.Rect(bounds.Min.X+cursor, bounds.Min.Y, bounds.Min.X+cursor+size.X, bounds.Min.Y+listCross)
+			cursor += size.X
+		}
+		if index < len(tabs)-1 {
+			cursor += gap
+		}
+	}
+	if panel != nil {
+		if orientation == "vertical" {
+			result[panel.Handle] = image.Rect(bounds.Min.X+listCross+panelGap, bounds.Min.Y, bounds.Max.X, bounds.Max.Y)
+		} else {
+			result[panel.Handle] = image.Rect(bounds.Min.X, bounds.Min.Y+listCross+panelGap, bounds.Max.X, bounds.Max.Y)
+		}
+	}
+	return result
+}
+
+func sliderParts(node *project.Node, bounds image.Rectangle) map[string]image.Rectangle {
+	result := make(map[string]image.Rectangle, len(node.Children))
+	if node == nil || bounds.Empty() {
+		return result
+	}
+	minimum, maximum, step := 0.0, 100.0, 1.0
+	if node.BindingState != nil {
+		if node.BindingState.Min != nil {
+			minimum = *node.BindingState.Min
+		}
+		if node.BindingState.Max != nil {
+			maximum = *node.BindingState.Max
+		}
+		if node.BindingState.Step != nil {
+			step = *node.BindingState.Step
+		}
+	}
+	_ = step
+	value := number(node.Props["value"], minimum)
+	ratio := 0.0
+	if maximum > minimum {
+		ratio = clamp((value-minimum)/(maximum-minimum), 0, 1)
+	}
+	var track, fill, thumb *project.Node
+	for _, child := range node.Children {
+		switch child.Type {
+		case "slider_track":
+			track = child
+		case "slider_fill":
+			fill = child
+		case "slider_thumb":
+			thumb = child
+		}
+	}
+	orientation := stringValue(node.Props["orientation"], "horizontal")
+	if orientation == "vertical" {
+		trackWidth := max(1, int(number(prop(track, "width"), 4)))
+		thumbWidth := max(1, int(number(prop(thumb, "width"), 16)))
+		thumbHeight := max(1, int(number(prop(thumb, "height"), 16)))
+		centerX := bounds.Min.X + bounds.Dx()/2
+		centerY := bounds.Max.Y - int(math.Round(ratio*float64(bounds.Dy())))
+		if track != nil {
+			result[track.Handle] = image.Rect(centerX-trackWidth/2, bounds.Min.Y, centerX+(trackWidth+1)/2, bounds.Max.Y)
+		}
+		if fill != nil {
+			fillWidth := max(1, int(number(prop(fill, "width"), float64(trackWidth))))
+			result[fill.Handle] = image.Rect(centerX-fillWidth/2, centerY, centerX+(fillWidth+1)/2, bounds.Max.Y)
+		}
+		if thumb != nil {
+			result[thumb.Handle] = image.Rect(centerX-thumbWidth/2, centerY-thumbHeight/2, centerX+(thumbWidth+1)/2, centerY+(thumbHeight+1)/2)
+		}
+		return result
+	}
+	trackHeight := max(1, int(number(prop(track, "height"), 4)))
+	thumbWidth := max(1, int(number(prop(thumb, "width"), 16)))
+	thumbHeight := max(1, int(number(prop(thumb, "height"), 16)))
+	centerX := bounds.Min.X + int(math.Round(ratio*float64(bounds.Dx())))
+	centerY := bounds.Min.Y + bounds.Dy()/2
+	if track != nil {
+		result[track.Handle] = image.Rect(bounds.Min.X, centerY-trackHeight/2, bounds.Max.X, centerY+(trackHeight+1)/2)
+	}
+	if fill != nil {
+		fillHeight := max(1, int(number(prop(fill, "height"), float64(trackHeight))))
+		result[fill.Handle] = image.Rect(bounds.Min.X, centerY-fillHeight/2, centerX, centerY+(fillHeight+1)/2)
+	}
+	if thumb != nil {
+		result[thumb.Handle] = image.Rect(centerX-thumbWidth/2, centerY-thumbHeight/2, centerX+(thumbWidth+1)/2, centerY+(thumbHeight+1)/2)
+	}
+	return result
+}
+
+func prop(node *project.Node, key string) any {
+	if node == nil {
+		return nil
+	}
+	return node.Props[key]
+}
+
 func measureStackIntrinsic(node *project.Node, limit image.Point, leaf intrinsicMeasure) image.Point {
 	vertical := stringValue(node.Props["direction"], "vertical") != "horizontal"
 	mainLimit := limit.X
@@ -76,7 +289,7 @@ func measureStackIntrinsic(node *project.Node, limit image.Point, leaf intrinsic
 		totalCross += lineCross
 		lineMain, lineCross, lineCount = 0, 0, 0
 	}
-	for _, child := range node.Children {
+	for _, child := range visibleLayoutChildren(node.Children) {
 		size := measureIntrinsic(child, limit, leaf)
 		main, cross := size.X, size.Y
 		mainKey := "width"
@@ -114,14 +327,25 @@ func measureGridIntrinsic(node *project.Node, limit image.Point, leaf intrinsicM
 		columns = max(1, int(number(node.Props["columns"], 1)))
 	}
 	columnWidths := make([]int, columns)
-	rowHeights := make([]int, (len(node.Children)+columns-1)/columns)
-	for index, child := range node.Children {
+	children := visibleLayoutChildren(node.Children)
+	rowHeights := make([]int, (len(children)+columns-1)/columns)
+	for index, child := range children {
 		size := measureIntrinsic(child, limit, leaf)
 		columnWidths[index%columns] = max(columnWidths[index%columns], size.X)
 		rowHeights[index/columns] = max(rowHeights[index/columns], size.Y)
 	}
 	gap := int(number(node.Props["gap"], 0))
 	return image.Pt(sumInts(columnWidths)+gap*max(0, len(columnWidths)-1), sumInts(rowHeights)+gap*max(0, len(rowHeights)-1))
+}
+
+func visibleLayoutChildren(children []*project.Node) []*project.Node {
+	result := make([]*project.Node, 0, len(children))
+	for _, child := range children {
+		if child != nil && !child.Hidden {
+			result = append(result, child)
+		}
+	}
+	return result
 }
 
 func constrainIntrinsic(node *project.Node, preferred, limit image.Point) image.Point {

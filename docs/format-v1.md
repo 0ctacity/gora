@@ -113,7 +113,7 @@ Apps and components may declare ephemeral, document-owned state:
 ```yaml
 state:
   expanded: { type: boolean, default: false }
-  seats: { type: number, default: 3 }
+  seats: { type: number, default: 3, min: 1, max: 10, step: 1 }
   status: { type: text, default: Ready }
   plan: { type: enum, values: [monthly, annual], default: monthly }
 ```
@@ -125,6 +125,11 @@ instance owns an independent scope. `{ ref: state.name }` reads the nearest
 lexical scope. Direct state references in text/content format booleans as
 `true`/`false`, numbers with the shortest finite decimal representation, and
 text/enums unchanged.
+
+Number state may declare finite `min`, `max`, and positive `step`. Bounds may
+be omitted for steppers but are required by sliders. All writes clamp to the
+domain and snap to the nearest step anchored at `min`, or zero without a
+minimum; exact ties round toward positive infinity.
 
 Any node may declare source-ordered persistent state variants:
 
@@ -186,8 +191,8 @@ responsive: {}
 children: []
 ```
 
-`name` is optional and unique within its source document. Runtime handles are
-generated and never serialized.
+`name` is optional and unique within its source document, except that buttons
+and links require one. Runtime handles are generated and never serialized.
 
 `responsive` is keyed by a breakpoint declared in the same document. It may
 override only `props`, `place`, and `visible`; it cannot change type, name, or
@@ -282,6 +287,69 @@ Button-only interaction variants use `when: { interaction: hovered }`,
 `pressed`, `focused`, or `disabled`. They may change only `background`,
 `border`, `shadow`, and `opacity`.
 
+### `link`
+
+A link is a surface-like semantic control with a required authored `name`, a
+non-empty `label`, a named-screen `to` target, and exactly one visual child.
+It shares button pointer capture, focus traversal, Enter/Space activation,
+disabled behavior, and paint-only interaction variants. Interactive descendants
+inside either control are invalid.
+
+`when: { interaction: current }` is link-only and matches when `to` is the
+active app screen. A component link target may come from a text parameter; its
+final value is checked against the consuming app after expansion. In a
+standalone component fixture, activation is a deterministic navigation no-op.
+
+Links navigate implicitly after their authored state actions commit. Their
+`on.activate` lists therefore contain state actions only.
+
+### Semantic controls
+
+Dedicated controls bind directly to a writable state name in their nearest
+lexical scope with `props.bind`; binding references are not `{ ref: ... }`
+objects. Every control root and every radio, tab, and option has a unique
+authored `name` and non-empty semantic `label`.
+
+- `toggle` and `checkbox` bind boolean state and contain one authored visual.
+- `radio_group` contains one or more `radio` children and binds text, number,
+  or enum state. Values are unique after reference resolution.
+- `tabs` contains source-ordered `tab` children followed by one matching
+  `tab_panel` per value. Inactive panels remain semantic but have null geometry.
+- `select` contains one `select_trigger` and one `select_popup`; the popup
+  contains named `option` children and renders in the viewport-clipped top
+  layer. Selection commits explicitly and Escape, Tab, or an outside click
+  cancels.
+- `slider` binds bounded number state and contains one `slider_track`, optional
+  `slider_fill`, and one `slider_thumb`.
+- `stepper` binds number state and contains decrement, value, and increment
+  parts.
+
+Radio groups and tabs use roving focus with wrapping arrows and Home/End.
+Select uses arrows, Home/End, PageUp/PageDown, Enter/Space, Escape, and Tab.
+Slider and stepper use arrows, ten-step Page keys, and available Home/End
+bounds. Slider pointer dragging owns its gesture until release or cancellation.
+
+Semantic variants are `checked` for toggles/checkboxes, `selected` for radio,
+tab, and option, `open` for select subtrees, and `active` for the select's
+transient option. Checked/selected variants may change persistent layout;
+open/active variants remain paint-only. Control visual subtrees cannot contain
+nested controls, while tab panels may contain arbitrary controls.
+
+### Navigation actions and history
+
+Buttons may author one `navigate`, `replace`, `back`, or `forward` command in
+an activation list. `navigate` and `replace` require a named-screen `to` target;
+`back` and `forward` accept no operands. State actions reduce and commit first,
+then navigation runs. Same-screen navigation and history-boundary operations
+are successful no-ops.
+
+Apps keep at most 100 history entries. New navigation saves the current
+entry's named scroll offsets, truncates forward history, and starts the target
+at the top. Back and forward restore the entry's screen and offsets. Replace
+starts the replacement at the top. State is not snapshotted. Studio screen
+selection is preview-only: it resets history to one entry and starts at the
+top.
+
 ### `text`
 
 Go-font fallback or a local TTF/OTF; text, size, weight, italic, color,
@@ -304,7 +372,8 @@ preview content use `slot_content`.
 
 ## Deferred from v1
 
-Text inputs/forms, navigation, semantic control libraries beyond button, safe
+Text inputs/forms, URL/deep-link routing, safe
 areas, SVG/vector paths, animation, remote assets, native accessibility-tree
-integration, translation, project manifests, formatting, document mutation,
-MCP, code generation, and a production runtime are not part of v1.
+integration, translation, code generation, and a production runtime are not
+part of v1. Multi-select, typeahead, editable spinbuttons, mixed checkboxes,
+native pickers, and press-and-hold repetition remain deferred.

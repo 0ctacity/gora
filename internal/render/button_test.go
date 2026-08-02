@@ -19,15 +19,27 @@ func TestButtonUsesSurfaceLayoutAndRecordsSemanticRegion(t *testing.T) {
 		Children: []*project.Node{{Handle: "label", Type: "text", Props: map[string]any{"content": "Save"}}},
 	}
 	result := Render(root, image.Pt(180, 48), State{})
-	if len(result.Interactions) != 1 {
-		t.Fatalf("interactions = %+v", result.Interactions)
-	}
-	region := result.Interactions[0]
-	if region.Handle != "save" || region.Scope != "screen:main" || region.Label != "Save" || region.Disabled || len(region.Actions) != 1 {
-		t.Fatalf("region = %+v", region)
+	region := result.Tree
+	if region.Handle != "save" || region.Scope != "screen:main" || region.Label != "Save" || !region.Enabled || len(region.Actions) != 1 {
+		t.Fatalf("semantic node = %+v", region)
 	}
 	if result.Bounds["label"].Min != image.Pt(12, 8) {
 		t.Fatalf("label bounds = %v", result.Bounds["label"])
+	}
+}
+
+func TestRenderBuildsCanonicalRuntimeTreeForLinks(t *testing.T) {
+	root := &project.Node{
+		Handle: "reports", Type: "link", Name: "reports-link", Scope: "screen:home",
+		Props:    map[string]any{"label": "Reports", "to": "reports", "width": float64(120), "height": float64(40)},
+		Children: []*project.Node{{Handle: "label", Type: "text", Props: map[string]any{"text": "Reports"}}},
+	}
+	result := Render(root, image.Pt(200, 80), State{Screen: "home"})
+	if result.Tree == nil || result.Tree.Role != "link" || result.Tree.Current || result.Tree.Bounds == nil {
+		t.Fatalf("tree = %+v", result.Tree)
+	}
+	if len(result.Tree.Effects) != 1 || result.Tree.Effects[0].Action != "navigate" || result.Tree.Effects[0].To != "reports" {
+		t.Fatalf("effects = %+v", result.Tree.Effects)
 	}
 }
 
