@@ -1,0 +1,29 @@
+gora: 1
+kind: component
+name: ContactField
+viewport: { width: 480, height: 100 }
+state:
+  nickname: { type: text, default: Countess }
+previews:
+  default: {}
+root:
+  type: text_field
+  name: nickname-field
+  props:
+    label: Component-local nickname
+    bind: nickname
+    min_length: 2
+    placeholder: Nickname
+  children:
+    - type: field_box
+      props:
+        height: 52
+        padding: { top: 14, right: 16, bottom: 14, left: 16 }
+        background: "#FFFDF8"
+        border: { thickness: 1, color: "#C9D0CA" }
+        radius: 12
+        size: 16
+        color: "#18211C"
+        placeholder_color: "#919A93"
+        selection_color: "#C9DDD0"
+        caret_color: "#28734D"
