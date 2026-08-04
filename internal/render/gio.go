@@ -135,6 +135,9 @@ func (r *gioRenderer) layoutNode(node *project.Node, bounds, currentClip image.R
 		bounds = applySize(node, bounds)
 	}
 	node = interactiveNodeForState(node, r.state)
+	if node.Type == "field_box" {
+		node, _ = fieldNodeWithViewport(node, bounds)
+	}
 	nodeClip := currentClip.Intersect(bounds)
 	previousOpacity := r.opacity
 	r.opacity *= clamp(number(node.Props["opacity"], 1), 0, 1)
@@ -161,7 +164,7 @@ func (r *gioRenderer) layoutNode(node *project.Node, bounds, currentClip image.R
 		if len(node.Children) == 1 {
 			r.layout(node.Children[0], bounds, nodeClip)
 		}
-	case "surface", "toggle", "checkbox", "radio", "tab", "tab_panel", "option", "select_trigger",
+	case "form", "surface", "toggle", "checkbox", "radio", "tab", "tab_panel", "option", "select_trigger", "field_support",
 		"slider_track", "slider_fill", "slider_thumb", "stepper_decrement", "stepper_value", "stepper_increment":
 		r.recordPaint(func() {
 			r.paintSurfaceGio(node, bounds, currentClip)
@@ -171,6 +174,31 @@ func (r *gioRenderer) layoutNode(node *project.Node, bounds, currentClip image.R
 			childBounds := r.surfaceChildBounds(node.Children[0], inner)
 			r.layout(node.Children[0], childBounds, chooseClip(node, currentClip, bounds))
 		}
+	case "field_box":
+		if r.scene == nil {
+			r.paintFieldBoxGio(node, bounds, currentClip)
+		} else {
+			r.scene.items = append(r.scene.items, sceneItem{
+				field:   &sceneField{node: node, bounds: bounds, clip: currentClip, opacity: r.opacity},
+				scrolls: append([]sceneScroll(nil), r.scrolls...),
+			})
+		}
+	case "text_field", "text_area":
+		labelBounds, contentBounds := fieldContentBounds(node, bounds)
+		if !labelBounds.Empty() {
+			label := *node
+			label.Type = "text"
+			label.Props = cloneMap(node.Props)
+			label.Props["text"] = stringValue(node.Props["label"], "")
+			label.Props["size"] = float64(14)
+			label.Props["weight"] = float64(600)
+			label.Props["color"] = "#39443D"
+			r.recordPaint(func() { r.paintTextGio(&label, labelBounds, nodeClip) })
+		}
+		clone := *node
+		clone.Props = cloneMap(node.Props)
+		clone.Props["direction"] = "vertical"
+		r.stackGio(&clone, contentBounds, nodeClip)
 	case "button", "link":
 		if r.scene == nil {
 			r.paintSurfaceGio(node, bounds, currentClip)
@@ -244,6 +272,32 @@ func (r *gioRenderer) layoutNode(node *project.Node, bounds, currentClip image.R
 	default:
 		for _, child := range node.Children {
 			r.layout(child, place(child, bounds), nodeClip)
+		}
+	}
+}
+
+func (r *gioRenderer) paintFieldBoxGio(node *project.Node, bounds, currentClip image.Rectangle) {
+	nodeClip := currentClip.Intersect(bounds)
+	r.paintSurfaceGio(node, bounds, currentClip)
+	geometry := newFieldTextGeometry(node, bounds)
+	selection, caret := geometry.Decorations()
+	focused := r.state.Focused == stringValue(node.Props["field_handle"], "")
+	if focused {
+		for _, rectangle := range selection {
+			r.fillRect(rectangle, nodeClip, colorValue(node.Props["selection_color"], color.RGBA{R: 103, G: 95, B: 242, A: 96}))
+		}
+	}
+	text := *node
+	text.Type = "text"
+	textBounds := inset(bounds, insets(node.Props["padding"]))
+	textBounds = textBounds.Sub(image.Pt(geometry.OffsetX, geometry.OffsetY*geometry.LineHeight))
+	r.paintTextGio(&text, textBounds, nodeClip)
+	if focused && !r.state.CaretHidden && !caret.Empty() {
+		r.fillRect(caret, nodeClip, colorValue(node.Props["caret_color"], colorValue(node.Props["color"], color.RGBA{A: 255})))
+	}
+	if focused {
+		for _, underline := range fieldCompositionUnderlines(node, bounds) {
+			r.fillRect(underline, nodeClip, colorValue(node.Props["caret_color"], colorValue(node.Props["color"], color.RGBA{A: 255})))
 		}
 	}
 }
@@ -405,6 +459,10 @@ func (r *gioRenderer) nrgba(value color.Color) color.NRGBA {
 
 func (r *gioRenderer) paintTextGio(node *project.Node, bounds, currentClip image.Rectangle) {
 	label := r.label(node)
+	if label.Shaper == fieldShapeState.fallback {
+		fieldShapeState.Lock()
+		defer fieldShapeState.Unlock()
+	}
 	pixelBounds := r.pxRect(bounds)
 	pixelClip := r.pxRect(currentClip.Intersect(bounds))
 	if pixelClip.Empty() {
@@ -443,6 +501,10 @@ func (r *gioRenderer) label(node *project.Node) material.LabelStyle {
 			label.Shaper = shaper
 			label.Font.Typeface = typeface
 		}
+	} else if stringValue(node.Props["field_handle"], "") != "" {
+		// Caret geometry is shaped with the deterministic fallback collection.
+		// Paint field text with the same shaper so glyph advances cannot drift.
+		label.Shaper = fieldShapeState.fallback
 	}
 	switch stringValue(node.Props["alignment"], "start") {
 	case "center":

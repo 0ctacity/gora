@@ -41,6 +41,14 @@ type sceneItem struct {
 	scrolls   []sceneScroll
 	scrollbar *sceneScrollbar
 	button    *sceneButton
+	field     *sceneField
+}
+
+type sceneField struct {
+	node    *project.Node
+	bounds  image.Rectangle
+	clip    image.Rectangle
+	opacity float64
 }
 
 type sceneGeometry struct {
@@ -147,7 +155,13 @@ func (scene *gioScene) replay(gtx layout.Context, theme *material.Theme, state S
 			continue
 		}
 		clipStack := pushSceneClip(gtx, viewportClip)
-		if item.button != nil {
+		if item.field != nil {
+			field := item.field
+			bounds := field.bounds.Add(translation)
+			staticClip := field.clip.Add(translation)
+			renderer := gioRenderer{gtx: gtx, theme: theme, state: state, opacity: field.opacity}
+			renderer.paintFieldBoxGio(interactiveNodeForState(field.node, state), bounds, staticClip.Intersect(viewportClipOrBounds(viewportClip, bounds)))
+		} else if item.button != nil {
 			button := item.button
 			bounds := button.bounds.Add(translation)
 			staticClip := button.clip.Add(translation)

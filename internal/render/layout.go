@@ -2,8 +2,19 @@ package render
 
 import (
 	"image"
+	"io"
 	"math"
+	"path/filepath"
+	"sort"
+	"sync"
 
+	giofont "gioui.org/font"
+	"gioui.org/font/gofont"
+	"gioui.org/io/system"
+	"gioui.org/text"
+	"golang.org/x/image/font"
+	"golang.org/x/image/font/opentype"
+	"golang.org/x/image/math/fixed"
 	"gora/internal/project"
 )
 
@@ -17,14 +28,14 @@ func measureIntrinsic(node *project.Node, limit image.Point, leaf intrinsicMeasu
 	innerLimit := image.Pt(max(0, limit.X-padding.left-padding.right), max(0, limit.Y-padding.top-padding.bottom))
 	var preferred image.Point
 	switch node.Type {
-	case "surface", "button", "link", "toggle", "checkbox", "radio", "tab", "tab_panel", "option", "select_trigger",
+	case "form", "surface", "button", "link", "toggle", "checkbox", "radio", "tab", "tab_panel", "option", "select_trigger", "field_support",
 		"slider_track", "slider_fill", "slider_thumb", "stepper_decrement", "stepper_value", "stepper_increment", "_viewport":
 		if len(node.Children) == 1 {
 			preferred = measureIntrinsic(node.Children[0], innerLimit, leaf)
 		}
 		preferred.X += padding.left + padding.right
 		preferred.Y += padding.top + padding.bottom
-	case "stack", "radio_group", "select_popup", "stepper":
+	case "stack", "radio_group", "select_popup", "stepper", "text_field", "text_area":
 		if node.Type == "stepper" {
 			clone := *node
 			clone.Props = cloneMap(node.Props)
@@ -35,6 +46,12 @@ func measureIntrinsic(node *project.Node, limit image.Point, leaf intrinsicMeasu
 			clone.Props = cloneMap(node.Props)
 			clone.Props["direction"] = "vertical"
 			preferred = measureStackIntrinsic(&clone, innerLimit, leaf)
+		} else if node.Type == "text_field" || node.Type == "text_area" {
+			clone := *node
+			clone.Props = cloneMap(node.Props)
+			clone.Props["direction"] = "vertical"
+			preferred = measureStackIntrinsic(&clone, innerLimit, leaf)
+			preferred.Y += fieldLabelHeight(node)
 		} else {
 			preferred = measureStackIntrinsic(node, innerLimit, leaf)
 		}
@@ -66,10 +83,44 @@ func measureIntrinsic(node *project.Node, limit image.Point, leaf intrinsicMeasu
 			preferred.X = minPositive(preferred.X, innerLimit.X)
 			preferred.Y = minPositive(preferred.Y, innerLimit.Y)
 		}
+	case "field_box":
+		text := *node
+		text.Type = "text"
+		preferred = leaf(&text, innerLimit)
+		preferred.X += padding.left + padding.right
+		if boolValue(node.Props["field_multiline"], false) {
+			geometry := newFieldTextGeometry(node, image.Rect(0, 0, max(1, limit.X), 1<<20))
+			lines := max(1, len(geometry.lineWidths))
+			lines = max(lines, int(number(node.Props["field_min_lines"], 1)))
+			if maximum := int(number(node.Props["field_max_lines"], 0)); maximum > 0 {
+				lines = min(lines, maximum)
+			}
+			preferred.Y = lines*geometry.LineHeight + padding.top + padding.bottom
+		} else {
+			preferred.Y += padding.top + padding.bottom
+		}
 	default:
 		preferred = leaf(node, innerLimit)
 	}
 	return constrainIntrinsic(node, preferred, limit)
+}
+
+func fieldLabelHeight(node *project.Node) int {
+	if stringValue(node.Props["label"], "") == "" {
+		return 0
+	}
+	return 20 + int(number(node.Props["gap"], 6))
+}
+
+func fieldContentBounds(node *project.Node, bounds image.Rectangle) (image.Rectangle, image.Rectangle) {
+	height := fieldLabelHeight(node)
+	if height == 0 {
+		return image.Rectangle{}, bounds
+	}
+	label := image.Rect(bounds.Min.X, bounds.Min.Y, bounds.Max.X, min(bounds.Max.Y, bounds.Min.Y+20))
+	content := bounds
+	content.Min.Y = min(bounds.Max.Y, bounds.Min.Y+height)
+	return label, content
 }
 
 func selectPopupBounds(node *project.Node, triggerBounds, viewport image.Rectangle, leaf intrinsicMeasure) (*project.Node, *project.Node, image.Rectangle) {
@@ -105,6 +156,441 @@ func selectPopupBounds(node *project.Node, triggerBounds, viewport image.Rectang
 	}
 	y = min(max(viewport.Min.Y, y), viewport.Max.Y-size.Y)
 	return trigger, popup, image.Rect(x, y, x+size.X, y+size.Y)
+}
+
+type fieldTextPosition struct {
+	line int
+	x    int
+}
+
+type fieldRuneSegment struct {
+	runeIndex int
+	line      int
+	startX    int
+	endX      int
+}
+
+type fieldTextGeometry struct {
+	Inner      image.Rectangle
+	Advance    int
+	LineHeight int
+	OffsetX    int
+	OffsetY    int
+	positions  []fieldTextPosition
+	lineWidths []int
+	lineStarts []int
+	lineEnds   []int
+	segments   []fieldRuneSegment
+	selection  image.Point
+}
+
+var fieldShapeState = struct {
+	sync.Mutex
+	fallback *text.Shaper
+}{fallback: text.NewShaper(text.NoSystemFonts(), text.WithCollection(gofont.Collection()))}
+
+func fieldNodeWithViewport(node *project.Node, bounds image.Rectangle) (*project.Node, fieldTextGeometry) {
+	geometry := newFieldTextGeometry(node, bounds)
+	clone := *node
+	clone.Props = cloneMap(node.Props)
+	clone.Props["internal_viewport_x"] = float64(geometry.OffsetX)
+	clone.Props["internal_viewport_y"] = float64(geometry.OffsetY * geometry.LineHeight)
+	clone.Props["internal_viewport_width"] = float64(geometry.Inner.Dx())
+	clone.Props["internal_viewport_height"] = float64(geometry.Inner.Dy())
+	return &clone, geometry
+}
+
+func newFieldTextGeometry(node *project.Node, bounds image.Rectangle) fieldTextGeometry {
+	inner := inset(bounds, insets(node.Props["padding"]))
+	size := number(node.Props["size"], 16)
+	face := fieldGeometryFace(node, size)
+	if closer, ok := face.(io.Closer); ok {
+		defer closer.Close()
+	}
+	advance := max(1, font.MeasureString(face, "n").Ceil())
+	lineHeight := max(1, int(math.Ceil(number(node.Props["line_height"], float64(face.Metrics().Height.Ceil())))))
+	runes := []rune(stringValue(node.Props["text"], ""))
+	multiline := boolValue(node.Props["field_multiline"], false)
+	positions, lineWidths, lineStarts, lineEnds, segments := shapeFieldText(node, inner.Dx(), lineHeight, multiline, len(runes))
+	start := min(max(0, int(number(node.Props["selection_start"], 0))), len(runes))
+	end := min(max(0, int(number(node.Props["selection_end"], float64(start)))), len(runes))
+	caret := positions[end]
+	offsetX := max(0, int(number(node.Props["internal_offset_x"], 0)))
+	offsetY := max(0, int(number(node.Props["internal_offset"], 0)))
+	if !multiline {
+		if caret.x < offsetX {
+			offsetX = caret.x
+		} else if caret.x >= offsetX+inner.Dx() {
+			offsetX = caret.x - inner.Dx() + 1
+		}
+		offsetY = 0
+	} else {
+		visibleLines := max(1, inner.Dy()/lineHeight)
+		offsetY = min(offsetY, max(0, len(lineWidths)-visibleLines))
+		if !boolValue(node.Props["manual_internal_scroll"], false) {
+			if caret.line < offsetY {
+				offsetY = caret.line
+			} else if caret.line >= offsetY+visibleLines {
+				offsetY = caret.line - visibleLines + 1
+			}
+		}
+		offsetX = 0
+	}
+	return fieldTextGeometry{
+		Inner: inner, Advance: advance, LineHeight: lineHeight, OffsetX: offsetX, OffsetY: offsetY,
+		positions: positions, lineWidths: lineWidths, lineStarts: lineStarts, lineEnds: lineEnds, segments: segments, selection: image.Pt(start, end),
+	}
+}
+
+func shapeFieldText(node *project.Node, width, lineHeight int, multiline bool, runeCount int) ([]fieldTextPosition, []int, []int, []int, []fieldRuneSegment) {
+	shaper, descriptor := fieldTextShaper(node)
+	maxWidth := 1 << 20
+	if multiline {
+		maxWidth = max(1, width)
+	}
+	params := text.Parameters{
+		Font: descriptor, PxPerEm: fixed.I(max(1, int(math.Round(number(node.Props["size"], 16))))),
+		MaxWidth: maxWidth, WrapPolicy: text.WrapHeuristically, Locale: system.Locale{Direction: system.LTR},
+		LineHeight: fixed.I(lineHeight), LineHeightScale: 1, DisableSpaceTrim: true,
+	}
+	fieldShapeState.Lock()
+	shaper.LayoutString(params, stringValue(node.Props["text"], ""))
+	index := newFieldGlyphIndex(runeCount)
+	for glyph, ok := shaper.NextGlyph(); ok; glyph, ok = shaper.NextGlyph() {
+		index.add(glyph)
+	}
+	fieldShapeState.Unlock()
+	return index.finish()
+}
+
+func fieldTextShaper(node *project.Node) (*text.Shaper, giofont.Font) {
+	descriptor := giofont.Font{}
+	if number(node.Props["weight"], 400) >= 600 {
+		descriptor.Weight = giofont.Bold
+	} else if number(node.Props["weight"], 400) >= 500 {
+		descriptor.Weight = giofont.Medium
+	}
+	if boolValue(node.Props["italic"], false) {
+		descriptor.Style = giofont.Italic
+	}
+	fontPath := stringValue(node.Props["font"], "")
+	if token, ok := node.Props["font"].(map[string]any); ok {
+		fontPath = stringValue(token["src"], "")
+	}
+	if fontPath == "" {
+		return fieldShapeState.fallback, descriptor
+	}
+	if !filepath.IsAbs(fontPath) {
+		fontPath = filepath.Join(filepath.Dir(node.Source.File), fontPath)
+	}
+	shaper, typeface, err := loadNativeFont(nil, fontPath)
+	if err != nil {
+		return fieldShapeState.fallback, descriptor
+	}
+	descriptor.Typeface = typeface
+	return shaper, descriptor
+}
+
+type fieldGlyphCaret struct {
+	runeIndex    int
+	line         int
+	x            fixed.Int26_6
+	runIndex     int
+	towardOrigin bool
+}
+
+type fieldGlyphIndex struct {
+	runeCount      int
+	carets         []fieldGlyphCaret
+	segments       []fieldRuneSegment
+	lineWidths     []int
+	lineStarts     []int
+	lineEnds       []int
+	line           int
+	lineStart      int
+	lineMin        fixed.Int26_6
+	lineMax        fixed.Int26_6
+	caret          fieldGlyphCaret
+	runIndex       int
+	clusterAdvance fixed.Int26_6
+	midCluster     bool
+}
+
+func newFieldGlyphIndex(runeCount int) *fieldGlyphIndex {
+	return &fieldGlyphIndex{runeCount: runeCount, lineMin: fixed.Int26_6(math.MaxInt32)}
+}
+
+func (index *fieldGlyphIndex) insertCaret(caret fieldGlyphCaret) {
+	if len(index.carets) > 0 {
+		last := len(index.carets) - 1
+		previous := index.carets[last]
+		if previous.runeIndex == caret.runeIndex && (previous.line != caret.line || previous.x == caret.x) {
+			index.carets[last] = caret
+			return
+		}
+	}
+	index.carets = append(index.carets, caret)
+}
+
+func (index *fieldGlyphIndex) add(glyph text.Glyph) {
+	if glyph.X < index.lineMin {
+		index.lineMin = glyph.X
+	}
+	if end := glyph.X + glyph.Advance; end > index.lineMax {
+		index.lineMax = end
+	}
+	clusterBreak := glyph.Flags&text.FlagClusterBreak != 0
+	paragraphBreak := glyph.Flags&text.FlagParagraphBreak != 0
+	towardOrigin := glyph.Flags&text.FlagTowardOrigin != 0
+	if !index.midCluster {
+		index.caret.line = index.line
+		index.caret.x = glyph.X
+		index.caret.runIndex = index.runIndex
+		index.caret.towardOrigin = towardOrigin
+		if towardOrigin {
+			index.caret.x += glyph.Advance
+		}
+		index.insertCaret(index.caret)
+	}
+	index.midCluster = !clusterBreak
+	if paragraphBreak {
+		index.clusterAdvance = 0
+		index.caret.runeIndex += int(glyph.Runes)
+	}
+	index.clusterAdvance += glyph.Advance
+	if clusterBreak && !paragraphBreak && glyph.Runes > 0 {
+		count := int(glyph.Runes)
+		step := index.clusterAdvance / fixed.Int26_6(count)
+		adjust := fixed.Int26_6(0)
+		if towardOrigin {
+			adjust = index.clusterAdvance
+			step = -step
+		}
+		for position := 1; position <= count; position++ {
+			startX := index.caret.x
+			index.caret.x = glyph.X + adjust + step*fixed.Int26_6(position)
+			index.segments = append(index.segments, fieldRuneSegment{
+				runeIndex: index.caret.runeIndex, line: index.line, startX: startX.Round(), endX: index.caret.x.Round(),
+			})
+			index.caret.runeIndex++
+			index.insertCaret(index.caret)
+		}
+		index.clusterAdvance = 0
+	}
+	if glyph.Flags&text.FlagRunBreak != 0 {
+		index.runIndex++
+		index.caret.runIndex = index.runIndex
+	}
+	if glyph.Flags&text.FlagLineBreak != 0 {
+		lineEnd := index.caret.runeIndex
+		if paragraphBreak {
+			lineEnd -= int(glyph.Runes)
+		}
+		index.lineStarts = append(index.lineStarts, index.lineStart)
+		index.lineEnds = append(index.lineEnds, max(index.lineStart, lineEnd))
+		if index.lineMin == fixed.Int26_6(math.MaxInt32) {
+			index.lineMin = 0
+		}
+		index.lineWidths = append(index.lineWidths, max(0, (index.lineMax-index.lineMin).Ceil()))
+		index.line++
+		index.lineStart = index.caret.runeIndex
+		index.lineMin = fixed.Int26_6(math.MaxInt32)
+		index.lineMax = 0
+		index.runIndex = 0
+		index.caret.runIndex = 0
+	}
+}
+
+func (index *fieldGlyphIndex) finish() ([]fieldTextPosition, []int, []int, []int, []fieldRuneSegment) {
+	if len(index.lineWidths) == 0 {
+		index.lineWidths = append(index.lineWidths, 0)
+		index.lineStarts = append(index.lineStarts, 0)
+		index.lineEnds = append(index.lineEnds, index.runeCount)
+	}
+	positions := make([]fieldTextPosition, index.runeCount+1)
+	seen := make([]bool, index.runeCount+1)
+	for _, caret := range index.carets {
+		if caret.runeIndex < 0 || caret.runeIndex > index.runeCount {
+			continue
+		}
+		positions[caret.runeIndex] = fieldTextPosition{line: min(caret.line, len(index.lineWidths)-1), x: caret.x.Round()}
+		seen[caret.runeIndex] = true
+	}
+	for runeIndex := 1; runeIndex <= index.runeCount; runeIndex++ {
+		if !seen[runeIndex] {
+			positions[runeIndex] = positions[runeIndex-1]
+		}
+	}
+	return positions, index.lineWidths, index.lineStarts, index.lineEnds, index.segments
+}
+
+func fieldGeometryFace(node *project.Node, size float64) font.Face {
+	bold := number(node.Props["weight"], 400) >= 600
+	italic := boolValue(node.Props["italic"], false)
+	parsed := fallbackRegular()
+	switch {
+	case bold && italic:
+		parsed = fallbackBoldItalic()
+	case bold:
+		parsed = fallbackBold()
+	case italic:
+		parsed = fallbackItalic()
+	}
+	fontPath := stringValue(node.Props["font"], "")
+	if token, ok := node.Props["font"].(map[string]any); ok {
+		fontPath = stringValue(token["src"], "")
+	}
+	if fontPath != "" {
+		if !filepath.IsAbs(fontPath) {
+			fontPath = filepath.Join(filepath.Dir(node.Source.File), fontPath)
+		}
+		if loaded, err := loadFont(fontPath); err == nil {
+			parsed = loaded
+		}
+	}
+	face, err := opentype.NewFace(parsed, &opentype.FaceOptions{Size: size, DPI: 72, Hinting: font.HintingFull})
+	if err == nil {
+		return face
+	}
+	fallback, _ := opentype.NewFace(fallbackRegular(), &opentype.FaceOptions{Size: size, DPI: 72, Hinting: font.HintingFull})
+	return fallback
+}
+
+func (geometry fieldTextGeometry) RuneAt(point image.Point) int {
+	if len(geometry.positions) == 0 {
+		return 0
+	}
+	line := max(0, (point.Y-geometry.Inner.Min.Y)/geometry.LineHeight+geometry.OffsetY)
+	x := max(0, point.X-geometry.Inner.Min.X+geometry.OffsetX)
+	best, distance := 0, int(^uint(0)>>1)
+	for index, position := range geometry.positions {
+		if position.line != line {
+			continue
+		}
+		candidate := fieldAbsInt(position.x - x)
+		if candidate < distance || candidate == distance && index > best {
+			best, distance = index, candidate
+		}
+	}
+	if distance != int(^uint(0)>>1) {
+		return best
+	}
+	if line <= geometry.positions[0].line {
+		return 0
+	}
+	return len(geometry.positions) - 1
+}
+
+func (geometry fieldTextGeometry) LineRange(position int) (int, int) {
+	position = min(max(0, position), len(geometry.positions)-1)
+	line := geometry.positions[position].line
+	return geometry.lineStarts[line], geometry.lineEnds[line]
+}
+
+func (geometry fieldTextGeometry) Decorations() ([]image.Rectangle, image.Rectangle) {
+	start, end := geometry.selection.X, geometry.selection.Y
+	if start > end {
+		start, end = end, start
+	}
+	var selection []image.Rectangle
+	if start != end {
+		selection = geometry.selectionRectangles(start, end)
+	}
+	caretPosition := geometry.positions[geometry.selection.Y]
+	caretX := geometry.Inner.Min.X + caretPosition.x - geometry.OffsetX
+	caretY := geometry.Inner.Min.Y + (caretPosition.line-geometry.OffsetY)*geometry.LineHeight
+	caret := image.Rect(caretX, caretY, caretX+1, caretY+geometry.LineHeight).Intersect(geometry.Inner)
+	return selection, caret
+}
+
+func (geometry fieldTextGeometry) selectionRectangles(start, end int) []image.Rectangle {
+	segments := make([]fieldRuneSegment, 0, end-start)
+	for _, segment := range geometry.segments {
+		if segment.runeIndex >= start && segment.runeIndex < end {
+			segments = append(segments, segment)
+		}
+	}
+	sort.SliceStable(segments, func(left, right int) bool {
+		if segments[left].line != segments[right].line {
+			return segments[left].line < segments[right].line
+		}
+		leftX := min(segments[left].startX, segments[left].endX)
+		rightX := min(segments[right].startX, segments[right].endX)
+		return leftX < rightX
+	})
+	var rectangles []image.Rectangle
+	for _, segment := range segments {
+		startX, endX := min(segment.startX, segment.endX), max(segment.startX, segment.endX)
+		rectangle := image.Rect(
+			geometry.Inner.Min.X+startX-geometry.OffsetX,
+			geometry.Inner.Min.Y+(segment.line-geometry.OffsetY)*geometry.LineHeight,
+			geometry.Inner.Min.X+endX-geometry.OffsetX,
+			geometry.Inner.Min.Y+(segment.line-geometry.OffsetY+1)*geometry.LineHeight,
+		).Intersect(geometry.Inner)
+		if rectangle.Empty() {
+			continue
+		}
+		last := len(rectangles) - 1
+		if last >= 0 && rectangles[last].Min.Y == rectangle.Min.Y && rectangle.Min.X <= rectangles[last].Max.X {
+			rectangles[last] = rectangles[last].Union(rectangle)
+			continue
+		}
+		rectangles = append(rectangles, rectangle)
+	}
+	return rectangles
+}
+
+func fieldDecorationRects(node *project.Node, bounds image.Rectangle) ([]image.Rectangle, image.Rectangle) {
+	return newFieldTextGeometry(node, bounds).Decorations()
+}
+
+func fieldCompositionUnderlines(node *project.Node, bounds image.Rectangle) []image.Rectangle {
+	if !boolValue(node.Props["composing"], false) {
+		return nil
+	}
+	clone := *node
+	clone.Props = cloneMap(node.Props)
+	clone.Props["selection_start"] = node.Props["composition_start"]
+	clone.Props["selection_end"] = node.Props["composition_end"]
+	selection, _ := newFieldTextGeometry(&clone, bounds).Decorations()
+	underlines := make([]image.Rectangle, 0, len(selection))
+	for _, rectangle := range selection {
+		if !rectangle.Empty() {
+			underlines = append(underlines, image.Rect(rectangle.Min.X, rectangle.Max.Y-1, rectangle.Max.X, rectangle.Max.Y))
+		}
+	}
+	return underlines
+}
+
+// FieldRuneAtPoint maps a pointer to the closest rune boundary using the same
+// logical field geometry as CPU and Gio painting.
+func FieldRuneAtPoint(props map[string]any, bounds image.Rectangle, point image.Point) int {
+	return newFieldTextGeometry(&project.Node{Props: props}, bounds).RuneAt(point)
+}
+
+// FieldLineRange returns the visual-line rune range containing position.
+func FieldLineRange(props map[string]any, bounds image.Rectangle, position int) (int, int) {
+	return newFieldTextGeometry(&project.Node{Props: props}, bounds).LineRange(position)
+}
+
+// FieldVisibleColumns returns the deterministic visual-column capacity used
+// for wrapped keyboard movement.
+func FieldVisibleColumns(props map[string]any, bounds image.Rectangle) int {
+	geometry := newFieldTextGeometry(&project.Node{Props: props}, bounds)
+	return max(1, geometry.Inner.Dx()/geometry.Advance)
+}
+
+// FieldCaretRect returns the visible logical caret rectangle for focus reveal.
+func FieldCaretRect(props map[string]any, bounds image.Rectangle) image.Rectangle {
+	_, caret := newFieldTextGeometry(&project.Node{Props: props}, bounds).Decorations()
+	return caret
+}
+
+func fieldAbsInt(value int) int {
+	if value < 0 {
+		return -value
+	}
+	return value
 }
 
 func measureTabsIntrinsic(node *project.Node, limit image.Point, leaf intrinsicMeasure) image.Point {

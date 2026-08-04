@@ -1,11 +1,38 @@
 package interaction
 
 import (
+	"reflect"
 	"testing"
 
 	"gora/internal/document"
 	"gora/internal/project"
 )
+
+func TestStoreApplyFormIsAtomicAndActionsSeePublishedDrafts(t *testing.T) {
+	store := NewStore()
+	store.Reconcile([]ScopeSpec{{
+		ID: "screen:main", Context: "main",
+		State: map[string]document.StateDeclaration{
+			"name":  {Type: "text", Default: "Ada"},
+			"saved": {Type: "text", Default: "none"},
+		},
+	}})
+	actions := []document.Action{{Action: "set", State: "saved", Value: map[string]any{"ref": "state.name"}}}
+	if _, err := store.ApplyForm(map[string]map[string]any{"screen:main": {"name": "Grace"}}, "screen:main", actions); err != nil {
+		t.Fatal(err)
+	}
+	if values := store.Values("screen:main"); values["name"] != "Grace" || values["saved"] != "Grace" {
+		t.Fatalf("form values = %+v", values)
+	}
+	before := store.Values("screen:main")
+	_, err := store.ApplyForm(map[string]map[string]any{"screen:main": {"name": "Broken"}}, "screen:main", []document.Action{{Action: "toggle", State: "saved"}})
+	if err == nil {
+		t.Fatal("invalid form action succeeded")
+	}
+	if after := store.Values("screen:main"); !reflect.DeepEqual(before, after) {
+		t.Fatalf("failed form changed state: before=%+v after=%+v", before, after)
+	}
+}
 
 func TestStoreAppliesOrderedActionsAtomically(t *testing.T) {
 	store := NewStore()
@@ -140,5 +167,25 @@ func TestStoreNormalizesPreservedValueIntoChangedDomain(t *testing.T) {
 	}}})
 	if got := store.Values("screen:main")["count"]; got != float64(8) {
 		t.Fatalf("reconciled value = %#v", got)
+	}
+}
+
+func TestStoreResetScopedValuesDeduplicatesRepeatedFormBindings(t *testing.T) {
+	store := NewStore()
+	store.Reconcile([]ScopeSpec{{ID: "screen:main", State: map[string]document.StateDeclaration{
+		"name": {Type: "text", Default: "Ada"},
+	}}})
+	if err := store.SetValues("screen:main", map[string]any{"name": "Grace"}); err != nil {
+		t.Fatal(err)
+	}
+	before := store.Revision()
+	if err := store.ResetScopedValues(map[string][]string{"screen:main": {"name", "name", "name"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Values("screen:main")["name"]; got != "Ada" {
+		t.Fatalf("reset value = %#v", got)
+	}
+	if store.Revision() != before+1 {
+		t.Fatalf("reset revision = %d, want %d", store.Revision(), before+1)
 	}
 }

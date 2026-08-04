@@ -103,6 +103,7 @@ type Action struct {
 
 type Events struct {
 	Activate []Action
+	Submit   []Action
 }
 
 type Condition struct {

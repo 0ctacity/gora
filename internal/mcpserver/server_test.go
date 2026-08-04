@@ -104,6 +104,147 @@ screens:
 	}
 }
 
+func TestMCPFieldDraftSubmitAndResetTools(t *testing.T) {
+	root := t.TempDir()
+	entry := filepath.Join(root, "forms.gora")
+	if err := os.WriteFile(entry, []byte(`gora: 1
+kind: app
+viewport: { width: 240, height: 180 }
+state:
+  name: { type: text, default: Ada }
+  disabled_name: { type: text, default: Disabled }
+  hidden_name: { type: text, default: Hidden }
+  show_hidden: { type: boolean, default: false }
+entry: main
+screens:
+  main:
+    type: form
+    name: profile-form
+    children:
+      - type: stack
+        props: { direction: vertical }
+        children:
+          - type: text_field
+            name: name-field
+            props: { label: Name, bind: name, required: true }
+            children:
+              - { type: field_box, props: { width: 200, height: 40 } }
+          - type: text_field
+            name: disabled-field
+            props: { label: Disabled, bind: disabled_name, disabled: true }
+            children:
+              - { type: field_box, props: { width: 200, height: 40 } }
+          - type: text_field
+            name: hidden-field
+            props: { label: Hidden, bind: hidden_name }
+            variants:
+              - when: { state: show_hidden, equals: false }
+                visible: false
+            children:
+              - { type: field_box, props: { width: 200, height: 40 } }
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(NewRegistry())
+	defer service.Close()
+	httpServer := httptest.NewServer(service.Handler())
+	defer httpServer.Close()
+	ctx := context.Background()
+	client := mcp.NewClient(&mcp.Implementation{Name: "gora-test", Version: "1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: httpServer.URL + "/mcp"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	tools, err := session.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"gora_set_field_draft", "gora_submit_form", "gora_reset_form"} {
+		if !hasTool(tools.Tools, name) {
+			t.Fatalf("missing tool %s", name)
+		}
+	}
+	opened, _ := session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_open_project", Arguments: map[string]any{"root": root}})
+	projectID := stringField(opened.StructuredContent, "project_id")
+	view, _ := session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_open_view", Arguments: map[string]any{"project_id": projectID, "file": "forms.gora"}})
+	viewID := stringField(view.StructuredContent, "view_id")
+	base := map[string]any{"project_id": projectID, "view_id": viewID}
+	for _, test := range []struct {
+		name      string
+		projectID string
+		viewID    string
+		fieldID   string
+	}{
+		{name: "stale semantic ID", projectID: projectID, viewID: viewID, fieldID: "screen/main/node/missing-field"},
+		{name: "disabled field", projectID: projectID, viewID: viewID, fieldID: "screen/main/node/disabled-field"},
+		{name: "hidden field", projectID: projectID, viewID: viewID, fieldID: "screen/main/node/hidden-field"},
+		{name: "project/view mismatch", projectID: "missing-project", viewID: viewID, fieldID: "screen/main/node/name-field"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_set_field_draft", Arguments: map[string]any{
+				"project_id": test.projectID, "view_id": test.viewID, "semantic_id": test.fieldID, "draft": "Changed",
+			}})
+			if err != nil || !result.IsError {
+				t.Fatalf("rejected draft error=%v result=%+v", err, result)
+			}
+		})
+	}
+	draft := mapsClone(base)
+	draft["semantic_id"] = "screen/main/node/name-field"
+	draft["draft"] = ""
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_set_field_draft", Arguments: draft})
+	if err != nil || result.IsError {
+		t.Fatalf("invalid draft should remain an ordinary tool result: error=%v result=%+v", err, result)
+	}
+	if boolField(result.StructuredContent, "valid") || stringField(result.StructuredContent, "draft") != "" || stringField(result.StructuredContent, "value") != "Ada" {
+		t.Fatalf("invalid draft output = %+v", result.StructuredContent)
+	}
+	submit := mapsClone(base)
+	submit["semantic_id"] = "screen/main/node/profile-form"
+	result, err = session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_submit_form", Arguments: submit})
+	if err != nil || !result.IsError {
+		t.Fatalf("invalid form submit error=%v result=%+v", err, result)
+	}
+
+	draft["draft"] = "Grace"
+	result, err = session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_set_field_draft", Arguments: draft})
+	if err != nil || result.IsError {
+		t.Fatalf("set draft error=%v result=%+v", err, result)
+	}
+	if got := stringField(result.StructuredContent, "draft"); got != "Grace" {
+		t.Fatalf("draft output = %q, want Grace", got)
+	}
+	if valid := boolField(result.StructuredContent, "valid"); !valid {
+		t.Fatalf("draft output should be valid: %+v", result.StructuredContent)
+	}
+	if got := stringField(result.StructuredContent, "value"); got != "Grace" {
+		t.Fatalf("valid draft published value = %q, want Grace", got)
+	}
+	result, err = session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_set_control_value", Arguments: map[string]any{
+		"project_id": projectID, "view_id": viewID, "semantic_id": "screen/main/node/name-field", "value": "",
+	}})
+	if err != nil || !result.IsError {
+		t.Fatalf("invalid typed field value error=%v result=%+v", err, result)
+	}
+	result, err = session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_submit_form", Arguments: submit})
+	if err != nil || result.IsError {
+		t.Fatalf("submit error=%v result=%+v", err, result)
+	}
+	result, err = session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_reset_form", Arguments: submit})
+	if err != nil || result.IsError {
+		t.Fatalf("reset error=%v result=%+v", err, result)
+	}
+}
+
+func mapsClone(source map[string]any) map[string]any {
+	result := make(map[string]any, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
 func hasTool(tools []*mcp.Tool, name string) bool {
 	for _, tool := range tools {
 		if tool.Name == name {
@@ -131,5 +272,11 @@ func stringField(value any, name string) string {
 func numberField(value any, name string) float64 {
 	mapping, _ := value.(map[string]any)
 	result, _ := mapping[name].(float64)
+	return result
+}
+
+func boolField(value any, name string) bool {
+	mapping, _ := value.(map[string]any)
+	result, _ := mapping[name].(bool)
 	return result
 }

@@ -6,6 +6,7 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gioui.org/layout"
@@ -145,6 +146,864 @@ screens:
 	}
 	if got := runtime.Snapshot().Scroll["feed"].Y; got != 120 {
 		t.Fatalf("clamped scroll = %d, want 120", got)
+	}
+}
+
+func TestRuntimeFieldDraftSubmitAndReset(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "forms.gora")
+	source := []byte(`
+gora: 1
+kind: app
+viewport: { width: 320, height: 180 }
+state:
+  name: { type: text, default: Ada }
+  submitted: { type: boolean, default: false }
+entry: main
+screens:
+  main:
+    type: form
+    name: profile-form
+    on:
+      submit: [{ action: set, state: submitted, value: true }]
+    children:
+      - type: stack
+        props: { direction: vertical, gap: 8 }
+        children:
+          - type: text_field
+            name: name-field
+            props: { label: Name, bind: name, required: true, min_length: 2, placeholder: Name }
+            children:
+              - type: field_box
+                props: { height: 36, padding: { top: 8, right: 8, bottom: 8, left: 8 } }
+          - type: button
+            name: submit-button
+            props: { label: Save, form_action: submit }
+            children: [{ type: text, props: { text: Save } }]
+          - type: button
+            name: reset-button
+            props: { label: Reset, form_action: reset }
+            children: [{ type: text, props: { text: Reset } }]
+`)
+	if err := os.WriteFile(path, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	field := namedSemanticNode(tree, "name-field")
+	form := namedSemanticNode(tree, "profile-form")
+	resetButton := namedSemanticNode(tree, "reset-button")
+	if field == nil || field.Role != "textbox" || form == nil || form.Role != "form" || resetButton == nil {
+		t.Fatalf("field=%+v form=%+v reset=%+v", field, form, resetButton)
+	}
+	if err := runtime.SetFieldDraft(field.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SubmitForm(form.ID); err == nil {
+		t.Fatal("invalid form submission succeeded")
+	}
+	if focused := runtime.Snapshot().Transient.Focused; focused != field.Handle {
+		t.Fatalf("invalid submit focused %q, want first invalid field %q", focused, field.Handle)
+	}
+	invalidTree, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidField := namedSemanticNode(invalidTree, "name-field")
+	if invalidField == nil || !invalidField.Touched || invalidField.Valid == nil || *invalidField.Valid {
+		t.Fatalf("invalid submitted field metadata = %+v", invalidField)
+	}
+	if values := runtime.Snapshot().StateValues["screen:main"]; values["name"] != "Ada" || values["submitted"] != false {
+		t.Fatalf("invalid submit values = %+v", values)
+	}
+	if err := runtime.SetFieldDraft(field.ID, "Grace"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SubmitForm(form.ID); err != nil {
+		t.Fatal(err)
+	}
+	if values := runtime.Snapshot().StateValues["screen:main"]; values["name"] != "Grace" || values["submitted"] != true {
+		t.Fatalf("submitted values = %+v", values)
+	}
+	runtime.SetTransient(interaction.Transient{Focused: resetButton.Handle})
+	if err := runtime.ActivateSemanticID(resetButton.ID); err != nil {
+		t.Fatal(err)
+	}
+	if focused := runtime.Snapshot().Transient.Focused; focused != resetButton.Handle {
+		t.Fatalf("form reset moved focus to %q, want %q", focused, resetButton.Handle)
+	}
+	if values := runtime.Snapshot().StateValues["screen:main"]; values["name"] != "Ada" || values["submitted"] != true {
+		t.Fatalf("reset values = %+v", values)
+	}
+	if err := runtime.SetFieldDraft(field.ID, "unsaved"); err != nil {
+		t.Fatal(err)
+	}
+	before := runtime.Snapshot().RuntimeRevision
+	if value, err := runtime.SetControlValue(field.ID, "Ada"); err != nil || value != "Ada" {
+		t.Fatalf("same-value external write = %#v, %v", value, err)
+	}
+	if draft, _ := runtime.FieldDraft(field.ID); draft != "Ada" {
+		t.Fatalf("same-value external write left draft %q", draft)
+	}
+	if runtime.Snapshot().RuntimeRevision <= before {
+		t.Fatal("observable draft replacement did not increment runtime revision")
+	}
+	if value, err := runtime.SetControlValue(field.ID, "A\nB\r\nC"); err != nil || value != "ABC" {
+		t.Fatalf("single-line external write = %#v, %v, want ABC", value, err)
+	}
+	if draft, _ := runtime.FieldDraft(field.ID); draft != "ABC" {
+		t.Fatalf("single-line external write left draft %q", draft)
+	}
+	changedConstraints := strings.Replace(string(source), "min_length: 2", "min_length: 5", 1)
+	if err := os.WriteFile(path, []byte(changedConstraints), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime.Reload()
+	if draft, _ := runtime.FieldDraft(field.ID); draft != "ABC" {
+		t.Fatalf("compatible reload replaced draft %q", draft)
+	}
+	reloadedTree, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloadedField := namedSemanticNode(reloadedTree, "name-field"); reloadedField == nil || reloadedField.Valid == nil || *reloadedField.Valid {
+		t.Fatalf("changed constraints did not revalidate retained draft: %+v", reloadedField)
+	}
+	if err := os.WriteFile(path, []byte("gora: 1\nkind: app\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime.Reload()
+	if draft, _ := runtime.FieldDraft(field.ID); draft != "ABC" || !runtime.Snapshot().Invalid {
+		t.Fatalf("invalid reload draft=%q invalid=%v", draft, runtime.Snapshot().Invalid)
+	}
+}
+
+func TestValidFieldDraftPublishesStateWhileInvalidDraftPreservesLastValue(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "live-fields.gora")
+	source := []byte(`
+gora: 1
+kind: app
+viewport: { width: 320, height: 180 }
+state:
+  name: { type: text, default: Ada }
+  seats: { type: number, default: 3, min: 1, max: 9, step: 2 }
+entry: main
+screens:
+  main:
+    type: stack
+    props: { direction: vertical }
+    children:
+      - type: text_field
+        name: name-field
+        props: { label: Name, bind: name, required: true, min_length: 2 }
+        children: [{ type: field_box }]
+      - type: text_field
+        name: seats-field
+        props: { label: Seats, bind: seats }
+        children: [{ type: field_box }]
+`)
+	if err := os.WriteFile(path, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := namedSemanticNode(tree, "name-field")
+	seats := namedSemanticNode(tree, "seats-field")
+	if err := runtime.SetFieldDraft(name.ID, "Grace"); err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.Snapshot().StateValues["screen:main"]["name"]; got != "Grace" {
+		t.Fatalf("valid text draft published %#v, want Grace", got)
+	}
+	if err := runtime.SetFieldDraft(name.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.Snapshot().StateValues["screen:main"]["name"]; got != "Grace" {
+		t.Fatalf("invalid text draft overwrote state with %#v", got)
+	}
+	if err := runtime.SetFieldDraft(seats.ID, "6"); err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.Snapshot().StateValues["screen:main"]["seats"]; got != float64(7) {
+		t.Fatalf("normalized number draft published %#v, want 7", got)
+	}
+	if err := runtime.SetFieldDraft(seats.ID, "-"); err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.Snapshot().StateValues["screen:main"]["seats"]; got != float64(7) {
+		t.Fatalf("partial number draft overwrote state with %#v", got)
+	}
+	tree, err = runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	name = namedSemanticNode(tree, "name-field")
+	seats = namedSemanticNode(tree, "seats-field")
+	if name.Value != "" || name.CommittedValue != "Grace" || name.Valid == nil || *name.Valid {
+		t.Fatalf("invalid text field semantics = %+v", name)
+	}
+	if seats.Value != "-" || seats.CommittedValue != float64(7) || seats.Valid == nil || *seats.Valid {
+		t.Fatalf("partial number field semantics = %+v", seats)
+	}
+}
+
+func TestFieldFocusChangeFinishesCompositionAndPublishesValidDraft(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "forms.gora")
+	source := []byte(`
+gora: 1
+kind: app
+viewport: { width: 320, height: 180 }
+state:
+  name: { type: text, default: Ada }
+entry: main
+screens:
+  main:
+    type: form
+    name: profile-form
+    children:
+      - type: stack
+        props: { direction: vertical }
+        children:
+          - type: text_field
+            name: name-field
+            props: { label: Name, bind: name, required: true }
+            children:
+              - { type: field_box }
+          - type: button
+            name: save-button
+            props: { label: Save }
+            children:
+              - { type: text, props: { text: Save } }
+`)
+	if err := os.WriteFile(path, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	field := namedSemanticNode(tree, "name-field")
+	button := namedSemanticNode(tree, "save-button")
+	runtime.SetTransient(interaction.Transient{Focused: field.Handle})
+	if err := runtime.SetFieldComposition(field.ID, 0, 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.ApplyFieldEdit(field.ID, 0, 3, "Grace"); err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.Snapshot().StateValues["screen:main"]["name"]; got != "Ada" {
+		t.Fatalf("composing draft published early: %#v", got)
+	}
+
+	runtime.SetTransient(interaction.Transient{Focused: button.Handle})
+	snapshot := runtime.Snapshot()
+	if got := snapshot.StateValues["screen:main"]["name"]; got != "Grace" {
+		t.Fatalf("finished composition was not published on focus change: %#v", got)
+	}
+	state := snapshot.Editing[field.ID]
+	if state.Composing || !state.Touched {
+		t.Fatalf("field after focus change = %+v", state)
+	}
+}
+
+func TestKeyboardEditsUndoAndRedoPublishOnlyValidDrafts(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keyboard-field.gora")
+	source := []byte(`
+gora: 1
+kind: app
+viewport: { width: 240, height: 100 }
+state:
+  name: { type: text, default: Ada }
+entry: main
+screens:
+  main:
+    type: text_field
+    name: name-field
+    props: { label: Name, bind: name, required: true, min_length: 2 }
+    children: [{ type: field_box }]
+`)
+	if err := os.WriteFile(path, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	field := namedSemanticNode(tree, "name-field")
+	if err := runtime.ApplyFieldEdit(field.ID, 0, 3, "Grace"); err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.Snapshot().StateValues["screen:main"]["name"]; got != "Grace" {
+		t.Fatalf("keyboard edit published %#v, want Grace", got)
+	}
+	beforeNoOp := runtime.Snapshot().RuntimeRevision
+	if err := runtime.ApplyFieldEdit(field.ID, 5, 5, ""); err != nil {
+		t.Fatal(err)
+	}
+	if after := runtime.Snapshot().RuntimeRevision; after != beforeNoOp {
+		t.Fatalf("empty edit changed runtime revision from %d to %d", beforeNoOp, after)
+	}
+	if !runtime.UndoField(field.ID) {
+		t.Fatal("undo did not change the field")
+	}
+	if got := runtime.Snapshot().StateValues["screen:main"]["name"]; got != "Ada" {
+		t.Fatalf("undo published %#v, want Ada", got)
+	}
+	if !runtime.RedoField(field.ID) {
+		t.Fatal("redo did not change the field")
+	}
+	if got := runtime.Snapshot().StateValues["screen:main"]["name"]; got != "Grace" {
+		t.Fatalf("redo published %#v, want Grace", got)
+	}
+	if err := runtime.SetFieldSelection(field.ID, 0, 5); err != nil {
+		t.Fatal(err)
+	}
+	if !runtime.DeleteFieldSelection(field.ID, true, false) {
+		t.Fatal("selection deletion did not change the field")
+	}
+	if got := runtime.Snapshot().StateValues["screen:main"]["name"]; got != "Grace" {
+		t.Fatalf("invalid deletion overwrote state with %#v", got)
+	}
+}
+
+func TestValidDraftSynchronizesRepeatedBindingsWithoutReplacingItsOwnEdit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "repeated-binding.gora")
+	source := []byte(`
+gora: 1
+kind: app
+viewport: { width: 240, height: 120 }
+state:
+  name: { type: text, default: Ada }
+entry: main
+screens:
+  main:
+    type: stack
+    props: { direction: vertical }
+    children:
+      - type: text_field
+        name: first-name
+        props: { label: First, bind: name, required: true }
+        children: [{ type: field_box }]
+      - type: text_field
+        name: second-name
+        props: { label: Second, bind: name, required: true }
+        children: [{ type: field_box }]
+`)
+	if err := os.WriteFile(path, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := namedSemanticNode(tree, "first-name")
+	if err := runtime.SetFieldDraft(first.ID, "Grace"); err != nil {
+		t.Fatal(err)
+	}
+	tree, err = runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first = namedSemanticNode(tree, "first-name")
+	second := namedSemanticNode(tree, "second-name")
+	if first.Value != "Grace" || first.CommittedValue != "Grace" || !first.Dirty {
+		t.Fatalf("source field = %+v", first)
+	}
+	if second.Value != "Grace" || second.CommittedValue != "Grace" || second.Dirty {
+		t.Fatalf("repeated binding field = %+v", second)
+	}
+	if _, err := runtime.SetControlValue(first.ID, "Linus"); err != nil {
+		t.Fatal(err)
+	}
+	tree, err = runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first = namedSemanticNode(tree, "first-name")
+	second = namedSemanticNode(tree, "second-name")
+	if first.Value != "Linus" || second.Value != "Linus" || first.Dirty || second.Dirty {
+		t.Fatalf("external repeated binding sync = first %+v second %+v", first, second)
+	}
+}
+
+func TestSetControlValueRejectsFieldValuesThatFailFieldValidation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "validated-control-value.gora")
+	source := []byte(`
+gora: 1
+kind: app
+viewport: { width: 240, height: 100 }
+state:
+  name: { type: text, default: Ada }
+entry: main
+screens:
+  main:
+    type: text_field
+    name: name-field
+    props:
+      label: Name
+      bind: name
+      required: true
+      min_length: 2
+      pattern: '[A-Z][a-z]+'
+    children: [{ type: field_box }]
+`)
+	if err := os.WriteFile(path, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	field := namedSemanticNode(tree, "name-field")
+	before := runtime.Snapshot().RuntimeRevision
+	if _, err := runtime.SetControlValue(field.ID, "x"); err == nil {
+		t.Fatal("invalid field value was accepted")
+	}
+	if got := runtime.Snapshot().StateValues["screen:main"]["name"]; got != "Ada" {
+		t.Fatalf("invalid control value changed state to %#v", got)
+	}
+	if draft, _ := runtime.FieldDraft(field.ID); draft != "Ada" {
+		t.Fatalf("invalid control value changed draft to %q", draft)
+	}
+	if after := runtime.Snapshot().RuntimeRevision; after != before {
+		t.Fatalf("rejected control value changed revision from %d to %d", before, after)
+	}
+	value, err := runtime.SetControlValue(field.ID, "Grace")
+	if err != nil || value != "Grace" {
+		t.Fatalf("valid field value = %#v, %v", value, err)
+	}
+}
+
+func TestActivateSemanticIDRejectsDisabledFormButtons(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "disabled-form-button.gora")
+	source := []byte(`
+gora: 1
+kind: app
+viewport: { width: 320, height: 180 }
+state:
+  name: { type: text, default: Ada }
+entry: main
+screens:
+  main:
+    type: form
+    name: profile-form
+    children:
+      - type: stack
+        props: { direction: vertical }
+        children:
+          - type: text_field
+            name: name-field
+            props: { label: Name, bind: name }
+            children: [{ type: field_box }]
+          - type: button
+            name: disabled-reset
+            props: { label: Reset, form_action: reset, disabled: true }
+            children: [{ type: text, props: { text: Reset } }]
+`)
+	if err := os.WriteFile(path, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	field := namedSemanticNode(tree, "name-field")
+	button := namedSemanticNode(tree, "disabled-reset")
+	if field == nil || button == nil {
+		t.Fatalf("field=%+v button=%+v", field, button)
+	}
+	if err := runtime.SetFieldDraft(field.ID, "unsaved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.ActivateSemanticID(button.ID); err == nil {
+		t.Fatal("disabled reset button activated")
+	}
+	if draft, _ := runtime.FieldDraft(field.ID); draft != "unsaved" {
+		t.Fatalf("disabled reset changed draft to %q", draft)
+	}
+}
+
+func TestFocusRevealUsesFieldCaretInsteadOfEntireFieldBounds(t *testing.T) {
+	runtime := &Runtime{scroll: map[string]image.Point{"feed": {}}, publishedTree: &semantic.Node{
+		Type: "scroll", Name: "feed", Bounds: &semantic.Rect{X: 0, Y: 0, Width: 100, Height: 50}, Props: map[string]any{"axis": "vertical"},
+		Children: []*semantic.Node{{
+			Type: "surface", Bounds: &semantic.Rect{X: 0, Y: 0, Width: 100, Height: 120}, Children: []*semantic.Node{{
+				Handle: "notes", Role: "textbox", Bounds: &semantic.Rect{X: 0, Y: 0, Width: 100, Height: 100}, Children: []*semantic.Node{{
+					Type: "field_box", Bounds: &semantic.Rect{X: 0, Y: 20, Width: 100, Height: 70},
+					Props: map[string]any{"text": "first\nsecond\nthird", "field_multiline": true, "selection_start": float64(0), "selection_end": float64(0), "size": float64(12)},
+				}},
+			}},
+		}},
+	}}
+	runtime.revealFocusedLocked("notes")
+	if got := runtime.scroll["feed"].Y; got != 0 {
+		t.Fatalf("focus reveal scrolled by %d for an already-visible caret", got)
+	}
+}
+
+func TestFocusRevealPropagatesAdjustedCaretThroughNestedScrollports(t *testing.T) {
+	field := &semantic.Node{Handle: "notes", Role: "textbox", Bounds: &semantic.Rect{X: 0, Y: 180, Width: 100, Height: 40}, Children: []*semantic.Node{{
+		Type: "field_box", Bounds: &semantic.Rect{X: 0, Y: 180, Width: 100, Height: 40},
+		Props: map[string]any{"text": "caret", "field_multiline": true, "selection_start": float64(0), "selection_end": float64(0), "size": float64(12)},
+	}}}
+	inner := &semantic.Node{
+		Type: "scroll", Name: "inner", Bounds: &semantic.Rect{X: 0, Y: 80, Width: 100, Height: 50}, Props: map[string]any{"axis": "vertical"},
+		Children: []*semantic.Node{{Type: "surface", Bounds: &semantic.Rect{X: 0, Y: 80, Width: 100, Height: 150}, Children: []*semantic.Node{field}}},
+	}
+	runtime := &Runtime{scroll: map[string]image.Point{"outer": {}, "inner": {}}, publishedTree: &semantic.Node{
+		Type: "scroll", Name: "outer", Bounds: &semantic.Rect{X: 0, Y: 0, Width: 100, Height: 100}, Props: map[string]any{"axis": "vertical"},
+		Children: []*semantic.Node{{Type: "surface", Bounds: &semantic.Rect{X: 0, Y: 0, Width: 100, Height: 300}, Children: []*semantic.Node{inner}}},
+	}}
+	runtime.revealFocusedLocked("notes")
+	caret := render.FieldCaretRect(field.Children[0].Props, field.Children[0].Bounds.ImageRectangle())
+	wantInner := caret.Max.Y - inner.Bounds.ImageRectangle().Max.Y
+	if innerOffset := runtime.scroll["inner"].Y; innerOffset != wantInner {
+		t.Fatalf("inner reveal offset = %d, want minimum %d", innerOffset, wantInner)
+	}
+	if outerOffset := runtime.scroll["outer"].Y; outerOffset != 30 {
+		t.Fatalf("outer reveal offset = %d, want 30 after inner translation", outerOffset)
+	}
+}
+
+func TestFormSubmitIncludesHiddenAndReadOnlyFieldsButSkipsDisabledFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "form-boundaries.gora")
+	source := []byte(`
+gora: 1
+kind: app
+viewport: { width: 320, height: 220 }
+state:
+  hide: { type: boolean, default: true }
+  disable_field: { type: boolean, default: true }
+  hidden_value: { type: text, default: "" }
+  disabled_value: { type: text, default: "" }
+  locked_value: { type: text, default: locked }
+  submitted: { type: boolean, default: false }
+entry: main
+screens:
+  main:
+    type: form
+    name: boundary-form
+    on:
+      submit: [{ action: set, state: submitted, value: true }]
+    children:
+      - type: stack
+        props: { direction: vertical }
+        children:
+          - type: text_field
+            name: hidden-field
+            props: { label: Hidden, bind: hidden_value, required: true }
+            variants:
+              - when: { state: hide, equals: true }
+                visible: false
+            children: [{ type: field_box }]
+          - type: text_field
+            name: disabled-field
+            props: { label: Disabled, bind: disabled_value, required: true, disabled: { ref: state.disable_field } }
+            children: [{ type: field_box }]
+          - type: text_field
+            name: locked-field
+            props: { label: Locked, bind: locked_value, required: true, read_only: true }
+            children: [{ type: field_box }]
+`)
+	if err := os.WriteFile(path, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	form := namedSemanticNode(tree, "boundary-form")
+	disabled := namedSemanticNode(tree, "disabled-field")
+	if disabled.Valid != nil || disabled.Issues != nil {
+		t.Fatalf("disabled field exposed validation state: %+v", disabled)
+	}
+	if err := runtime.SetStateValues("screen:main", map[string]any{"disable_field": false}); err != nil {
+		t.Fatal(err)
+	}
+	tree, err = runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabled = namedSemanticNode(tree, "disabled-field")
+	if disabled.Valid == nil || *disabled.Valid || disabled.Issues == nil {
+		t.Fatalf("enabled empty required field was not revalidated: %+v", disabled)
+	}
+	if err := runtime.SetStateValues("screen:main", map[string]any{"disable_field": true}); err != nil {
+		t.Fatal(err)
+	}
+	tree, err = runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	form = namedSemanticNode(tree, "boundary-form")
+	if err := runtime.SubmitForm(form.ID); err == nil {
+		t.Fatal("hidden enabled invalid field did not block submission")
+	}
+	if err := runtime.SetStateValues("screen:main", map[string]any{"hidden_value": "ready"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SubmitForm(form.ID); err != nil {
+		t.Fatalf("disabled invalid field should have been skipped: %v", err)
+	}
+	values := runtime.Snapshot().StateValues["screen:main"]
+	if values["hidden_value"] != "ready" || values["locked_value"] != "locked" || values["submitted"] != true {
+		t.Fatalf("submitted values = %+v", values)
+	}
+}
+
+func TestFormSubmitPublishesDraftBeforeActionsAndNavigatesLast(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "submit-order.gora")
+	if err := os.WriteFile(path, []byte(`
+gora: 1
+kind: app
+viewport: { width: 320, height: 180 }
+state:
+  name: { type: text, default: Ada }
+  saved: { type: text, default: "" }
+entry: edit
+screens:
+  edit:
+    type: form
+    name: profile-form
+    on:
+      submit:
+        - { action: set, state: saved, value: { ref: state.name } }
+        - { action: navigate, to: done }
+    children:
+      - type: text_field
+        name: name-field
+        props: { label: Name, bind: name, required: true }
+        children: [{ type: field_box }]
+  done:
+    type: text
+    props: { text: Done }
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SetFieldDraft(namedSemanticNode(tree, "name-field").ID, "Grace"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SubmitForm(namedSemanticNode(tree, "profile-form").ID); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := runtime.Snapshot()
+	if snapshot.Screen != "done" {
+		t.Fatalf("selected screen = %q, want done", snapshot.Screen)
+	}
+	values := snapshot.StateValues["screen:edit"]
+	if values["name"] != "Grace" || values["saved"] != "Grace" {
+		t.Fatalf("published/action values = %+v", values)
+	}
+}
+
+func TestFormSubmissionKeepsComponentFieldScopesIsolated(t *testing.T) {
+	dir := t.TempDir()
+	componentPath := filepath.Join(dir, "contact.gora")
+	component := []byte(`
+gora: 1
+kind: component
+name: Contact
+viewport: { width: 220, height: 48 }
+state:
+  nickname: { type: text, default: Countess }
+previews:
+  default: {}
+root:
+  type: text_field
+  name: nickname-field
+  props: { label: Nickname, bind: nickname, required: true }
+  children: [{ type: field_box, props: { height: 40 } }]
+`)
+	if err := os.WriteFile(componentPath, component, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	appPath := filepath.Join(dir, "app.gora")
+	appSource := []byte(`
+gora: 1
+kind: app
+imports:
+  components: { contact: ./contact.gora }
+viewport: { width: 320, height: 180 }
+entry: main
+screens:
+  main:
+    type: form
+    name: contacts-form
+    children:
+      - type: stack
+        props: { direction: vertical, gap: 8 }
+        children:
+          - { type: instance, name: primary-contact, props: { component: contact } }
+          - { type: instance, name: secondary-contact, props: { component: contact } }
+`)
+	if err := os.WriteFile(appPath, appSource, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, appPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	form := namedSemanticNode(tree, "contacts-form")
+	var fields []*semantic.Node
+	var nodes []string
+	for _, node := range semantic.Flatten(tree) {
+		nodes = append(nodes, node.Type+":"+node.Name+":"+node.Role)
+		if node.Name == "nickname-field" {
+			fields = append(fields, node)
+		}
+	}
+	if form == nil || len(fields) != 2 || fields[0].Scope == fields[1].Scope {
+		t.Fatalf("form=%+v fields=%+v nodes=%v", form, fields, nodes)
+	}
+	if err := runtime.SetFieldDraft(fields[0].ID, "Primary"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SetFieldDraft(fields[1].ID, "Secondary"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SubmitForm(form.ID); err != nil {
+		t.Fatal(err)
+	}
+	values := runtime.Snapshot().StateValues
+	if got := values[fields[0].Scope]["nickname"]; got != "Primary" {
+		t.Fatalf("primary scope value = %#v", got)
+	}
+	if got := values[fields[1].Scope]["nickname"]; got != "Secondary" {
+		t.Fatalf("secondary scope value = %#v", got)
+	}
+}
+
+func TestFormSubmissionKeepsScreenFieldScopesIsolated(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "screens.gora")
+	source := []byte(`
+gora: 1
+kind: app
+viewport: { width: 320, height: 180 }
+state:
+  name: { type: text, default: Ada }
+entry: first
+screens:
+  first:
+    type: form
+    name: first-form
+    children:
+      - type: text_field
+        name: first-name
+        props: { label: First name, bind: name }
+        children: [{ type: field_box }]
+  second:
+    type: form
+    name: second-form
+    children:
+      - type: text_field
+        name: second-name
+        props: { label: Second name, bind: name }
+        children: [{ type: field_box }]
+`)
+	if err := os.WriteFile(path, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SetFieldDraft(namedSemanticNode(tree, "first-name").ID, "Grace"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SubmitForm(namedSemanticNode(tree, "first-form").ID); err != nil {
+		t.Fatal(err)
+	}
+	if !runtime.SelectScreen("second") {
+		t.Fatal("second screen was not selected")
+	}
+	tree, err = runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SetFieldDraft(namedSemanticNode(tree, "second-name").ID, "Linus"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SubmitForm(namedSemanticNode(tree, "second-form").ID); err != nil {
+		t.Fatal(err)
+	}
+	values := runtime.Snapshot().StateValues
+	if got := values["screen:first"]["name"]; got != "Grace" {
+		t.Fatalf("first screen value = %#v", got)
+	}
+	if got := values["screen:second"]["name"]; got != "Linus" {
+		t.Fatalf("second screen value = %#v", got)
+	}
+	if !runtime.SelectScreen("first") {
+		t.Fatal("first screen was not restored")
+	}
+	tree, err = runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	field := namedSemanticNode(tree, "first-name")
+	if field.Value != "Grace" || field.CommittedValue != "Grace" {
+		t.Fatalf("restored first field = draft %#v committed %#v", field.Value, field.CommittedValue)
 	}
 }
 

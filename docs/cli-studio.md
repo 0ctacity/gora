@@ -119,6 +119,16 @@ open/active/commit/cancel cycle, and sliders/steppers support Arrow, Page,
 Home, and End range changes. Inspect mode exclusively owns clicks and clears
 document transient interaction.
 
+Document `text_field` and `text_area` controls use the same semantic focus
+order. Pointer press/drag changes selection; repeated clicks select words and
+lines. Platform select-all, copy, cut, paste, undo, and redo shortcuts are
+supported, and Gio IME edit, selection, and composition events update the
+renderer-neutral draft. Valid drafts publish typed or normalized state
+immediately; invalid drafts stay visible without replacing the last valid
+value. Form submit/reset buttons and Enter conventions use the local form
+transaction described in the format contract. Captures and inspection include
+the current draft, validation state, selection, caret, and composition state.
+
 File watching is directory-based and debounced. The watch set includes the
 entry document, imports, token modules, fonts, and images. A valid reload swaps
 atomically. An invalid reload keeps the last-good frame visible and replaces

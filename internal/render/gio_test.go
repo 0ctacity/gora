@@ -89,6 +89,30 @@ func TestCPUAndGioUseIdenticalStackGeometry(t *testing.T) {
 	}
 }
 
+func TestCPUAndGioUseIdenticalFieldGeometry(t *testing.T) {
+	root := &project.Node{Handle: "field-box", Type: "field_box", Props: map[string]any{
+		"width": float64(150), "height": float64(48),
+		"padding": map[string]any{"top": float64(8), "right": float64(10), "bottom": float64(8), "left": float64(10)},
+		"text":    "Ada שלום", "size": float64(16), "selection_start": float64(2), "selection_end": float64(7),
+	}}
+	viewport := image.Pt(180, 60)
+	cpu := Render(root, viewport, State{})
+	var operations op.Ops
+	gio := LayoutGio(layout.Context{Ops: &operations, Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}, Constraints: layout.Exact(viewport)}, material.NewTheme(), root, viewport, State{})
+	if cpu.Bounds["field-box"] != gio.Bounds["field-box"] {
+		t.Fatalf("field bounds: CPU=%v Gio=%v", cpu.Bounds["field-box"], gio.Bounds["field-box"])
+	}
+	cpuGeometry, gioGeometry := cpu.Geometry["field-box"], gio.Geometry["field-box"]
+	if cpuGeometry.Clip != gioGeometry.Clip {
+		t.Fatalf("field clip: CPU=%v Gio=%v", cpuGeometry.Clip, gioGeometry.Clip)
+	}
+	for _, property := range []string{"internal_viewport_x", "internal_viewport_y", "internal_viewport_width", "internal_viewport_height"} {
+		if cpuGeometry.Props[property] != gioGeometry.Props[property] {
+			t.Fatalf("%s: CPU=%v Gio=%v", property, cpuGeometry.Props[property], gioGeometry.Props[property])
+		}
+	}
+}
+
 func TestCPUAndGioUseIdenticalSemanticSliderGeometry(t *testing.T) {
 	minimum, maximum, step := 0.0, 100.0, 5.0
 	root := &project.Node{
@@ -327,6 +351,57 @@ func TestGioCacheReplaysTransientButtonPaintWithoutGeometryRebuild(t *testing.T)
 	}
 	if hovered.Tree == nil || hovered.Tree.Props["background"] != "#FF0000" || !hovered.Tree.Hovered {
 		t.Fatalf("hovered runtime tree = %+v", hovered.Tree)
+	}
+}
+
+func TestGioCacheReplaysFieldDecorationWithoutGeometryRebuild(t *testing.T) {
+	box := &project.Node{Handle: "box", Type: "field_box", Props: map[string]any{
+		"field_handle": "field", "text": "Ada", "selection_start": float64(1), "selection_end": float64(1),
+		"background": "#FFFFFF", "color": "#111111", "caret_color": "#FF0000", "size": float64(16),
+	}}
+	root := &project.Node{
+		Handle: "field", Type: "text_field", Name: "name-field", Props: map[string]any{"label": "Name"},
+		Children: []*project.Node{box},
+	}
+	theme := material.NewTheme()
+	viewport := image.Pt(100, 32)
+	var cache GioCache
+	layoutCached := func(state State) GioResult {
+		var operations op.Ops
+		return cache.Layout(layout.Context{
+			Ops: &operations, Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}, Constraints: layout.Exact(viewport),
+		}, theme, root, viewport, state)
+	}
+	layoutCached(State{})
+	focused := layoutCached(State{Focused: "field"})
+	if cache.builds != 1 {
+		t.Fatalf("scene builds = %d, want 1", cache.builds)
+	}
+	foundField := false
+	for _, item := range cache.scene.items {
+		foundField = foundField || item.field != nil
+	}
+	if !foundField {
+		t.Fatal("field box was retained as static paint instead of transient field paint")
+	}
+	if focused.Tree == nil || !focused.Tree.Focused {
+		t.Fatalf("focused runtime tree = %+v", focused.Tree)
+	}
+}
+
+func TestGioFieldTextUsesTheCaretGeometryShaper(t *testing.T) {
+	theme := material.NewTheme()
+	renderer := gioRenderer{theme: theme}
+	field := &project.Node{Type: "field_box", Props: map[string]any{
+		"field_handle": "name-field", "text": "Ada Lovelace", "size": float64(20),
+	}}
+
+	label := renderer.label(field)
+	if label.Shaper != fieldShapeState.fallback {
+		t.Fatal("field text and caret geometry use different fallback shapers")
+	}
+	if ordinary := renderer.label(&project.Node{Type: "text"}); ordinary.Shaper != theme.Shaper {
+		t.Fatal("ordinary document text unexpectedly changed shaper")
 	}
 }
 

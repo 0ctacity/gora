@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,6 +46,7 @@ type Node struct {
 	Handle       string
 	Type         string
 	Name         string
+	SourceName   string
 	Hidden       bool
 	Props        map[string]any
 	Place        map[string]any
@@ -54,6 +56,7 @@ type Node struct {
 	Scope        string
 	Binding      string
 	BindingState *document.StateDeclaration
+	Form         string
 	On           document.Events
 	Variants     []document.Variant
 }
@@ -76,11 +79,21 @@ type resolveContext struct {
 	parameters map[string]any
 	components map[string]*document.Document
 	tokens     map[string]*document.Document
-	slots      map[string][]*Node
+	slots      map[string][]slotFill
 	breadcrumb []string
 	source     document.Source
 	scope      string
 	context    string
+	form       string
+}
+
+// slotFill defers resolving caller-authored slot content until the component
+// template reaches the slot. That preserves the caller's lexical scope while
+// allowing the content to inherit structural context such as a surrounding
+// component-owned form.
+type slotFill struct {
+	source  *document.Node
+	context resolveContext
 }
 
 func Load(root, entry string, viewportWidth int) (*Loaded, []document.Diagnostic) {
@@ -252,7 +265,7 @@ func (l *loader) validateParameters(component *document.Document, values map[str
 	}
 }
 
-func (l *loader) validateSlots(component *document.Document, values map[string][]*Node, source document.Source) {
+func (l *loader) validateSlots(component *document.Document, values map[string][]slotFill, source document.Source) {
 	if source.File == "" {
 		source = document.Source{File: component.File, Line: 1, Column: 1}
 	}
@@ -623,7 +636,15 @@ func (l *loader) resolveNode(source *document.Node, ctx resolveContext) *Node {
 	if source.Type == "slot" {
 		name, _ := props["name"].(string)
 		if content, ok := ctx.slots[name]; ok {
-			group := groupNode(source, content, ctx.breadcrumb, l)
+			children := make([]*Node, 0, len(content))
+			for _, fill := range content {
+				fillContext := fill.context
+				fillContext.form = ctx.form
+				if resolved := l.resolveNode(fill.source, fillContext); resolved != nil {
+					children = append(children, resolved)
+				}
+			}
+			group := groupNode(source, children, ctx.breadcrumb, l)
 			group.Hidden = !visible
 			return group
 		}
@@ -646,6 +667,7 @@ func (l *loader) resolveNode(source *document.Node, ctx resolveContext) *Node {
 		Handle:     l.handle(),
 		Type:       source.Type,
 		Name:       source.Name,
+		SourceName: source.Name,
 		Hidden:     !visible,
 		Props:      props,
 		Place:      place,
@@ -653,16 +675,24 @@ func (l *loader) resolveNode(source *document.Node, ctx resolveContext) *Node {
 		Breadcrumb: append([]string(nil), ctx.breadcrumb...),
 		Scope:      ctx.scope,
 		Binding:    stringProp(props, "bind"),
+		Form:       ctx.form,
 		On:         resolveEvents(source.On, ctx, l),
 		Variants:   resolveVariants(source.Variants, ctx, l),
+	}
+	if node.Type == "form" && ctx.form != "" {
+		l.add(node.Source.File, node.Source.Line, node.Source.Column, "form.nested", "forms cannot be nested after component expansion")
 	}
 	if declaration, ok := ctx.doc.State[node.Binding]; ok {
 		copy := declaration
 		node.BindingState = &copy
 	}
 	l.validateResolvedInteraction(node, ctx)
+	childContext := ctx
+	if node.Type == "form" {
+		childContext.form = node.Handle
+	}
 	for _, child := range source.Children {
-		if resolved := l.resolveNode(child, ctx); resolved != nil {
+		if resolved := l.resolveNode(child, childContext); resolved != nil {
 			if resolved.Type == "_group" {
 				node.Children = append(node.Children, resolved.Children...)
 			} else {
@@ -684,7 +714,7 @@ func propagateControlBinding(node *Node, binding string, declaration *document.S
 			continue
 		}
 		switch child.Type {
-		case "radio", "tab", "tab_panel", "select_trigger", "select_popup", "option", "slider_track", "slider_fill", "slider_thumb", "stepper_decrement", "stepper_value", "stepper_increment":
+		case "field_box", "field_support", "radio", "tab", "tab_panel", "select_trigger", "select_popup", "option", "slider_track", "slider_fill", "slider_thumb", "stepper_decrement", "stepper_value", "stepper_increment":
 			child.Binding = binding
 			child.BindingState = declaration
 			propagateControlBinding(child, binding, declaration)
@@ -705,6 +735,7 @@ func (l *loader) validateResolvedControls(node *Node) {
 		l.add(node.Source.File, node.Source.Line, node.Source.Column, "control.disabled_type", node.Type+" disabled must resolve to boolean")
 	}
 	allowed := map[string][]string{
+		"text_field": {"text", "number"}, "text_area": {"text"},
 		"toggle": {"boolean"}, "checkbox": {"boolean"},
 		"radio_group": {"text", "number", "enum"}, "tabs": {"text", "number", "enum"}, "select": {"text", "number", "enum"},
 		"slider": {"number"}, "stepper": {"number"},
@@ -715,6 +746,20 @@ func (l *loader) validateResolvedControls(node *Node) {
 		}
 	}
 	switch node.Type {
+	case "form":
+		if len(node.Children) != 1 {
+			l.add(node.Source.File, node.Source.Line, node.Source.Column, "schema.children", "form requires exactly one visual child after component expansion")
+		}
+	case "text_field", "text_area":
+		l.validateResolvedField(node)
+		for _, child := range directChildren(node, "field_support") {
+			for _, content := range child.Children {
+				if containsResolvedInteractive(content) {
+					l.add(child.Source.File, child.Source.Line, child.Source.Column, "control.nested", "field_support cannot contain interactive descendants after component expansion")
+					break
+				}
+			}
+		}
 	case "radio_group":
 		l.validateResolvedChoices(node, directChildren(node, "radio"))
 	case "tabs":
@@ -722,6 +767,70 @@ func (l *loader) validateResolvedControls(node *Node) {
 		l.validateResolvedTabPanels(node)
 	case "select":
 		l.validateResolvedChoices(node, descendants(node, "option"))
+	}
+}
+
+func containsResolvedInteractive(node *Node) bool {
+	if node == nil {
+		return false
+	}
+	switch node.Type {
+	case "button", "link", "text_field", "text_area", "toggle", "checkbox", "radio_group", "radio", "tabs", "tab", "select", "option", "slider", "stepper":
+		return true
+	}
+	for _, child := range node.Children {
+		if containsResolvedInteractive(child) {
+			return true
+		}
+	}
+	return false
+}
+
+func (l *loader) validateResolvedField(node *Node) {
+	label, ok := node.Props["label"].(string)
+	if !ok || strings.TrimSpace(label) == "" {
+		l.add(node.Source.File, node.Source.Line, node.Source.Column, node.Type+".label", node.Type+" label must resolve to non-empty text")
+	}
+	for _, key := range []string{"disabled", "read_only", "required"} {
+		if value, exists := node.Props[key]; exists && !resolvedStateType(value, "boolean", l) {
+			l.add(node.Source.File, node.Source.Line, node.Source.Column, "field."+key, key+" must resolve to boolean")
+		}
+	}
+	for _, key := range []string{"min_length", "max_length"} {
+		if value, exists := node.Props[key]; exists {
+			number, valid := numberAsFloat64(value)
+			if !valid || math.IsNaN(number) || math.IsInf(number, 0) || number < 0 || number != math.Trunc(number) {
+				l.add(node.Source.File, node.Source.Line, node.Source.Column, "field.length", key+" must resolve to a non-negative integer")
+			}
+		}
+	}
+	if minimum, minOK := numberAsFloat64(node.Props["min_length"]); minOK {
+		if maximum, maxOK := numberAsFloat64(node.Props["max_length"]); maxOK && minimum > maximum {
+			l.add(node.Source.File, node.Source.Line, node.Source.Column, "field.length", "min_length must not exceed max_length")
+		}
+	}
+	if value, exists := node.Props["pattern"]; exists {
+		pattern, valid := value.(string)
+		if !valid {
+			l.add(node.Source.File, node.Source.Line, node.Source.Column, "field.pattern", "pattern must resolve to text")
+		} else if _, err := regexp.Compile("^(?:" + pattern + ")$"); err != nil {
+			l.add(node.Source.File, node.Source.Line, node.Source.Column, "field.pattern", "pattern must resolve to a valid RE2 expression")
+		}
+	}
+	if node.Type == "text_area" {
+		for _, key := range []string{"min_lines", "max_lines"} {
+			if value, exists := node.Props[key]; exists {
+				number, valid := numberAsFloat64(value)
+				if !valid || math.IsNaN(number) || math.IsInf(number, 0) || number <= 0 || number != math.Trunc(number) {
+					l.add(node.Source.File, node.Source.Line, node.Source.Column, "field.lines", key+" must resolve to a positive integer")
+				}
+			}
+		}
+		if minimum, minOK := numberAsFloat64(node.Props["min_lines"]); minOK {
+			if maximum, maxOK := numberAsFloat64(node.Props["max_lines"]); maxOK && minimum > maximum {
+				l.add(node.Source.File, node.Source.Line, node.Source.Column, "field.lines", "min_lines must not exceed max_lines")
+			}
+		}
 	}
 }
 
@@ -811,7 +920,8 @@ func (l *loader) validateResolvedInteraction(node *Node, ctx resolveContext) {
 			}
 		}
 	}
-	for _, action := range node.On.Activate {
+	actions := append(append([]document.Action(nil), node.On.Activate...), node.On.Submit...)
+	for _, action := range actions {
 		if action.Action == "navigate" || action.Action == "replace" {
 			if l.appScreens != nil {
 				if _, exists := l.appScreens[action.To]; !exists {
@@ -1049,7 +1159,7 @@ func (l *loader) resolveInstance(source *document.Node, instanceProps, place map
 		instanceName = alias
 	}
 	breadcrumb := append(append([]string(nil), caller.breadcrumb...), instanceName)
-	slots := make(map[string][]*Node)
+	slots := make(map[string][]slotFill)
 	for _, fill := range source.Children {
 		if fill.Type != "slot_content" {
 			l.add(fill.Source.File, fill.Source.Line, fill.Source.Column, "component.child", "instance children must be slot_content nodes")
@@ -1066,9 +1176,7 @@ func (l *loader) resolveInstance(source *document.Node, instanceProps, place map
 		fillContext := caller
 		fillContext.breadcrumb = breadcrumb
 		for _, child := range fill.Children {
-			if resolved := l.resolveNode(child, fillContext); resolved != nil {
-				slots[name] = append(slots[name], resolved)
-			}
+			slots[name] = append(slots[name], slotFill{source: child, context: fillContext})
 		}
 	}
 	for name, slot := range component.Slots {
@@ -1086,6 +1194,7 @@ func (l *loader) resolveInstance(source *document.Node, instanceProps, place map
 		slots:      slots,
 		breadcrumb: breadcrumb,
 		context:    caller.context,
+		form:       caller.form,
 	}
 	if len(component.State) != 0 {
 		baseScope := "screen:" + caller.context
@@ -1220,11 +1329,19 @@ func resolveMap(values map[string]any, ctx resolveContext, l *loader) map[string
 }
 
 func resolveEvents(events document.Events, ctx resolveContext, l *loader) document.Events {
-	resolved := document.Events{Activate: make([]document.Action, len(events.Activate))}
+	resolved := document.Events{
+		Activate: make([]document.Action, len(events.Activate)),
+		Submit:   make([]document.Action, len(events.Submit)),
+	}
 	for index, action := range events.Activate {
 		resolved.Activate[index] = action
 		resolved.Activate[index].Value = resolveValue(action.Value, ctx, l)
 		resolved.Activate[index].By = resolveValue(action.By, ctx, l)
+	}
+	for index, action := range events.Submit {
+		resolved.Submit[index] = action
+		resolved.Submit[index].Value = resolveValue(action.Value, ctx, l)
+		resolved.Submit[index].By = resolveValue(action.By, ctx, l)
 	}
 	return resolved
 }
@@ -1420,8 +1537,8 @@ func selectPreview(previews map[string]document.Preview, selection string) (stri
 	return "", document.Preview{}, false
 }
 
-func previewSlots(preview document.Preview, ctx resolveContext, l *loader) map[string][]*Node {
-	slots := make(map[string][]*Node)
+func previewSlots(preview document.Preview, ctx resolveContext, l *loader) map[string][]slotFill {
+	slots := make(map[string][]slotFill)
 	for _, wrapper := range preview.Children {
 		name := "default"
 		children := []*document.Node{wrapper}
@@ -1432,9 +1549,7 @@ func previewSlots(preview document.Preview, ctx resolveContext, l *loader) map[s
 			children = wrapper.Children
 		}
 		for _, child := range children {
-			if resolved := l.resolveNode(child, ctx); resolved != nil {
-				slots[name] = append(slots[name], resolved)
-			}
+			slots[name] = append(slots[name], slotFill{source: child, context: ctx})
 		}
 	}
 	return slots

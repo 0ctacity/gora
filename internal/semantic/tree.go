@@ -40,43 +40,63 @@ type Effect struct {
 
 // Node is the canonical renderer-neutral runtime inspection node.
 type Node struct {
-	ID          string            `json:"id"`
-	Handle      string            `json:"-"`
-	Type        string            `json:"type"`
-	Name        string            `json:"name,omitempty"`
-	Role        string            `json:"role,omitempty"`
-	Label       string            `json:"label,omitempty"`
-	Value       any               `json:"value,omitempty"`
-	Enabled     bool              `json:"enabled"`
-	Current     bool              `json:"current,omitempty"`
-	Checked     *bool             `json:"checked,omitempty"`
-	Selected    *bool             `json:"selected,omitempty"`
-	Expanded    *bool             `json:"expanded,omitempty"`
-	Min         *float64          `json:"min,omitempty"`
-	Max         *float64          `json:"max,omitempty"`
-	Step        *float64          `json:"step,omitempty"`
-	Orientation string            `json:"orientation,omitempty"`
-	Visible     bool              `json:"visible"`
-	InViewport  bool              `json:"in_viewport"`
-	Bounds      *Rect             `json:"bounds"`
-	Clip        *Rect             `json:"clip"`
-	Props       map[string]any    `json:"props,omitempty"`
-	Place       map[string]any    `json:"place,omitempty"`
-	Source      Source            `json:"source"`
-	Breadcrumb  []string          `json:"breadcrumb,omitempty"`
-	Scope       string            `json:"scope,omitempty"`
-	Binding     string            `json:"binding,omitempty"`
-	Group       string            `json:"-"`
-	State       map[string]any    `json:"state,omitempty"`
-	Hovered     bool              `json:"hovered,omitempty"`
-	Pressed     bool              `json:"pressed,omitempty"`
-	Focused     bool              `json:"focused,omitempty"`
-	FocusOrder  int               `json:"focus_order"`
-	PaintOrder  int               `json:"paint_order"`
-	Operations  []string          `json:"operations,omitempty"`
-	Effects     []Effect          `json:"effects,omitempty"`
-	Actions     []document.Action `json:"-"`
-	Children    []*Node           `json:"children,omitempty"`
+	ID                   string            `json:"id"`
+	Handle               string            `json:"-"`
+	Type                 string            `json:"type"`
+	Name                 string            `json:"name,omitempty"`
+	Role                 string            `json:"role,omitempty"`
+	Label                string            `json:"label,omitempty"`
+	Value                any               `json:"value,omitempty"`
+	CommittedValue       any               `json:"committed_value,omitempty"`
+	Enabled              bool              `json:"enabled"`
+	Current              bool              `json:"current,omitempty"`
+	Checked              *bool             `json:"checked,omitempty"`
+	Selected             *bool             `json:"selected,omitempty"`
+	Expanded             *bool             `json:"expanded,omitempty"`
+	ReadOnly             bool              `json:"read_only,omitempty"`
+	Required             bool              `json:"required,omitempty"`
+	Multiline            bool              `json:"multiline,omitempty"`
+	Placeholder          string            `json:"placeholder,omitempty"`
+	Dirty                bool              `json:"dirty,omitempty"`
+	Touched              bool              `json:"touched,omitempty"`
+	Valid                *bool             `json:"valid,omitempty"`
+	Issues               any               `json:"issues,omitempty"`
+	SelectionStart       int               `json:"selection_start,omitempty"`
+	SelectionEnd         int               `json:"selection_end,omitempty"`
+	Composition          string            `json:"composition,omitempty"`
+	CompositionStart     int               `json:"composition_start,omitempty"`
+	CompositionEnd       int               `json:"composition_end,omitempty"`
+	Composing            bool              `json:"composing,omitempty"`
+	PlaceholderShown     bool              `json:"placeholder_shown,omitempty"`
+	InternalOffset       float64           `json:"internal_text_offset,omitempty"`
+	InternalTextViewport *Rect             `json:"internal_text_viewport,omitempty"`
+	Min                  *float64          `json:"min,omitempty"`
+	Max                  *float64          `json:"max,omitempty"`
+	Step                 *float64          `json:"step,omitempty"`
+	Orientation          string            `json:"orientation,omitempty"`
+	Visible              bool              `json:"visible"`
+	InViewport           bool              `json:"in_viewport"`
+	Bounds               *Rect             `json:"bounds"`
+	Clip                 *Rect             `json:"clip"`
+	Props                map[string]any    `json:"props,omitempty"`
+	Place                map[string]any    `json:"place,omitempty"`
+	Source               Source            `json:"source"`
+	Breadcrumb           []string          `json:"breadcrumb,omitempty"`
+	Scope                string            `json:"scope,omitempty"`
+	Binding              string            `json:"binding,omitempty"`
+	Form                 string            `json:"form,omitempty"`
+	FormHandle           string            `json:"-"`
+	Group                string            `json:"-"`
+	State                map[string]any    `json:"state,omitempty"`
+	Hovered              bool              `json:"hovered,omitempty"`
+	Pressed              bool              `json:"pressed,omitempty"`
+	Focused              bool              `json:"focused,omitempty"`
+	FocusOrder           int               `json:"focus_order"`
+	PaintOrder           int               `json:"paint_order"`
+	Operations           []string          `json:"operations,omitempty"`
+	Effects              []Effect          `json:"effects,omitempty"`
+	Actions              []document.Action `json:"-"`
+	Children             []*Node           `json:"children,omitempty"`
 }
 
 type Context struct {
@@ -113,6 +133,7 @@ type Envelope struct {
 // interaction state without discarding hidden nodes.
 func Build(root *project.Node, geometry map[string]Geometry, context Context) *Node {
 	tree := build(root, geometry, context, nil, false)
+	resolveFormIDs(tree)
 	assignFocusOrder(tree)
 	return tree
 }
@@ -126,7 +147,7 @@ func build(source *project.Node, geometry map[string]Geometry, context Context, 
 		ID:         semanticID(source, context.Screen, path),
 		Handle:     source.Handle,
 		Type:       source.Type,
-		Name:       source.Name,
+		Name:       authoredName(source),
 		Enabled:    !boolValue(source.Props["disabled"]),
 		Visible:    !hidden,
 		Props:      cloneMap(source.Props),
@@ -135,6 +156,7 @@ func build(source *project.Node, geometry map[string]Geometry, context Context, 
 		Breadcrumb: append([]string(nil), source.Breadcrumb...),
 		Scope:      source.Scope,
 		Binding:    source.Binding,
+		FormHandle: source.Form,
 		State:      cloneMap(context.Values[source.Scope]),
 		Hovered:    context.Hovered == source.Handle,
 		Pressed:    context.Pressed == source.Handle,
@@ -172,6 +194,42 @@ func build(source *project.Node, geometry map[string]Geometry, context Context, 
 			node.Actions = append(node.Actions, document.Action{Action: "navigate", To: target})
 		}
 	}
+	if source.Type == "form" {
+		node.Role = "form"
+		node.Label = node.Name
+		node.Operations = []string{"submit", "reset"}
+		for _, action := range source.On.Submit {
+			node.Effects = append(node.Effects, effect(action))
+			node.Actions = append(node.Actions, action)
+		}
+	}
+	if source.Type == "text_field" || source.Type == "text_area" {
+		node.Role = "textbox"
+		node.Label, _ = source.Props["label"].(string)
+		node.Value = source.Props["draft"]
+		node.CommittedValue = source.Props["committed"]
+		node.ReadOnly, _ = source.Props["read_only"].(bool)
+		node.Required, _ = source.Props["required"].(bool)
+		node.Multiline = source.Type == "text_area"
+		node.Placeholder, _ = source.Props["placeholder"].(string)
+		node.Dirty, _ = source.Props["dirty"].(bool)
+		node.Touched, _ = source.Props["touched"].(bool)
+		node.Issues = source.Props["issues"]
+		node.SelectionStart = intValue(source.Props["selection_start"])
+		node.SelectionEnd = intValue(source.Props["selection_end"])
+		node.Composition, _ = source.Props["composition"].(string)
+		node.CompositionStart = intValue(source.Props["composition_start"])
+		node.CompositionEnd = intValue(source.Props["composition_end"])
+		node.Composing, _ = source.Props["composing"].(bool)
+		node.PlaceholderShown = node.Value == ""
+		if offset, ok := numericValue(source.Props["internal_offset"]); ok {
+			node.InternalOffset = offset
+		}
+		if valid, ok := source.Props["valid"].(bool); ok {
+			node.Valid = boolPointer(valid)
+		}
+		node.Operations = []string{"set_draft", "set_value", "focus", "select_all"}
+	}
 	applyControlSemantics(node, source)
 	for index, child := range source.Children {
 		childPath := append(append([]int(nil), path...), index)
@@ -181,11 +239,38 @@ func build(source *project.Node, geometry map[string]Geometry, context Context, 
 	return node
 }
 
+func resolveFormIDs(root *Node) {
+	byHandle := make(map[string]string)
+	for _, node := range Flatten(root) {
+		if node.Role == "form" {
+			byHandle[node.Handle] = node.ID
+		}
+	}
+	for _, node := range Flatten(root) {
+		if node.FormHandle != "" {
+			node.Form = byHandle[node.FormHandle]
+		}
+	}
+}
+
 func annotateComposite(node *Node) {
 	if node == nil {
 		return
 	}
 	switch node.Type {
+	case "text_field", "text_area":
+		for _, child := range node.Children {
+			if child == nil || child.Type != "field_box" {
+				continue
+			}
+			node.InternalTextViewport = &Rect{
+				X:      intValue(child.Props["internal_viewport_x"]),
+				Y:      intValue(child.Props["internal_viewport_y"]),
+				Width:  intValue(child.Props["internal_viewport_width"]),
+				Height: intValue(child.Props["internal_viewport_height"]),
+			}
+			break
+		}
 	case "radio_group":
 		for _, child := range node.Children {
 			if child != nil && child.Type == "radio" {
@@ -364,7 +449,7 @@ func assignFocusOrder(root *Node) {
 			return
 		}
 		switch node.Type {
-		case "button", "link", "toggle", "checkbox", "select", "slider", "stepper":
+		case "button", "link", "text_field", "text_area", "toggle", "checkbox", "select", "slider", "stepper":
 			if node.Visible && node.Enabled && node.Bounds != nil {
 				candidates[node.Handle] = true
 			}
@@ -442,7 +527,7 @@ func semanticID(node *project.Node, screen string, path []int) string {
 			result.WriteString(escape(segment))
 		}
 		result.WriteString("/node/")
-		result.WriteString(escape(node.Name))
+		result.WriteString(escape(authoredName(node)))
 		return result.String()
 	}
 	if len(path) == 0 {
@@ -455,9 +540,24 @@ func semanticID(node *project.Node, screen string, path []int) string {
 	return prefix + "/path/0/" + strings.Join(parts, "/")
 }
 
+func authoredName(node *project.Node) string {
+	if node.SourceName != "" {
+		return node.SourceName
+	}
+	return node.Name
+}
+
+// StableID returns the reload-stable semantic ID of a named runtime node.
+func StableID(node *project.Node, screen string) string {
+	if node == nil || !namedInteractive(node.Type) {
+		return ""
+	}
+	return semanticID(node, screen, nil)
+}
+
 func namedInteractive(nodeType string) bool {
 	switch nodeType {
-	case "button", "link", "toggle", "checkbox", "radio_group", "radio", "tabs", "tab", "select", "option", "slider", "stepper":
+	case "form", "button", "link", "text_field", "text_area", "toggle", "checkbox", "radio_group", "radio", "tabs", "tab", "select", "option", "slider", "stepper":
 		return true
 	default:
 		return false
@@ -479,6 +579,19 @@ func rect(value image.Rectangle) *Rect {
 func boolValue(value any) bool {
 	result, _ := value.(bool)
 	return result
+}
+
+func intValue(value any) int {
+	switch value := value.(type) {
+	case int:
+		return value
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
+	default:
+		return 0
+	}
 }
 
 func boolPointer(value bool) *bool { return &value }

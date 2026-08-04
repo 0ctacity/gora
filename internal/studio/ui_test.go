@@ -16,8 +16,10 @@ import (
 	"gioui.org/unit"
 	"gioui.org/widget/material"
 
+	"gora/internal/interaction"
 	"gora/internal/project"
 	"gora/internal/render"
+	"gora/internal/semantic"
 )
 
 func TestLayoutPreviewKeepsResolvedNodesAsNativeFrameEntries(t *testing.T) {
@@ -352,5 +354,95 @@ func TestCombinedViewportEditorsProduceOneViewport(t *testing.T) {
 	}
 	if viewport != image.Pt(1440, 900) {
 		t.Fatalf("viewport = %v", viewport)
+	}
+}
+
+func TestLiveCaretPhaseDoesNotChangeDeterministicCaptureState(t *testing.T) {
+	snapshot := Snapshot{Transient: interaction.Transient{Focused: "name-field"}}
+	visible := liveRenderState(snapshot, time.UnixMilli(0), time.Time{})
+	hidden := liveRenderState(snapshot, time.UnixMilli(500), time.Time{})
+	if visible.CaretHidden || !hidden.CaretHidden {
+		t.Fatalf("live caret phases = visible:%v hidden:%v", visible.CaretHidden, hidden.CaretHidden)
+	}
+	if renderState(snapshot).CaretHidden {
+		t.Fatal("deterministic capture state must keep the focused caret visible")
+	}
+}
+
+func TestLiveCaretMovementRestartsVisibleBlinkPhase(t *testing.T) {
+	snapshot := Snapshot{Transient: interaction.Transient{Focused: "name-field"}}
+	restartedAt := time.UnixMilli(750)
+
+	if liveRenderState(snapshot, restartedAt, restartedAt).CaretHidden {
+		t.Fatal("caret must be visible immediately after movement")
+	}
+	if liveRenderState(snapshot, restartedAt.Add(499*time.Millisecond), restartedAt).CaretHidden {
+		t.Fatal("caret must remain visible for the first blink interval after movement")
+	}
+	if !liveRenderState(snapshot, restartedAt.Add(500*time.Millisecond), restartedAt).CaretHidden {
+		t.Fatal("caret must resume blinking after the movement interval")
+	}
+}
+
+func TestFieldPointerAndTripleClickUseSharedVisualLineGeometry(t *testing.T) {
+	field := &semantic.Node{Type: "text_area", Value: "abcd\nefgh", Children: []*semantic.Node{{
+		Type: "field_box", Bounds: &semantic.Rect{X: 0, Y: 0, Width: 18, Height: 48},
+		Props: map[string]any{"text": "abcd\nefgh", "field_multiline": true, "size": float64(10), "line_height": float64(12)},
+	}}}
+	if got := fieldRuneAtPoint(field, image.Pt(13, 25)); got != 7 {
+		t.Fatalf("pointer rune = %d, want 7", got)
+	}
+	start, end := fieldVisualLineRange(field, 7)
+	if start != 5 || end != 8 {
+		t.Fatalf("visual line range = %d..%d, want 5..8", start, end)
+	}
+}
+
+func TestReadOnlyFieldsAllowPointerSelectionButDisabledFieldsDoNot(t *testing.T) {
+	if !fieldAllowsPointerSelection(&semantic.Node{Role: "textbox", Enabled: true, ReadOnly: true}) {
+		t.Fatal("read-only field rejected pointer selection")
+	}
+	if fieldAllowsPointerSelection(&semantic.Node{Role: "textbox", Enabled: false}) {
+		t.Fatal("disabled field accepted pointer selection")
+	}
+}
+
+func TestInspectModeClearsFieldPointerSelectionOwnership(t *testing.T) {
+	state := &uiState{fieldPointerID: 7, fieldSelectionID: "screen/main/node/name", fieldAnchor: 3}
+	clearFieldSelectionOwnership(state)
+	if state.fieldPointerID != 0 || state.fieldSelectionID != "" || state.fieldAnchor != 0 {
+		t.Fatalf("field pointer ownership = %+v", state)
+	}
+}
+
+func TestFieldRedoUsesPlatformConventionalShortcuts(t *testing.T) {
+	if !fieldRedoShortcut(key.Name("Z"), key.ModShortcut|key.ModShift) {
+		t.Fatal("Shortcut+Shift+Z was not recognized as redo")
+	}
+	if !fieldRedoShortcut(key.Name("Y"), key.ModShortcut) {
+		t.Fatal("Shortcut+Y was not recognized as redo")
+	}
+	if fieldRedoShortcut(key.Name("Z"), key.ModShortcut) {
+		t.Fatal("plain Shortcut+Z was recognized as redo")
+	}
+}
+
+func TestTextAreaScrollTargetOwnsOnlyVisibleEnabledMultilineFields(t *testing.T) {
+	area := &semantic.Node{
+		ID: "notes", Type: "text_area", Enabled: true, Visible: true, InViewport: true,
+		Bounds: &semantic.Rect{X: 10, Y: 10, Width: 100, Height: 60},
+		Clip:   &semantic.Rect{X: 0, Y: 0, Width: 200, Height: 200},
+	}
+	root := &semantic.Node{Children: []*semantic.Node{area}}
+	if got := textAreaScrollTarget(root, image.Pt(20, 20)); got != area {
+		t.Fatalf("scroll target = %+v, want text area", got)
+	}
+	area.Enabled = false
+	if got := textAreaScrollTarget(root, image.Pt(20, 20)); got != nil {
+		t.Fatalf("disabled text area owned scrolling: %+v", got)
+	}
+	area.Enabled = true
+	if got := textAreaScrollTarget(root, image.Pt(150, 20)); got != nil {
+		t.Fatalf("outside point targeted text area: %+v", got)
 	}
 }

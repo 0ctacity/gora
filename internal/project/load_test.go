@@ -168,6 +168,46 @@ screens:
 	t.Fatalf("missing duplicate resolved choice diagnostic: %+v", diagnostics)
 }
 
+func TestLoadValidatesResolvedFieldProps(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "field.gora"), `
+gora: 1
+kind: component
+viewport: { width: 320, height: 180 }
+parameters:
+  pattern: { type: text, required: true }
+  minimum: { type: number, required: true }
+state:
+  value: { type: text, default: Ada }
+previews:
+  default: { parameters: { pattern: '[', minimum: 2.5 } }
+root:
+  type: text_field
+  name: value-field
+  props:
+    label: Value
+    bind: value
+    pattern: { ref: parameter.pattern }
+    min_length: { ref: parameter.minimum }
+  children:
+    - type: field_box
+`)
+
+	_, diagnostics := Load(root, filepath.Join(root, "field.gora"), 320)
+	for _, code := range []string{"field.pattern", "field.length"} {
+		found := false
+		for _, diagnostic := range diagnostics {
+			if diagnostic.Code == code {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("missing %s diagnostic: %+v", code, diagnostics)
+		}
+	}
+}
+
 func TestLoadResolvesPercentageDimensionsFromTokensAndParameters(t *testing.T) {
 	t.Parallel()
 
@@ -284,6 +324,217 @@ screens:
 	if slotText != (StateReference{Scope: "screen:main", Name: "title"}) {
 		t.Fatalf("slot ref = %#v", slotText)
 	}
+}
+
+func TestLoadKeepsCallerFieldScopeInsideComponentFormSlot(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "profile.gora"), `
+gora: 1
+kind: component
+viewport: { width: 320, height: 180 }
+state:
+  local_name: { type: text, default: Local }
+slots:
+  default: { required: true }
+previews:
+  default:
+    children:
+      - type: slot_content
+        props: { slot: default }
+        children: [{ type: spacer }]
+root:
+  type: form
+  name: profile-form
+  children:
+    - type: stack
+      children:
+        - type: text_field
+          name: local-field
+          props: { label: Local, bind: local_name }
+          children: [{ type: field_box }]
+        - type: slot
+          props: { name: default }
+`)
+	writeFile(t, filepath.Join(root, "app.gora"), `
+gora: 1
+kind: app
+imports: { components: { profile: profile.gora } }
+viewport: { width: 800, height: 600 }
+state:
+  caller_name: { type: text, default: Caller }
+entry: main
+screens:
+  main:
+    type: instance
+    name: profile
+    props: { component: profile }
+    children:
+      - type: slot_content
+        children:
+          - type: text_field
+            name: caller-field
+            props: { label: Caller, bind: caller_name }
+            children: [{ type: field_box }]
+`)
+	loaded, diagnostics := Load(root, filepath.Join(root, "app.gora"), 800)
+	if len(diagnostics) != 0 {
+		t.Fatalf("Load returned diagnostics: %+v", diagnostics)
+	}
+	byName := make(map[string]*Node)
+	var walk func(*Node)
+	walk = func(node *Node) {
+		if node == nil {
+			return
+		}
+		if node.Name != "" {
+			byName[node.Name] = node
+		}
+		for _, child := range node.Children {
+			walk(child)
+		}
+	}
+	walk(loaded.Screens["main"])
+	local, caller := byName["local-field"], byName["caller-field"]
+	if local == nil || caller == nil {
+		t.Fatalf("expanded fields = %+v", byName)
+	}
+	if local.Scope != "screen:main/profile" || caller.Scope != "screen:main" {
+		t.Fatalf("field scopes local=%q caller=%q", local.Scope, caller.Scope)
+	}
+	if local.Form == "" || caller.Form != local.Form {
+		t.Fatalf("form handles local=%q caller=%q", local.Form, caller.Form)
+	}
+}
+
+func TestLoadRejectsFormNestedThroughComponentSlotExpansion(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "shell.gora"), `
+gora: 1
+kind: component
+viewport: { width: 320, height: 180 }
+slots:
+  default: { required: true }
+previews:
+  default:
+    children:
+      - type: slot_content
+        children: [{ type: spacer }]
+root:
+  type: form
+  name: outer-form
+  children:
+    - type: slot
+      props: { name: default }
+`)
+	writeFile(t, filepath.Join(root, "app.gora"), `
+gora: 1
+kind: app
+imports: { components: { shell: shell.gora } }
+viewport: { width: 800, height: 600 }
+entry: main
+screens:
+  main:
+    type: instance
+    name: shell
+    props: { component: shell }
+    children:
+      - type: slot_content
+        children:
+          - type: form
+            name: inner-form
+            children: [{ type: spacer }]
+`)
+
+	_, diagnostics := Load(root, filepath.Join(root, "app.gora"), 800)
+	found := false
+	for _, diagnostic := range diagnostics {
+		found = found || diagnostic.Code == "form.nested"
+	}
+	if !found {
+		t.Fatalf("diagnostics = %+v, want form.nested", diagnostics)
+	}
+}
+
+func TestLoadRejectsFormCardinalityChangedBySlotExpansion(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "shell.gora"), `
+gora: 1
+kind: component
+viewport: { width: 320, height: 180 }
+slots:
+  default: { required: true }
+previews:
+  default:
+    children:
+      - type: slot_content
+        children: [{ type: spacer }]
+root:
+  type: form
+  name: profile-form
+  children:
+    - type: slot
+      props: { name: default }
+`)
+	writeFile(t, filepath.Join(root, "app.gora"), `
+gora: 1
+kind: app
+imports: { components: { shell: shell.gora } }
+viewport: { width: 800, height: 600 }
+entry: main
+screens:
+  main:
+    type: instance
+    name: shell
+    props: { component: shell }
+    children:
+      - type: slot_content
+        children:
+          - { type: spacer }
+          - { type: spacer }
+`)
+
+	_, diagnostics := Load(root, filepath.Join(root, "app.gora"), 800)
+	requireProjectDiagnostic(t, diagnostics, "schema.children")
+}
+
+func TestLoadRejectsInteractiveComponentInsideFieldSupport(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "action.gora"), `
+gora: 1
+kind: component
+viewport: { width: 160, height: 60 }
+previews:
+  default: {}
+root:
+  type: button
+  name: nested-button
+  props: { label: Nested }
+  children:
+    - { type: text, props: { text: Nested } }
+`)
+	writeFile(t, filepath.Join(root, "app.gora"), `
+gora: 1
+kind: app
+imports: { components: { action: action.gora } }
+viewport: { width: 800, height: 600 }
+state:
+  name: { type: text, default: Ada }
+entry: main
+screens:
+  main:
+    type: text_field
+    name: name-field
+    props: { label: Name, bind: name }
+    children:
+      - { type: field_box }
+      - type: field_support
+        children:
+          - type: instance
+            props: { component: action }
+`)
+
+	_, diagnostics := Load(root, filepath.Join(root, "app.gora"), 800)
+	requireProjectDiagnostic(t, diagnostics, "control.nested")
 }
 
 func TestLoadRejectsUnnamedStatefulComponentInstance(t *testing.T) {

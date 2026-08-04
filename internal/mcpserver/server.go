@@ -100,6 +100,13 @@ type SetControlValueInput struct {
 	Value      any    `json:"value"`
 }
 
+type SetFieldDraftInput struct {
+	ProjectID  string `json:"project_id"`
+	ViewID     string `json:"view_id"`
+	SemanticID string `json:"semantic_id"`
+	Draft      string `json:"draft"`
+}
+
 type ResetStateInput struct {
 	ProjectID string `json:"project_id"`
 	ViewID    string `json:"view_id"`
@@ -115,6 +122,15 @@ type ControlValueOutput struct {
 	ProjectID string      `json:"project_id"`
 	View      ViewSummary `json:"view"`
 	Value     any         `json:"value"`
+}
+
+type FieldDraftOutput struct {
+	ProjectID string      `json:"project_id"`
+	View      ViewSummary `json:"view"`
+	Draft     string      `json:"draft"`
+	Value     any         `json:"value"`
+	Valid     bool        `json:"valid"`
+	Issues    any         `json:"issues,omitempty"`
 }
 
 type CaptureInput struct {
@@ -317,6 +333,56 @@ func (s *Service) registerRuntimeTools() {
 			return nil, ControlValueOutput{}, err
 		}
 		return nil, ControlValueOutput{ProjectID: input.ProjectID, View: view, Value: value}, nil
+	})
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_set_field_draft", Description: "Set one visible editable field's draft; valid typed values publish immediately.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input SetFieldDraftInput) (*mcp.CallToolResult, FieldDraftOutput, error) {
+		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
+		if err == nil {
+			err = runtime.SetFieldDraft(input.SemanticID, input.Draft)
+		}
+		if err != nil {
+			return nil, FieldDraftOutput{}, err
+		}
+		view, err := s.registry.ViewSummary(input.ProjectID, input.ViewID)
+		if err != nil {
+			return nil, FieldDraftOutput{}, err
+		}
+		tree, err := runtime.RuntimeTree()
+		if err != nil {
+			return nil, FieldDraftOutput{}, err
+		}
+		var field *semantic.Node
+		for _, node := range semantic.Flatten(tree) {
+			if node.ID == input.SemanticID {
+				field = node
+				break
+			}
+		}
+		if field == nil || field.Role != "textbox" {
+			return nil, FieldDraftOutput{}, fmt.Errorf("unknown semantic field %q", input.SemanticID)
+		}
+		s.notifyView(input.ProjectID, input.ViewID)
+		valid := field.Valid != nil && *field.Valid
+		return nil, FieldDraftOutput{ProjectID: input.ProjectID, View: view, Draft: fmt.Sprint(field.Value), Value: field.CommittedValue, Valid: valid, Issues: field.Issues}, nil
+	})
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_submit_form", Description: "Validate and submit one local form by semantic ID.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input ActivateInput) (*mcp.CallToolResult, RuntimeMutationOutput, error) {
+		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
+		if err == nil {
+			err = runtime.SubmitForm(input.SemanticID)
+		}
+		if err != nil {
+			return nil, RuntimeMutationOutput{}, err
+		}
+		return s.runtimeMutation(input.ProjectID, input.ViewID)
+	})
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_reset_form", Description: "Reset only the states bound to fields in one local form.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input ActivateInput) (*mcp.CallToolResult, RuntimeMutationOutput, error) {
+		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
+		if err == nil {
+			err = runtime.ResetForm(input.SemanticID)
+		}
+		if err != nil {
+			return nil, RuntimeMutationOutput{}, err
+		}
+		return s.runtimeMutation(input.ProjectID, input.ViewID)
 	})
 	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_reset_state", Description: "Reset one state scope or the selected view context.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input ResetStateInput) (*mcp.CallToolResult, RuntimeMutationOutput, error) {
 		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)

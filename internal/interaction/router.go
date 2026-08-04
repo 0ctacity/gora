@@ -278,7 +278,7 @@ func (r *Router) TakeValueChange() (ControlValueChange, bool) {
 
 func interactiveRole(role string) bool {
 	switch role {
-	case "button", "link", "switch", "checkbox", "radio", "tab", "combobox", "option", "slider", "spinbutton":
+	case "button", "link", "textbox", "switch", "checkbox", "radio", "tab", "combobox", "option", "slider", "spinbutton":
 		return true
 	default:
 		return false

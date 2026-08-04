@@ -214,6 +214,94 @@ func (s *Store) SetValues(scopeID string, values map[string]any) error {
 	return nil
 }
 
+// SetScopedValues validates every lexical scope before committing any field value.
+func (s *Store) SetScopedValues(values map[string]map[string]any) error {
+	working := make(map[string]map[string]any, len(values))
+	for scopeID, changes := range values {
+		scope, ok := s.scopes[scopeID]
+		if !ok {
+			return fmt.Errorf("unknown state scope %q", scopeID)
+		}
+		copy := cloneValues(scope.current)
+		for name, value := range changes {
+			declaration, ok := scope.declarations[name]
+			if !ok {
+				return fmt.Errorf("unknown state %q in scope %q", name, scopeID)
+			}
+			value = normalizeForDeclaration(declaration, value)
+			if !valueMatches(declaration, value) {
+				return fmt.Errorf("value does not match %s state %q", declaration.Type, name)
+			}
+			copy[name] = value
+		}
+		working[scopeID] = copy
+	}
+	changed := false
+	for scopeID, values := range working {
+		if !reflect.DeepEqual(s.scopes[scopeID].current, values) {
+			s.scopes[scopeID].current = values
+			changed = true
+		}
+	}
+	if changed {
+		s.revision++
+	}
+	return nil
+}
+
+// ApplyForm atomically publishes field values and reduces submit actions over
+// the resulting working state. Nothing is committed when either phase fails.
+func (s *Store) ApplyForm(values map[string]map[string]any, actionScope string, actions []document.Action) (*document.Action, error) {
+	working := NewStore()
+	working.revision = s.revision
+	for id, source := range s.scopes {
+		working.scopes[id] = &scope{
+			context:      source.context,
+			declarations: cloneDeclarations(source.declarations),
+			initial:      cloneValues(source.initial),
+			current:      cloneValues(source.current),
+		}
+	}
+	if err := working.SetScopedValues(values); err != nil {
+		return nil, err
+	}
+	navigation, err := working.ApplyActivation(actionScope, actions)
+	if err != nil {
+		return nil, err
+	}
+	changed := false
+	for id, candidate := range working.scopes {
+		if !reflect.DeepEqual(s.scopes[id].current, candidate.current) {
+			s.scopes[id].current = cloneValues(candidate.current)
+			changed = true
+		}
+	}
+	if changed {
+		s.revision++
+	}
+	return navigation, nil
+}
+
+// ResetScopedValues resets only the named form-bound declarations.
+func (s *Store) ResetScopedValues(names map[string][]string) error {
+	changes := make(map[string]map[string]any, len(names))
+	for scopeID, fields := range names {
+		scope, ok := s.scopes[scopeID]
+		if !ok {
+			return fmt.Errorf("unknown state scope %q", scopeID)
+		}
+		changes[scopeID] = make(map[string]any, len(fields))
+		for _, name := range fields {
+			value, ok := scope.initial[name]
+			if !ok {
+				return fmt.Errorf("unknown state %q in scope %q", name, scopeID)
+			}
+			changes[scopeID][name] = value
+		}
+	}
+	return s.SetScopedValues(changes)
+}
+
 // ResetScope restores one lexical scope to its declared initial values.
 func (s *Store) ResetScope(scopeID string) error {
 	scope, ok := s.scopes[scopeID]

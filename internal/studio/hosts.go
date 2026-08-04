@@ -8,9 +8,11 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"gioui.org/app"
 	"gioui.org/io/event"
+	"gioui.org/io/key"
 	"gioui.org/io/pointer"
 	"gioui.org/io/system"
 	"gioui.org/layout"
@@ -104,9 +106,17 @@ func layoutAppContent(gtx layout.Context, theme *material.Theme, runtime *Runtim
 	hardClip := clip.Rect{Max: pixelSize}.Push(gtx.Ops)
 	event.Op(gtx.Ops, &state.zoomInput)
 	event.Op(gtx.Ops, &state.interactionInput)
+	if field := focusedTextField(state); field != nil {
+		hint := key.HintText
+		if _, ok := field.Props["committed"].(float64); ok {
+			hint = key.HintNumeric
+		}
+		key.InputHintOp{Tag: &state.interactionInput, Hint: hint}.Add(gtx.Ops)
+		gtx.Execute(op.InvalidateCmd{At: frameTime(gtx.Now).Add(500 * time.Millisecond)})
+	}
 	previewGtx := gtx
 	previewGtx.Constraints = layout.Exact(pixelSize)
-	result := state.preview.Layout(previewGtx, theme, snapshot.Root, snapshot.Viewport, renderState(snapshot))
+	result := state.preview.Layout(previewGtx, theme, snapshot.Root, snapshot.Viewport, liveRenderState(snapshot, gtx.Now, state.caretBlinkStart))
 	layoutPreviewScrollbar(previewGtx, theme, runtime, state, snapshot, result, window)
 	state.runtimeTree = result.Tree
 	runtime.PublishTree(result.Tree)

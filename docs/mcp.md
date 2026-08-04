@@ -51,10 +51,18 @@ two-space Gora YAML; comments and prior manual formatting in those files are
 discarded. Unchanged files remain byte-identical.
 
 `gora_set_control_value` accepts a semantic control ID and typed value, so an
-agent can operate toggles, choice groups, selects, sliders, and steppers
+agent can operate fields, toggles, choice groups, selects, sliders, and steppers
 without discovering lexical scope IDs. Choice values must name an enabled
 option. Numeric values use the bound state's clamp-and-step normalization. The
 result includes the normalized value and updated view/tree resource links.
+
+Fields additionally expose `gora_set_field_draft`. Valid drafts publish their
+typed or normalized value immediately; invalid or incomplete drafts remain
+visible while preserving the last valid bound value. `gora_submit_form`
+validates and atomically synchronizes a form's enabled field drafts before
+running authored submit effects; `gora_reset_form` restores only bindings
+represented by that form.
+All three require `project_id`, `view_id`, and a stable semantic field/form ID.
 
 ## Resources and subscriptions
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"io"
 	"math"
 	"os"
 	"os/signal"
@@ -17,10 +18,12 @@ import (
 
 	"gioui.org/app"
 	"gioui.org/f32"
+	"gioui.org/io/clipboard"
 	"gioui.org/io/event"
 	"gioui.org/io/key"
 	"gioui.org/io/pointer"
 	"gioui.org/io/system"
+	"gioui.org/io/transfer"
 	"gioui.org/layout"
 	"gioui.org/op"
 	"gioui.org/op/clip"
@@ -36,6 +39,8 @@ import (
 	"gora/internal/semantic"
 	"gora/internal/session"
 )
+
+const fieldClipboardMIME = "application/text"
 
 type uiState struct {
 	nextScreen        widget.Clickable
@@ -71,6 +76,13 @@ type uiState struct {
 	inspectPending    bool
 	inspectPoint      image.Point
 	resetState        widget.Clickable
+	fieldPointerID    int
+	fieldSelectionID  string
+	fieldAnchor       int
+	lastFieldClick    time.Duration
+	lastFieldClickID  string
+	caretBlinkStart   time.Time
+	fieldClickCount   int
 }
 
 type checkerboardCache struct {
@@ -206,6 +218,14 @@ func layoutStudioCanvas(gtx layout.Context, theme *material.Theme, runtime *Runt
 	hardClip := clip.Rect{Max: viewport}.Push(gtx.Ops)
 	event.Op(gtx.Ops, &state.zoomInput)
 	event.Op(gtx.Ops, &state.interactionInput)
+	if field := focusedTextField(state); field != nil {
+		hint := key.HintText
+		if _, ok := field.Props["committed"].(float64); ok {
+			hint = key.HintNumeric
+		}
+		key.InputHintOp{Tag: &state.interactionInput, Hint: hint}.Add(gtx.Ops)
+		gtx.Execute(op.InvalidateCmd{At: frameTime(gtx.Now).Add(500 * time.Millisecond)})
+	}
 	position := canvasPosition(viewport, size, state.canvasPan)
 	offset := op.Offset(position).Push(gtx.Ops)
 	previewGtx.Constraints = layout.Exact(size)
@@ -215,7 +235,7 @@ func layoutStudioCanvas(gtx layout.Context, theme *material.Theme, runtime *Runt
 		theme,
 		snapshot.Root,
 		snapshot.Viewport,
-		renderState(snapshot),
+		liveRenderState(snapshot, gtx.Now, state.caretBlinkStart),
 	)
 	if state.inspecting && state.selectedHandle != "" {
 		paintHighlight(previewGtx, result.Bounds[state.selectedHandle])
@@ -270,6 +290,31 @@ func renderState(snapshot Snapshot) render.State {
 		Hovered: snapshot.Transient.Hovered, Pressed: snapshot.Transient.Pressed, Focused: snapshot.Transient.Focused,
 		OpenSelect: snapshot.Transient.OpenSelect, ActiveOption: snapshot.Transient.ActiveOption,
 	}
+}
+
+func liveRenderState(snapshot Snapshot, now, caretBlinkStart time.Time) render.State {
+	state := renderState(snapshot)
+	now = frameTime(now)
+	if snapshot.Transient.Focused == "" {
+		return state
+	}
+	if !caretBlinkStart.IsZero() {
+		elapsed := now.Sub(caretBlinkStart)
+		if elapsed < 0 {
+			elapsed = 0
+		}
+		state.CaretHidden = (elapsed/(500*time.Millisecond))%2 == 1
+		return state
+	}
+	state.CaretHidden = (now.UnixMilli()/500)%2 == 1
+	return state
+}
+
+func frameTime(now time.Time) time.Time {
+	if now.IsZero() {
+		return time.Now()
+	}
+	return now
 }
 
 func paintCheckerboard(operations *op.Ops, size image.Point, tile int) {
@@ -441,7 +486,23 @@ func handleActions(gtx layout.Context, runtime *Runtime, state *uiState, snapsho
 		state.router = interaction.NewRouter()
 	}
 	handleDocumentInteraction(gtx, runtime, state, window)
-	zoomScroll, horizontalScroll, verticalScroll := canvasScrollEvents(gtx, state)
+	scrollEvents := collectCanvasScrollEvents(gtx, state)
+	zoomScroll, horizontalScroll, verticalScroll := scrollEvents.zoom, scrollEvents.horizontal, scrollEvents.vertical
+	for _, fieldScroll := range scrollEvents.fields {
+		if columns, ok := fieldVisualColumns(fieldScroll.field); ok {
+			runtime.SetFieldVisualColumns(fieldScroll.field.ID, columns)
+		}
+		lines := int(math.Round(float64(fieldScroll.delta) / 16))
+		if lines == 0 {
+			lines = 1
+			if fieldScroll.delta < 0 {
+				lines = -1
+			}
+		}
+		if !runtime.ScrollFieldInternal(fieldScroll.field.ID, lines) {
+			verticalScroll += fieldScroll.delta
+		}
+	}
 	axis, scroll := dominantPageScroll(horizontalScroll, verticalScroll)
 	blockPageScroll := state.blockPageScroll(gtx.Now, zoomScroll, scroll)
 	if zoomScroll != 0 {
@@ -490,6 +551,7 @@ func handleActions(gtx layout.Context, runtime *Runtime, state *uiState, snapsho
 		state.selectedHandle = ""
 		state.inspectPressed = false
 		state.inspectPending = false
+		clearFieldSelectionOwnership(state)
 		state.router.SetInspecting(state.inspecting)
 		runtime.SetTransient(state.router.Transient())
 	}
@@ -527,9 +589,24 @@ func handleActions(gtx layout.Context, runtime *Runtime, state *uiState, snapsho
 	_ = window
 }
 
+func clearFieldSelectionOwnership(state *uiState) {
+	if state == nil {
+		return
+	}
+	state.fieldPointerID = 0
+	state.fieldSelectionID = ""
+	state.fieldAnchor = 0
+}
+
 func handleDocumentInteraction(gtx layout.Context, runtime *Runtime, state *uiState, window *app.Window) {
 	before := state.router.Transient()
 	mutated := false
+	if field := focusedTextField(state); field != nil {
+		text, _ := field.Value.(string)
+		start, end, _ := runtime.FieldRuneSelection(field.ID)
+		gtx.Execute(key.SnippetCmd{Tag: &state.interactionInput, Snippet: key.Snippet{Range: key.Range{Start: 0, End: len([]rune(text))}, Text: text}})
+		gtx.Execute(key.SelectionCmd{Tag: &state.interactionInput, Range: key.Range{Start: start, End: end}})
+	}
 	pointerFilter := pointer.Filter{
 		Target: &state.interactionInput,
 		Kinds:  pointer.Enter | pointer.Leave | pointer.Move | pointer.Drag | pointer.Press | pointer.Release | pointer.Cancel,
@@ -548,6 +625,14 @@ func handleDocumentInteraction(gtx layout.Context, runtime *Runtime, state *uiSt
 		switch event.Kind {
 		case pointer.Enter, pointer.Move, pointer.Drag:
 			state.router.Move(point, touch)
+			if event.Kind == pointer.Drag && state.fieldSelectionID != "" && state.fieldPointerID == int(event.PointerID) {
+				if field := semanticNodeByID(state.runtimeTree, state.fieldSelectionID); field != nil {
+					caret := fieldRuneAtPoint(field, point)
+					if err := runtime.SetFieldSelection(field.ID, state.fieldAnchor, caret); err == nil {
+						mutated = true
+					}
+				}
+			}
 		case pointer.Leave:
 			state.router.Move(image.Pt(-1, -1), touch)
 		case pointer.Press:
@@ -559,11 +644,38 @@ func handleDocumentInteraction(gtx layout.Context, runtime *Runtime, state *uiSt
 					continue
 				}
 				if state.router.Press(int(event.PointerID), point) {
+					if field := hitTextField(state.runtimeTree, point); fieldAllowsPointerSelection(field) {
+						caret := fieldRuneAtPoint(field, point)
+						if state.lastFieldClickID == field.ID && event.Time-state.lastFieldClick <= 400*time.Millisecond {
+							state.fieldClickCount++
+						} else {
+							state.fieldClickCount = 1
+						}
+						state.lastFieldClick = event.Time
+						state.lastFieldClickID = field.ID
+						start, end := caret, caret
+						if event.Modifiers.Contain(key.ModShift) {
+							start, _, _ = runtime.FieldRuneSelection(field.ID)
+						} else if state.fieldClickCount == 2 {
+							start, end = wordRuneRange(fmt.Sprint(field.Value), caret)
+						} else if state.fieldClickCount >= 3 {
+							start, end = fieldVisualLineRange(field, caret)
+							state.fieldClickCount = 0
+						}
+						_ = runtime.SetFieldSelection(field.ID, start, end)
+						state.fieldPointerID = int(event.PointerID)
+						state.fieldSelectionID = field.ID
+						state.fieldAnchor = start
+						mutated = true
+					}
 					gtx.Execute(pointer.GrabCmd{Tag: &state.interactionInput, ID: event.PointerID})
 					gtx.Execute(key.FocusCmd{Tag: &state.interactionInput})
 				}
 			}
 		case pointer.Release:
+			if state.fieldPointerID == int(event.PointerID) {
+				state.fieldSelectionID = ""
+			}
 			if state.inspecting {
 				if state.inspectPressed && state.inspectPointerID == int(event.PointerID) {
 					state.inspectPressed = false
@@ -580,6 +692,9 @@ func handleDocumentInteraction(gtx layout.Context, runtime *Runtime, state *uiSt
 				}
 			}
 		case pointer.Cancel:
+			if state.fieldPointerID == int(event.PointerID) {
+				state.fieldSelectionID = ""
+			}
 			if state.inspecting && state.inspectPointerID == int(event.PointerID) {
 				state.inspectPressed = false
 				continue
@@ -588,20 +703,29 @@ func handleDocumentInteraction(gtx layout.Context, runtime *Runtime, state *uiSt
 		}
 	}
 
+	movementModifiers := key.ModShift | key.ModAlt | key.ModCtrl | key.ModShortcut
 	filters := []key.Filter{
 		{Focus: &state.interactionInput, Name: key.NameTab, Optional: key.ModShift},
-		{Focus: &state.interactionInput, Name: key.NameReturn},
-		{Focus: &state.interactionInput, Name: key.NameEnter},
+		{Focus: &state.interactionInput, Name: key.NameReturn, Optional: key.ModShortcut},
+		{Focus: &state.interactionInput, Name: key.NameEnter, Optional: key.ModShortcut},
 		{Focus: &state.interactionInput, Name: key.NameSpace},
 		{Focus: &state.interactionInput, Name: key.NameEscape},
-		{Focus: &state.interactionInput, Name: key.NameLeftArrow},
-		{Focus: &state.interactionInput, Name: key.NameRightArrow},
-		{Focus: &state.interactionInput, Name: key.NameUpArrow},
-		{Focus: &state.interactionInput, Name: key.NameDownArrow},
-		{Focus: &state.interactionInput, Name: key.NameHome},
-		{Focus: &state.interactionInput, Name: key.NameEnd},
+		{Focus: &state.interactionInput, Name: key.NameLeftArrow, Optional: movementModifiers},
+		{Focus: &state.interactionInput, Name: key.NameRightArrow, Optional: movementModifiers},
+		{Focus: &state.interactionInput, Name: key.NameUpArrow, Optional: movementModifiers},
+		{Focus: &state.interactionInput, Name: key.NameDownArrow, Optional: movementModifiers},
+		{Focus: &state.interactionInput, Name: key.NameHome, Optional: movementModifiers},
+		{Focus: &state.interactionInput, Name: key.NameEnd, Optional: movementModifiers},
+		{Focus: &state.interactionInput, Name: key.NameDeleteBackward, Optional: movementModifiers},
+		{Focus: &state.interactionInput, Name: key.NameDeleteForward, Optional: movementModifiers},
 		{Focus: &state.interactionInput, Name: key.NamePageUp},
 		{Focus: &state.interactionInput, Name: key.NamePageDown},
+		{Focus: &state.interactionInput, Name: key.Name("C"), Required: key.ModShortcut},
+		{Focus: &state.interactionInput, Name: key.Name("X"), Required: key.ModShortcut},
+		{Focus: &state.interactionInput, Name: key.Name("V"), Required: key.ModShortcut},
+		{Focus: &state.interactionInput, Name: key.Name("A"), Required: key.ModShortcut},
+		{Focus: &state.interactionInput, Name: key.Name("Z"), Required: key.ModShortcut, Optional: key.ModShift},
+		{Focus: &state.interactionInput, Name: key.Name("Y"), Required: key.ModShortcut},
 	}
 	for _, filter := range filters {
 		for {
@@ -614,8 +738,118 @@ func handleDocumentInteraction(gtx layout.Context, runtime *Runtime, state *uiSt
 				continue
 			}
 			if event.Name == key.NameTab && event.State == key.Press {
+				if field := focusedTextField(state); field != nil {
+					mutated = runtime.TouchField(field.ID) || mutated
+				}
 				state.router.FocusNext(event.Modifiers.Contain(key.ModShift))
 				continue
+			}
+			if field := focusedTextField(state); field != nil && event.State == key.Press && event.Modifiers.Contain(key.ModShortcut) {
+				switch event.Name {
+				case key.Name("C"), key.Name("X"):
+					if selected, ok := runtime.FieldSelectedText(field.ID); ok {
+						gtx.Execute(clipboard.WriteCmd{Type: fieldClipboardMIME, Data: io.NopCloser(strings.NewReader(selected))})
+					}
+					if event.Name == key.Name("X") && !field.ReadOnly {
+						start, end, _ := runtime.FieldRuneSelection(field.ID)
+						_ = runtime.ApplyFieldEdit(field.ID, start, end, "")
+						mutated = true
+					}
+				case key.Name("V"):
+					if !field.ReadOnly {
+						gtx.Execute(clipboard.ReadCmd{Tag: &state.interactionInput})
+					}
+				case key.Name("A"):
+					if draft, ok := runtime.FieldDraft(field.ID); ok {
+						_ = runtime.SetFieldSelection(field.ID, 0, len([]rune(draft)))
+						mutated = true
+					}
+				case key.Name("Z"), key.Name("Y"):
+					if fieldRedoShortcut(event.Name, event.Modifiers) {
+						mutated = runtime.RedoField(field.ID) || mutated
+					} else {
+						mutated = runtime.UndoField(field.ID) || mutated
+					}
+				}
+				continue
+			}
+			if field := focusedTextField(state); field != nil && event.State == key.Press && (event.Name == key.NameReturn || event.Name == key.NameEnter) {
+				if field.Type == "text_area" && !event.Modifiers.Contain(key.ModShortcut) {
+					start, end, _ := runtime.FieldRuneSelection(field.ID)
+					if err := runtime.ApplyFieldEdit(field.ID, start, end, "\n"); err != nil {
+						state.status = err.Error()
+					} else {
+						mutated = true
+					}
+					continue
+				}
+				if form := semanticNodeByHandle(state.runtimeTree, field.FormHandle); form != nil {
+					if err := runtime.SubmitForm(form.ID); err != nil {
+						state.status = err.Error()
+					} else {
+						mutated = true
+					}
+				}
+				continue
+			}
+			if field := focusedTextField(state); field != nil {
+				if event.State != key.Press {
+					continue
+				}
+				extend := event.Modifiers.Contain(key.ModShift)
+				word := event.Modifiers.Contain(key.ModAlt) || event.Modifiers.Contain(key.ModCtrl)
+				movement := ""
+				switch event.Name {
+				case key.NameLeftArrow:
+					movement = "grapheme-left"
+					if word {
+						movement = "word-left"
+					}
+				case key.NameRightArrow:
+					movement = "grapheme-right"
+					if word {
+						movement = "word-right"
+					}
+				case key.NameUpArrow:
+					if field.Multiline {
+						movement = "line-up"
+					}
+				case key.NameDownArrow:
+					if field.Multiline {
+						movement = "line-down"
+					}
+				case key.NameHome:
+					movement = "line-start"
+					if event.Modifiers.Contain(key.ModShortcut) {
+						movement = "document-start"
+					}
+				case key.NameEnd:
+					movement = "line-end"
+					if event.Modifiers.Contain(key.ModShortcut) {
+						movement = "document-end"
+					}
+				case key.NameDeleteBackward, key.NameDeleteForward:
+					if !field.ReadOnly {
+						mutated = runtime.DeleteFieldSelection(field.ID, event.Name == key.NameDeleteBackward, word) || mutated
+					}
+					continue
+				case key.NameEscape:
+					mutated = runtime.CancelFieldComposition(field.ID) || mutated
+					continue
+				case key.NameSpace:
+					// Text insertion arrives through key.EditEvent.
+					continue
+				}
+				if movement != "" {
+					if field.Multiline {
+						if columns, ok := fieldVisualColumns(field); ok {
+							mutated = runtime.SetFieldVisualColumns(field.ID, columns) || mutated
+						}
+					}
+					state.caretBlinkStart = frameTime(gtx.Now)
+					mutated = runtime.MoveFieldSelection(field.ID, movement, extend) || mutated
+					continue
+				}
 			}
 			name := ""
 			switch event.Name {
@@ -658,6 +892,61 @@ func handleDocumentInteraction(gtx layout.Context, runtime *Runtime, state *uiSt
 			}
 		}
 	}
+	for {
+		raw, ok := gtx.Event(key.FocusFilter{Target: &state.interactionInput})
+		if !ok {
+			break
+		}
+		field := focusedTextField(state)
+		if field == nil || field.ReadOnly || !field.Enabled {
+			continue
+		}
+		switch event := raw.(type) {
+		case key.EditEvent:
+			if err := runtime.ApplyFieldEdit(field.ID, event.Range.Start, event.Range.End, event.Text); err != nil {
+				state.status = err.Error()
+			} else {
+				mutated = true
+			}
+		case key.SelectionEvent:
+			rangeValue := key.Range(event)
+			if err := runtime.SetFieldSelection(field.ID, rangeValue.Start, rangeValue.End); err == nil {
+				mutated = true
+			}
+		case key.CompositionEvent:
+			rangeValue := key.Range(event)
+			if err := runtime.SetFieldComposition(field.ID, rangeValue.Start, rangeValue.End); err == nil {
+				mutated = true
+			}
+		}
+	}
+	for {
+		raw, ok := gtx.Event(transfer.TargetFilter{Target: &state.interactionInput, Type: fieldClipboardMIME})
+		if !ok {
+			break
+		}
+		data, ok := raw.(transfer.DataEvent)
+		field := focusedTextField(state)
+		if !ok || field == nil || field.ReadOnly || !field.Enabled {
+			continue
+		}
+		reader := data.Open()
+		if reader == nil {
+			continue
+		}
+		contents, readErr := io.ReadAll(reader)
+		_ = reader.Close()
+		if readErr != nil {
+			state.status = readErr.Error()
+			continue
+		}
+		start, end, _ := runtime.FieldRuneSelection(field.ID)
+		if err := runtime.ApplyFieldEdit(field.ID, start, end, string(contents)); err != nil {
+			state.status = err.Error()
+		} else {
+			mutated = true
+		}
+	}
 	if change, ok := state.router.TakeValueChange(); ok {
 		if _, err := runtime.SetControlValue(change.ID, change.Value); err != nil {
 			state.status = err.Error()
@@ -671,6 +960,121 @@ func handleDocumentInteraction(gtx layout.Context, runtime *Runtime, state *uiSt
 	}
 	if transient != before || mutated {
 		window.Invalidate()
+	}
+}
+
+func fieldRedoShortcut(name key.Name, modifiers key.Modifiers) bool {
+	if !modifiers.Contain(key.ModShortcut) {
+		return false
+	}
+	return name == key.Name("Y") || name == key.Name("Z") && modifiers.Contain(key.ModShift)
+}
+
+func focusedTextField(state *uiState) *semantic.Node {
+	if state == nil || state.runtimeTree == nil || state.router == nil {
+		return nil
+	}
+	handle := state.router.Transient().Focused
+	for _, node := range semantic.Flatten(state.runtimeTree) {
+		if node.Handle == handle && node.Role == "textbox" {
+			return node
+		}
+	}
+	return nil
+}
+
+func semanticNodeByID(root *semantic.Node, id string) *semantic.Node {
+	for _, node := range semantic.Flatten(root) {
+		if node.ID == id {
+			return node
+		}
+	}
+	return nil
+}
+
+func hitTextField(root *semantic.Node, point image.Point) *semantic.Node {
+	nodes := semantic.Flatten(root)
+	for index := len(nodes) - 1; index >= 0; index-- {
+		node := nodes[index]
+		if node.Role == "textbox" && node.Bounds != nil && node.Clip != nil && point.In(node.Bounds.ImageRectangle().Intersect(node.Clip.ImageRectangle())) {
+			return node
+		}
+	}
+	return nil
+}
+
+func fieldAllowsPointerSelection(field *semantic.Node) bool {
+	return field != nil && field.Role == "textbox" && field.Enabled
+}
+
+func fieldRuneAtPoint(field *semantic.Node, point image.Point) int {
+	box := field
+	for _, child := range field.Children {
+		if child != nil && child.Type == "field_box" && child.Bounds != nil {
+			box = child
+			break
+		}
+	}
+	if box.Bounds == nil {
+		return 0
+	}
+	return render.FieldRuneAtPoint(box.Props, box.Bounds.ImageRectangle(), point)
+}
+
+func fieldVisualLineRange(field *semantic.Node, caret int) (int, int) {
+	for _, child := range field.Children {
+		if child != nil && child.Type == "field_box" && child.Bounds != nil {
+			return render.FieldLineRange(child.Props, child.Bounds.ImageRectangle(), caret)
+		}
+	}
+	return lineRuneRange(fmt.Sprint(field.Value), caret)
+}
+
+func fieldVisualColumns(field *semantic.Node) (int, bool) {
+	for _, child := range field.Children {
+		if child != nil && child.Type == "field_box" && child.Bounds != nil {
+			return render.FieldVisibleColumns(child.Props, child.Bounds.ImageRectangle()), true
+		}
+	}
+	return 0, false
+}
+
+func wordRuneRange(text string, caret int) (int, int) {
+	runes := []rune(text)
+	caret = min(max(0, caret), len(runes))
+	start, end := caret, caret
+	for start > 0 && (unicode.IsLetter(runes[start-1]) || unicode.IsDigit(runes[start-1]) || runes[start-1] == '_') {
+		start--
+	}
+	for end < len(runes) && (unicode.IsLetter(runes[end]) || unicode.IsDigit(runes[end]) || runes[end] == '_') {
+		end++
+	}
+	return start, end
+}
+
+func lineRuneRange(text string, caret int) (int, int) {
+	runes := []rune(text)
+	caret = min(max(0, caret), len(runes))
+	start, end := caret, caret
+	for start > 0 && runes[start-1] != '\n' {
+		start--
+	}
+	for end < len(runes) && runes[end] != '\n' {
+		end++
+	}
+	return start, end
+}
+
+func numberValue(value any, fallback float64) float64 {
+	switch value := value.(type) {
+	case float64:
+		return value
+	case int64:
+		return float64(value)
+	case int:
+		return float64(value)
+	default:
+		return fallback
 	}
 }
 
@@ -742,27 +1146,72 @@ func trackpadZoomScroll(gtx layout.Context, state *uiState) float32 {
 }
 
 func canvasScrollEvents(gtx layout.Context, state *uiState) (zoom, horizontal, vertical float32) {
+	result := collectCanvasScrollEvents(gtx, state)
+	return result.zoom, result.horizontal, result.vertical
+}
+
+type fieldScrollInput struct {
+	field *semantic.Node
+	delta float32
+}
+
+type canvasScrollInput struct {
+	zoom       float32
+	horizontal float32
+	vertical   float32
+	fields     []fieldScrollInput
+}
+
+func collectCanvasScrollEvents(gtx layout.Context, state *uiState) (result canvasScrollInput) {
 	filter := trackpadZoomFilter(state)
 	for {
 		rawEvent, ok := gtx.Event(filter)
 		if !ok {
-			return zoom, horizontal, vertical
+			return result
 		}
 		scrollEvent, ok := rawEvent.(pointer.Event)
 		if !ok {
 			continue
 		}
 		if isTrackpadZoom(scrollEvent.Modifiers) {
-			zoom += trackpadZoomDelta(scrollEvent)
+			result.zoom += trackpadZoomDelta(scrollEvent)
 			continue
 		}
 		axis, delta := canvasScrollDelta(scrollEvent)
 		if axis == "horizontal" {
-			horizontal += delta
+			result.horizontal += delta
 		} else {
-			vertical += delta
+			point := documentPoint(state, gtx.Metric, scrollEvent.Position)
+			if field := textAreaScrollTarget(state.runtimeTree, point); field != nil {
+				merged := false
+				for index := range result.fields {
+					if result.fields[index].field.ID == field.ID {
+						result.fields[index].delta += delta
+						merged = true
+						break
+					}
+				}
+				if !merged {
+					result.fields = append(result.fields, fieldScrollInput{field: field, delta: delta})
+				}
+				continue
+			}
+			result.vertical += delta
 		}
 	}
+}
+
+func textAreaScrollTarget(root *semantic.Node, point image.Point) *semantic.Node {
+	var target *semantic.Node
+	for _, node := range semantic.Flatten(root) {
+		if node == nil || node.Type != "text_area" || !node.Enabled || !node.Visible || !node.InViewport || node.Bounds == nil || node.Clip == nil {
+			continue
+		}
+		if point.In(node.Bounds.ImageRectangle().Intersect(node.Clip.ImageRectangle())) {
+			target = node
+		}
+	}
+	return target
 }
 
 func trackpadZoomDelta(scrollEvent pointer.Event) float32 {

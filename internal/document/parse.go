@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -252,16 +253,19 @@ func parseEvents(file string, n *yaml.Node, diagnostics *[]Diagnostic) Events {
 	if n == nil {
 		return Events{}
 	}
-	m := mapping(file, n, []string{"activate"}, diagnostics)
-	return Events{Activate: parseActions(file, m["activate"], diagnostics)}
+	m := mapping(file, n, []string{"activate", "submit"}, diagnostics)
+	return Events{
+		Activate: parseActions(file, "activate", m["activate"], diagnostics),
+		Submit:   parseActions(file, "submit", m["submit"], diagnostics),
+	}
 }
 
-func parseActions(file string, n *yaml.Node, diagnostics *[]Diagnostic) []Action {
+func parseActions(file, event string, n *yaml.Node, diagnostics *[]Diagnostic) []Action {
 	if n == nil {
 		return nil
 	}
 	if n.Kind != yaml.SequenceNode {
-		addNodeDiagnostic(file, n, "schema.type", "activate actions must be a list", nil, diagnostics)
+		addNodeDiagnostic(file, n, "schema.type", event+" actions must be a list", nil, diagnostics)
 		return nil
 	}
 	out := make([]Action, 0, len(n.Content))
@@ -590,13 +594,13 @@ func validateDocument(doc *Document, diagnostics *[]Diagnostic) {
 		*diagnostics = append(*diagnostics, diagnostic(doc.File, "component.preview", "component documents require at least one named preview fixture", 1, 1))
 	}
 
-	var walk func(*Node, string)
-	walk = func(node *Node, parentType string) {
+	var walk func(*Node, string, bool)
+	walk = func(node *Node, parentType string, inForm bool) {
 		if node == nil {
 			return
 		}
 		nodeTypes := []string{
-			"stack", "grid", "overlay", "scroll", "surface", "button", "link", "toggle", "checkbox",
+			"stack", "grid", "overlay", "scroll", "surface", "form", "text_field", "text_area", "field_box", "field_support", "button", "link", "toggle", "checkbox",
 			"radio_group", "radio", "tabs", "tab", "tab_panel", "select", "select_trigger", "select_popup", "option",
 			"slider", "slider_track", "slider_fill", "slider_thumb", "stepper", "stepper_decrement", "stepper_value", "stepper_increment",
 			"text", "image", "spacer", "divider", "instance", "slot", "slot_content",
@@ -610,6 +614,34 @@ func validateDocument(doc *Document, diagnostics *[]Diagnostic) {
 		validateNodeFields(node, diagnostics)
 		validateChildPlacement(node, parentType, diagnostics)
 		switch node.Type {
+		case "form":
+			if strings.TrimSpace(node.Name) == "" {
+				*diagnostics = append(*diagnostics, nodeDiagnostic(node, "interactive.name", "form requires a non-empty authored name"))
+			}
+			if inForm {
+				*diagnostics = append(*diagnostics, nodeDiagnostic(node, "form.nested", "forms cannot be nested"))
+			}
+			if len(node.Children) != 1 {
+				*diagnostics = append(*diagnostics, nodeDiagnostic(node, "schema.children", "form requires exactly one visual child"))
+			}
+		case "text_field", "text_area":
+			allowedTypes := []string{"text", "number"}
+			if node.Type == "text_area" {
+				allowedTypes = []string{"text"}
+			}
+			validateNamedBoundControl(doc, node, allowedTypes, diagnostics)
+			validateTextField(node, diagnostics)
+		case "field_box":
+			if len(node.Children) != 0 {
+				*diagnostics = append(*diagnostics, nodeDiagnostic(node, "field_box.children", "field_box cannot have authored children"))
+			}
+		case "field_support":
+			if len(node.Children) != 1 {
+				*diagnostics = append(*diagnostics, nodeDiagnostic(node, "field.structure", "field_support requires exactly one presentation child"))
+			}
+			if len(node.Children) == 1 && containsInteractiveNode(node.Children[0]) {
+				*diagnostics = append(*diagnostics, nodeDiagnostic(node, "control.nested", "field_support cannot contain interactive descendants"))
+			}
 		case "surface":
 			if len(node.Children) > 1 {
 				*diagnostics = append(*diagnostics, nodeDiagnostic(node, "schema.children", "surface accepts at most one child"))
@@ -631,6 +663,20 @@ func validateDocument(doc *Document, diagnostics *[]Diagnostic) {
 			if disabled, exists := node.Props["disabled"]; exists {
 				if _, ok := disabled.(bool); !ok && !isReferenceValue(disabled) {
 					*diagnostics = append(*diagnostics, nodeDiagnostic(node, node.Type+".disabled", node.Type+" disabled must be true, false, or a compatible state reference"))
+				}
+			}
+			if node.Type == "button" {
+				if formAction, exists := node.Props["form_action"]; exists {
+					value, ok := formAction.(string)
+					if !ok || !contains([]string{"submit", "reset"}, value) {
+						*diagnostics = append(*diagnostics, nodeDiagnostic(node, "button.form_action", "button form_action must be submit or reset"))
+					}
+					if !inForm {
+						*diagnostics = append(*diagnostics, nodeDiagnostic(node, "form_action.outside", "button form_action requires a containing form"))
+					}
+					if len(node.On.Activate) != 0 {
+						*diagnostics = append(*diagnostics, nodeDiagnostic(node, "button.form_action", "button form_action cannot be combined with on.activate"))
+					}
 				}
 			}
 			if node.Type == "link" {
@@ -733,16 +779,16 @@ func validateDocument(doc *Document, diagnostics *[]Diagnostic) {
 			}
 		}
 		for _, child := range node.Children {
-			walk(child, node.Type)
+			walk(child, node.Type, inForm || node.Type == "form")
 		}
 	}
 	for _, screen := range doc.Screens {
-		walk(screen, "")
+		walk(screen, "", false)
 	}
-	walk(doc.Root, "")
+	walk(doc.Root, "", false)
 	for _, preview := range doc.Previews {
 		for _, child := range preview.Children {
-			walk(child, "")
+			walk(child, "", false)
 		}
 	}
 }
@@ -801,7 +847,7 @@ func numberInDomain(declaration StateDeclaration, value float64) bool {
 	return math.Abs(steps-math.Round(steps)) <= 1e-9
 }
 
-var interactiveNodeTypes = []string{"button", "link", "toggle", "checkbox", "radio_group", "radio", "tabs", "tab", "select", "option", "slider", "stepper"}
+var interactiveNodeTypes = []string{"button", "link", "text_field", "text_area", "toggle", "checkbox", "radio_group", "radio", "tabs", "tab", "select", "option", "slider", "stepper"}
 
 func validateNamedBoundControl(doc *Document, node *Node, allowedTypes []string, diagnostics *[]Diagnostic) {
 	if strings.TrimSpace(node.Name) == "" {
@@ -820,6 +866,64 @@ func validateNamedBoundControl(doc *Document, node *Node, allowedTypes []string,
 	if !exists || !contains(allowedTypes, declaration.Type) {
 		*diagnostics = append(*diagnostics, nodeDiagnostic(node, "control.binding", fmt.Sprintf("%s binding %q has an incompatible state type", node.Type, bind)))
 	}
+}
+
+func validateTextField(node *Node, diagnostics *[]Diagnostic) {
+	if len(node.Children) < 1 || len(node.Children) > 2 || node.Children[0] == nil || node.Children[0].Type != "field_box" || len(node.Children) == 2 && (node.Children[1] == nil || node.Children[1].Type != "field_support") {
+		*diagnostics = append(*diagnostics, nodeDiagnostic(node, "field.structure", node.Type+" requires field_box followed by an optional field_support"))
+	}
+}
+
+func validateTextFieldProps(node *Node, diagnostics *[]Diagnostic) {
+	for _, key := range []string{"disabled", "read_only", "required"} {
+		if value, exists := node.Props[key]; exists {
+			if _, ok := value.(bool); !ok && !isReferenceValue(value) {
+				*diagnostics = append(*diagnostics, nodeDiagnostic(node, "field."+key, node.Type+" "+key+" must be true, false, or a compatible boolean reference"))
+			}
+		}
+	}
+	minLength, hasMinLength := nonNegativeIntegerProp(node, "min_length", "field.length", diagnostics)
+	maxLength, hasMaxLength := nonNegativeIntegerProp(node, "max_length", "field.length", diagnostics)
+	if hasMinLength && hasMaxLength && minLength > maxLength {
+		*diagnostics = append(*diagnostics, nodeDiagnostic(node, "field.length", "min_length must not exceed max_length"))
+	}
+	if pattern, exists := node.Props["pattern"]; exists && !isReferenceValue(pattern) {
+		text, ok := pattern.(string)
+		if !ok {
+			*diagnostics = append(*diagnostics, nodeDiagnostic(node, "field.pattern", "pattern must be text or a compatible reference"))
+		} else if _, err := regexp.Compile("^(?:" + text + ")$"); err != nil {
+			*diagnostics = append(*diagnostics, nodeDiagnostic(node, "field.pattern", "pattern must be a valid RE2 expression"))
+		}
+	}
+	if node.Type == "text_area" {
+		minLines, hasMinLines := positiveIntegerProp(node, "min_lines", "field.lines", diagnostics)
+		maxLines, hasMaxLines := positiveIntegerProp(node, "max_lines", "field.lines", diagnostics)
+		if hasMinLines && hasMaxLines && minLines > maxLines {
+			*diagnostics = append(*diagnostics, nodeDiagnostic(node, "field.lines", "min_lines must not exceed max_lines"))
+		}
+	}
+}
+
+func nonNegativeIntegerProp(node *Node, key, code string, diagnostics *[]Diagnostic) (int, bool) {
+	value, exists := node.Props[key]
+	if !exists || isReferenceValue(value) {
+		return 0, false
+	}
+	number, ok := finiteNumber(value)
+	if !ok || number < 0 || number != math.Trunc(number) {
+		*diagnostics = append(*diagnostics, nodeDiagnostic(node, code, key+" must be a non-negative integer"))
+		return 0, false
+	}
+	return int(number), true
+}
+
+func positiveIntegerProp(node *Node, key, code string, diagnostics *[]Diagnostic) (int, bool) {
+	value, ok := nonNegativeIntegerProp(node, key, code, diagnostics)
+	if ok && value == 0 {
+		*diagnostics = append(*diagnostics, nodeDiagnostic(node, code, key+" must be a positive integer"))
+		return 0, false
+	}
+	return value, ok
 }
 
 func validateNamedChoice(node *Node, diagnostics *[]Diagnostic) {
@@ -961,11 +1065,55 @@ func validateInteractionNode(doc *Document, node *Node, diagnostics *[]Diagnosti
 	if len(node.On.Activate) != 0 && node.Type != "button" && node.Type != "link" {
 		*diagnostics = append(*diagnostics, nodeDiagnostic(node, "action.node", "only buttons and links may declare activate actions"))
 	}
+	if len(node.On.Submit) != 0 && node.Type != "form" {
+		*diagnostics = append(*diagnostics, nodeDiagnostic(node, "action.node", "only forms may declare submit actions"))
+	}
+	validateActionList(doc, node, "activate", node.On.Activate, diagnostics)
+	validateActionList(doc, node, "submit", node.On.Submit, diagnostics)
+	comparisons := []string{"equals", "not_equals", "less_than", "less_than_or_equal", "greater_than", "greater_than_or_equal"}
+	for _, variant := range node.Variants {
+		condition := variant.When
+		if condition.Interaction != "" {
+			allowed := []string{"hovered", "pressed", "focused", "disabled", "read_only", "checked", "selected", "open", "active", "valid", "invalid", "dirty", "touched", "placeholder_shown", "editing", "composing"}
+			if node.Type == "link" {
+				allowed = append(allowed, "current")
+			}
+			if !contains(allowed, condition.Interaction) {
+				*diagnostics = append(*diagnostics, diagnostic(doc.File, "variant.interaction", "variant requires a supported interaction or semantic control state", condition.Source.Line, condition.Source.Column))
+			}
+			if contains([]string{"checked", "selected", "read_only", "valid", "invalid", "dirty", "touched", "placeholder_shown"}, condition.Interaction) {
+				continue
+			}
+			for key := range variant.Props {
+				if !contains([]string{"background", "border", "shadow", "opacity"}, key) {
+					*diagnostics = append(*diagnostics, diagnostic(doc.File, "variant.transient", fmt.Sprintf("interaction variants cannot override %q", key), variant.Source.Line, variant.Source.Column))
+				}
+			}
+			if len(variant.Place) != 0 || variant.Visible != nil {
+				*diagnostics = append(*diagnostics, diagnostic(doc.File, "variant.transient", "interaction variants cannot override placement or visibility", variant.Source.Line, variant.Source.Column))
+			}
+			continue
+		}
+		declaration, ok := doc.State[condition.State]
+		if !ok {
+			*diagnostics = append(*diagnostics, diagnostic(doc.File, "state.unknown", fmt.Sprintf("variant references unknown state %q", condition.State), condition.Source.Line, condition.Source.Column))
+			continue
+		}
+		if !contains(comparisons, condition.Operator) || !isReferenceValue(condition.Value) && !stateValueMatches(declaration, condition.Value) {
+			*diagnostics = append(*diagnostics, diagnostic(doc.File, "variant.condition", "variant comparison does not match its state", condition.Source.Line, condition.Source.Column))
+		}
+		if condition.Operator != "equals" && condition.Operator != "not_equals" && declaration.Type != "number" {
+			*diagnostics = append(*diagnostics, diagnostic(doc.File, "variant.condition", "ordering comparisons require number state", condition.Source.Line, condition.Source.Column))
+		}
+	}
+}
+
+func validateActionList(doc *Document, node *Node, event string, actions []Action, diagnostics *[]Diagnostic) {
 	navigationCount := 0
-	for _, action := range node.On.Activate {
+	for _, action := range actions {
 		if contains([]string{"navigate", "replace", "back", "forward"}, action.Action) {
 			navigationCount++
-			if node.Type == "link" {
+			if event == "activate" && node.Type == "link" {
 				*diagnostics = append(*diagnostics, diagnostic(doc.File, "link.actions", "link activate actions may mutate state but cannot declare navigation", action.Source.Line, action.Source.Column))
 			}
 			if (action.Action == "navigate" || action.Action == "replace") && doc.Kind == KindApp && action.To != "" {
@@ -1008,43 +1156,7 @@ func validateInteractionNode(doc *Document, node *Node, diagnostics *[]Diagnosti
 		}
 	}
 	if navigationCount > 1 {
-		*diagnostics = append(*diagnostics, nodeDiagnostic(node, "action.navigation_count", "activate may contain at most one navigation command"))
-	}
-	comparisons := []string{"equals", "not_equals", "less_than", "less_than_or_equal", "greater_than", "greater_than_or_equal"}
-	for _, variant := range node.Variants {
-		condition := variant.When
-		if condition.Interaction != "" {
-			allowed := []string{"hovered", "pressed", "focused", "disabled", "checked", "selected", "open", "active"}
-			if node.Type == "link" {
-				allowed = append(allowed, "current")
-			}
-			if !contains(allowed, condition.Interaction) {
-				*diagnostics = append(*diagnostics, diagnostic(doc.File, "variant.interaction", "variant requires a supported interaction or semantic control state", condition.Source.Line, condition.Source.Column))
-			}
-			if condition.Interaction == "checked" || condition.Interaction == "selected" {
-				continue
-			}
-			for key := range variant.Props {
-				if !contains([]string{"background", "border", "shadow", "opacity"}, key) {
-					*diagnostics = append(*diagnostics, diagnostic(doc.File, "variant.transient", fmt.Sprintf("interaction variants cannot override %q", key), variant.Source.Line, variant.Source.Column))
-				}
-			}
-			if len(variant.Place) != 0 || variant.Visible != nil {
-				*diagnostics = append(*diagnostics, diagnostic(doc.File, "variant.transient", "interaction variants cannot override placement or visibility", variant.Source.Line, variant.Source.Column))
-			}
-			continue
-		}
-		declaration, ok := doc.State[condition.State]
-		if !ok {
-			*diagnostics = append(*diagnostics, diagnostic(doc.File, "state.unknown", fmt.Sprintf("variant references unknown state %q", condition.State), condition.Source.Line, condition.Source.Column))
-			continue
-		}
-		if !contains(comparisons, condition.Operator) || !isReferenceValue(condition.Value) && !stateValueMatches(declaration, condition.Value) {
-			*diagnostics = append(*diagnostics, diagnostic(doc.File, "variant.condition", "variant comparison does not match its state", condition.Source.Line, condition.Source.Column))
-		}
-		if condition.Operator != "equals" && condition.Operator != "not_equals" && declaration.Type != "number" {
-			*diagnostics = append(*diagnostics, diagnostic(doc.File, "variant.condition", "ordering comparisons require number state", condition.Source.Line, condition.Source.Column))
-		}
+		*diagnostics = append(*diagnostics, nodeDiagnostic(node, "action.navigation_count", event+" may contain at most one navigation command"))
 	}
 }
 
@@ -1201,7 +1313,12 @@ func validateNodeFields(node *Node, diagnostics *[]Diagnostic) {
 		"overlay":           {"alignment"},
 		"scroll":            {"axis", "scrollbar"},
 		"surface":           {"padding", "background", "border", "radius", "shadow", "clip"},
-		"button":            {"label", "disabled", "padding", "background", "border", "radius", "shadow", "clip"},
+		"form":              {},
+		"text_field":        {"label", "bind", "disabled", "read_only", "required", "min_length", "max_length", "pattern", "placeholder", "gap"},
+		"text_area":         {"label", "bind", "disabled", "read_only", "required", "min_length", "max_length", "pattern", "placeholder", "gap", "min_lines", "max_lines"},
+		"field_box":         {"padding", "background", "border", "radius", "shadow", "clip", "font", "size", "weight", "italic", "color", "alignment", "line_height", "letter_spacing", "placeholder_color", "selection_color", "caret_color"},
+		"field_support":     {},
+		"button":            {"label", "disabled", "form_action", "padding", "background", "border", "radius", "shadow", "clip"},
 		"link":              {"label", "to", "disabled", "padding", "background", "border", "radius", "shadow", "clip"},
 		"toggle":            {"label", "bind", "disabled", "padding", "background", "border", "radius", "shadow", "clip"},
 		"checkbox":          {"label", "bind", "disabled", "padding", "background", "border", "radius", "shadow", "clip"},
@@ -1300,6 +1417,10 @@ func validateNodeFields(node *Node, diagnostics *[]Diagnostic) {
 		validateReferenceObjects(node, action.Value, diagnostics)
 		validateReferenceObjects(node, action.By, diagnostics)
 	}
+	for _, action := range node.On.Submit {
+		validateReferenceObjects(node, action.Value, diagnostics)
+		validateReferenceObjects(node, action.By, diagnostics)
+	}
 	validatePrimitiveValues(node, diagnostics)
 }
 
@@ -1316,6 +1437,10 @@ func validatePrimitiveValues(node *Node, diagnostics *[]Diagnostic) {
 		}
 	}
 	switch node.Type {
+	case "button":
+		enum("form_action", []string{"submit", "reset"})
+	case "text_field", "text_area":
+		validateTextFieldProps(node, diagnostics)
 	case "stack":
 		enum("direction", []string{"horizontal", "vertical"})
 		enum("alignment", []string{"start", "center", "end", "stretch"})

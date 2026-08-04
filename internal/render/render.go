@@ -39,6 +39,7 @@ type State struct {
 	Hovered      string
 	Pressed      string
 	Focused      string
+	CaretHidden  bool
 	OpenSelect   string
 	ActiveOption string
 }
@@ -185,6 +186,10 @@ func (r *renderer) layoutNode(node *project.Node, bounds, clip image.Rectangle, 
 		bounds = applySize(node, bounds)
 	}
 	node = interactiveNodeForState(node, r.state)
+	var fieldGeometry fieldTextGeometry
+	if node.Type == "field_box" {
+		node, fieldGeometry = fieldNodeWithViewport(node, bounds)
+	}
 	incomingClip := clip
 	clip = clip.Intersect(bounds)
 	previousOpacity := r.opacity
@@ -205,13 +210,52 @@ func (r *renderer) layoutNode(node *project.Node, bounds, clip image.Rectangle, 
 		if len(node.Children) == 1 {
 			r.layout(node.Children[0], bounds, clip)
 		}
-	case "surface", "button", "link", "toggle", "checkbox", "radio", "tab", "tab_panel", "option", "select_trigger",
+	case "form", "surface", "button", "link", "toggle", "checkbox", "radio", "tab", "tab_panel", "option", "select_trigger", "field_support",
 		"slider_track", "slider_fill", "slider_thumb", "stepper_decrement", "stepper_value", "stepper_increment":
 		r.paintSurface(node, bounds, incomingClip)
 		inner := inset(bounds, insets(node.Props["padding"]))
 		if len(node.Children) == 1 {
 			r.layout(node.Children[0], inner, chooseClip(node, incomingClip, bounds))
 		}
+	case "field_box":
+		r.paintSurface(node, bounds, incomingClip)
+		geometry := fieldGeometry
+		selection, caret := geometry.Decorations()
+		focused := r.state.Focused == stringValue(node.Props["field_handle"], "")
+		if focused {
+			for _, rectangle := range selection {
+				r.paintRect(rectangle, clip, colorValue(node.Props["selection_color"], color.RGBA{R: 103, G: 95, B: 242, A: 96}), 1)
+			}
+		}
+		text := *node
+		text.Type = "text"
+		textBounds := inset(bounds, insets(node.Props["padding"]))
+		textBounds = textBounds.Sub(image.Pt(geometry.OffsetX, geometry.OffsetY*geometry.LineHeight))
+		r.text(&text, textBounds, clip.Intersect(bounds))
+		if focused && !r.state.CaretHidden && !caret.Empty() {
+			r.paintRect(caret, clip, colorValue(node.Props["caret_color"], colorValue(node.Props["color"], color.RGBA{A: 255})), 1)
+		}
+		if focused {
+			for _, underline := range fieldCompositionUnderlines(node, bounds) {
+				r.paintRect(underline, clip, colorValue(node.Props["caret_color"], colorValue(node.Props["color"], color.RGBA{A: 255})), 1)
+			}
+		}
+	case "text_field", "text_area":
+		labelBounds, contentBounds := fieldContentBounds(node, bounds)
+		if !labelBounds.Empty() {
+			label := *node
+			label.Type = "text"
+			label.Props = cloneMap(node.Props)
+			label.Props["text"] = stringValue(node.Props["label"], "")
+			label.Props["size"] = float64(14)
+			label.Props["weight"] = float64(600)
+			label.Props["color"] = "#39443D"
+			r.text(&label, labelBounds, clip)
+		}
+		clone := *node
+		clone.Props = cloneMap(node.Props)
+		clone.Props["direction"] = "vertical"
+		r.stack(&clone, contentBounds, clip)
 	case "stack", "radio_group":
 		r.stack(node, bounds, clip)
 	case "stepper":
@@ -306,16 +350,17 @@ func interactiveNodeForState(node *project.Node, state State) *project.Node {
 		return node
 	}
 	props := node.Props
+	interactionHandle := stringValue(props["field_handle"], node.Handle)
 	changed := false
 	for _, variant := range node.Variants {
 		matched := false
 		switch variant.When.Interaction {
 		case "hovered":
-			matched = state.Hovered == node.Handle
+			matched = state.Hovered == interactionHandle
 		case "pressed":
-			matched = state.Pressed == node.Handle
+			matched = state.Pressed == interactionHandle
 		case "focused":
-			matched = state.Focused == node.Handle
+			matched = state.Focused == interactionHandle
 		case "disabled":
 			matched = boolValue(props["disabled"], false)
 		case "current":

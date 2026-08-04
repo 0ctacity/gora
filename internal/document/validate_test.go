@@ -524,6 +524,120 @@ screens:
 	requireDiagnostic(t, diagnostics, "control.nested", "")
 }
 
+func TestAcceptsTextFieldsAndLocalForm(t *testing.T) {
+	doc, diagnostics := Parse("forms.gora", []byte(`
+gora: 1
+kind: app
+viewport: { width: 640, height: 480 }
+state:
+  name: { type: text, default: Ada }
+  seats: { type: number, default: 3, min: 1, max: 20, step: 1 }
+  notes: { type: text, default: "" }
+  submitted: { type: boolean, default: false }
+entry: main
+screens:
+  main:
+    type: form
+    name: profile-form
+    on:
+      submit:
+        - { action: set, state: submitted, value: true }
+    children:
+      - type: stack
+        children:
+          - type: text_field
+            name: name-field
+            props:
+              label: Name
+              bind: name
+              placeholder: Your name
+              required: true
+              min_length: 2
+              max_length: 80
+              pattern: '[A-Za-z ]+'
+            children:
+              - type: field_box
+              - type: field_support
+                children:
+                  - { type: text, props: { text: Use your full name } }
+          - type: text_field
+            name: seats-field
+            props: { label: Seats, bind: seats, read_only: false }
+            children:
+              - type: field_box
+          - type: text_area
+            name: notes-field
+            props: { label: Notes, bind: notes, min_lines: 3, max_lines: 8 }
+            children:
+              - type: field_box
+          - type: button
+            name: submit-button
+            props: { label: Save, form_action: submit }
+            children: [{ type: text, props: { text: Save } }]
+`))
+	if len(diagnostics) != 0 {
+		t.Fatalf("Parse diagnostics: %+v", diagnostics)
+	}
+	form := doc.Screens["main"]
+	if got := len(form.On.Submit); got != 1 || form.On.Submit[0].Action != "set" {
+		t.Fatalf("submit actions = %+v", form.On.Submit)
+	}
+}
+
+func TestRejectsInvalidTextFieldsAndForms(t *testing.T) {
+	_, diagnostics := Parse("invalid-forms.gora", []byte(`
+gora: 1
+kind: app
+viewport: { width: 640, height: 480 }
+state:
+  enabled: { type: boolean, default: true }
+  count: { type: number, default: 3 }
+entry: main
+screens:
+  main:
+    type: form
+    name: outer-form
+    children:
+      - type: stack
+        children:
+          - type: text_area
+            name: bad-area
+            props:
+              label: Notes
+              bind: count
+              min_length: 4
+              max_length: 2
+              pattern: '['
+              min_lines: 0
+              max_lines: -1
+            children:
+              - type: field_support
+                children: []
+              - type: field_box
+                children: [{ type: text }]
+          - type: form
+            name: inner-form
+            children: [{ type: spacer }]
+          - type: button
+            name: bad-reset
+            props: { label: Reset, form_action: reset }
+            on:
+              activate: [{ action: toggle, state: enabled }]
+            children: [{ type: text, props: { text: Reset } }]
+  other:
+    type: button
+    name: outside-submit
+    props: { label: Submit, form_action: submit }
+    children: [{ type: text, props: { text: Submit } }]
+`))
+	for _, code := range []string{
+		"control.binding", "field.length", "field.pattern", "field.lines", "field.structure",
+		"field_box.children", "form.nested", "button.form_action", "form_action.outside",
+	} {
+		requireDiagnostic(t, diagnostics, code, "")
+	}
+}
+
 func requireDiagnostic(t *testing.T, diagnostics []Diagnostic, code, suggestion string) {
 	t.Helper()
 	for _, diagnostic := range diagnostics {

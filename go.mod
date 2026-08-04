@@ -6,6 +6,7 @@ require (
 	gioui.org v0.10.1
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/modelcontextprotocol/go-sdk v1.7.0
+	github.com/rivo/uniseg v0.4.7
 	go.yaml.in/yaml/v4 v4.0.0-rc.6
 	golang.org/x/image v0.44.0
 )

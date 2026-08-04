@@ -5,6 +5,7 @@ import (
 
 	"gora/internal/document"
 	"gora/internal/project"
+	"gora/internal/semantic"
 )
 
 func TestEffectiveTreeResolvesStateTextAndVariantPrecedence(t *testing.T) {
@@ -27,6 +28,81 @@ func TestEffectiveTreeResolvesStateTextAndVariantPrecedence(t *testing.T) {
 	}
 	if root.Props["content"] == "3" {
 		t.Fatal("ResolveTree mutated the authored resolved node")
+	}
+}
+
+func TestEffectiveFieldBoxConvertsGraphemeRangesToRuneOffsetsForPainting(t *testing.T) {
+	field := &project.Node{
+		Handle: "field", Type: "text_area", Name: "bio-field", Scope: "screen:main",
+		Children: []*project.Node{{Handle: "box", Type: "field_box", Props: map[string]any{}}},
+	}
+	draft := "A👨‍👩‍👧‍👦éZ"
+	fields := map[string]EditingState{
+		semantic.StableID(field, "main"): {
+			Draft: draft, SelectionStart: 1, SelectionEnd: 3,
+			Composing: true, Composition: "é", CompositionStart: 2, CompositionEnd: 3,
+		},
+	}
+
+	effective := ResolveTreeWithFields(field, nil, Transient{}, fields, "main")
+	box := effective.Children[0]
+	if effective.Props["selection_start"] != 1 || effective.Props["selection_end"] != 3 {
+		t.Fatalf("semantic grapheme range = %v..%v", effective.Props["selection_start"], effective.Props["selection_end"])
+	}
+	if box.Props["selection_start"] != 1 || box.Props["selection_end"] != 10 {
+		t.Fatalf("paint rune selection = %v..%v, want 1..10", box.Props["selection_start"], box.Props["selection_end"])
+	}
+	if box.Props["composition_start"] != 8 || box.Props["composition_end"] != 10 {
+		t.Fatalf("paint rune composition = %v..%v, want 8..10", box.Props["composition_start"], box.Props["composition_end"])
+	}
+}
+
+func TestEffectiveFieldSupportUsesInheritedValidationState(t *testing.T) {
+	hide := false
+	show := true
+	field := &project.Node{
+		Handle: "email", Type: "text_field", Name: "email-field", Scope: "screen:main", Binding: "email",
+		Props: map[string]any{"label": "Email"},
+		Children: []*project.Node{
+			{Handle: "box", Type: "field_box", Props: map[string]any{}},
+			{
+				Handle: "support", Type: "field_support", Props: map[string]any{},
+				Variants: []document.Variant{
+					{When: document.Condition{Interaction: "valid"}, Visible: &hide},
+					{When: document.Condition{Interaction: "invalid"}, Props: map[string]any{"validation_state": "invalid"}, Visible: &show},
+				},
+				Children: []*project.Node{{Handle: "message", Type: "text", Props: map[string]any{"text": "Invalid"}}},
+			},
+		},
+	}
+	id := semantic.StableID(field, "main")
+	effective := ResolvePersistentTreeWithFields(field, map[string]map[string]any{"screen:main": {"email": "ada@example.com"}}, map[string]EditingState{
+		id: {Draft: "ada@example.com", Committed: "ada@example.com", Valid: true, Validated: true},
+	}, "main")
+	if !effective.Children[1].Hidden {
+		t.Fatalf("valid field support remained visible: %+v", effective.Children[1])
+	}
+
+	unvalidated := ResolvePersistentTreeWithFields(field, map[string]map[string]any{"screen:main": {"email": ""}}, map[string]EditingState{
+		id: {Draft: "", Committed: "", Valid: false, Validated: false},
+	}, "main")
+	if _, ok := unvalidated.Children[1].Props["validation_state"]; ok {
+		t.Fatalf("unvalidated field matched invalid variant: %+v", unvalidated.Children[1].Props)
+	}
+}
+
+func TestEffectiveTextAreaPassesLineLimitsToItsFieldBox(t *testing.T) {
+	field := &project.Node{
+		Handle: "field", Type: "text_area", Name: "bio-field", Scope: "screen:main",
+		Props:    map[string]any{"min_lines": float64(3), "max_lines": float64(8)},
+		Children: []*project.Node{{Handle: "box", Type: "field_box", Props: map[string]any{}}},
+	}
+	effective := ResolveTreeWithFields(field, nil, Transient{}, map[string]EditingState{
+		semantic.StableID(field, "main"): {Draft: "Biography"},
+	}, "main")
+	props := effective.Children[0].Props
+	if props["field_min_lines"] != float64(3) || props["field_max_lines"] != float64(8) {
+		t.Fatalf("field box line limits = %#v", props)
 	}
 }
 

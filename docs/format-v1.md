@@ -191,8 +191,9 @@ responsive: {}
 children: []
 ```
 
-`name` is optional and unique within its source document, except that buttons
-and links require one. Runtime handles are generated and never serialized.
+`name` is optional and unique within its source document, except that forms and
+interactive controls require one. Runtime handles are generated and never
+serialized.
 
 `responsive` is keyed by a breakpoint declared in the same document. It may
 override only `props`, `place`, and `visible`; it cannot change type, name, or
@@ -335,6 +336,52 @@ transient option. Checked/selected variants may change persistent layout;
 open/active variants remain paint-only. Control visual subtrees cannot contain
 nested controls, while tab panels may contain arbitrary controls.
 
+### Text fields and local forms
+
+`text_field` binds text or number state; `text_area` binds text state. Each
+requires a unique authored `name`, non-empty semantic `label`, and direct
+lexical `props.bind`. `disabled`, `read_only`, and `required` accept booleans or
+compatible boolean state references. Text validation supports non-negative
+`min_length`/`max_length` grapheme counts and a whole-value RE2 `pattern`.
+Text areas additionally accept positive `min_lines` and `max_lines`.
+Disabled fields expose no valid/invalid result and do not participate in
+validation or submission; read-only fields do both.
+
+Fields contain exactly one `field_box` followed by an optional
+`field_support`. `field_box` has no authored child: it paints the runtime-owned
+draft, placeholder, caret, selection, and composition using surface and text
+styling. The field paints its semantic label above the box using the runtime's
+deterministic default label style. `field_support` contains exactly one presentation child. Nested
+semantic controls inside either field part are invalid.
+
+Draft text is separate from the last valid committed value. A valid text draft
+publishes immediately to its bound state; a valid number draft publishes after
+the number state's min/max/step normalization. Invalid and partial drafts remain
+visible without overwriting that last valid value. Editing uses grapheme-indexed
+caret/selection, bounded undo/redo, platform clipboard shortcuts, and Gio IME
+edit/selection/composition events. Compatible reloads preserve editing state by
+semantic ID, scope, binding, and state type; external state writes replace the
+draft.
+
+Field semantic variants are `valid`, `invalid`, `dirty`, `touched`, and
+`placeholder_shown`. They may change persistent props, placement, and
+visibility. `editing` and `composing` are transient paint-only variants.
+
+`form` is a non-state-owning structural node with a unique authored `name` and
+exactly one content child; forms cannot nest. It may declare `on.submit` using
+the same transactional state/navigation action list as button activation.
+Fields retain their lexical scopes while belonging to their nearest form.
+
+A button inside a form may set `props.form_action` to `submit` or `reset`; it
+cannot also declare `on.activate`. Submission finishes composition, marks and
+validates every enabled descendant field, focuses the first invalid field when
+blocked, and otherwise atomically synchronizes all valid drafts before running
+submit actions.
+Hidden enabled fields participate; disabled fields do not. Reset restores only
+state bindings represented by fields in that form and clears their editing
+metadata. Enter submits a `text_field`; Enter inserts a newline in a
+`text_area`, while Command/Control-Enter submits it.
+
 ### Navigation actions and history
 
 Buttons may author one `navigate`, `replace`, `back`, or `forward` command in
@@ -372,8 +419,9 @@ preview content use `slot_content`.
 
 ## Deferred from v1
 
-Text inputs/forms, URL/deep-link routing, safe
-areas, SVG/vector paths, animation, remote assets, native accessibility-tree
+Secure/password fields, file inputs, form encoding/submission effects,
+URL/deep-link routing, safe areas, SVG/vector paths, animation, remote assets,
+native accessibility-tree
 integration, translation, code generation, and a production runtime are not
 part of v1. Multi-select, typeahead, editable spinbuttons, mixed checkboxes,
 native pickers, and press-and-hold repetition remain deferred.

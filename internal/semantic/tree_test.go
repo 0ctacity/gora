@@ -68,6 +68,50 @@ func TestInteractiveIDPercentEncodesContextBreadcrumbAndName(t *testing.T) {
 	}
 }
 
+func TestBuildExposesCompleteTextFieldSemantics(t *testing.T) {
+	field := &project.Node{
+		Handle: "name", Type: "text_field", Name: "name-field", Scope: "screen:main", Binding: "name", Form: "form",
+		Props: map[string]any{
+			"label": "Name", "draft": "Grace", "committed": "Ada", "placeholder": "Your name",
+			"required": true, "read_only": true, "dirty": true, "touched": true, "valid": false,
+			"selection_start": 1, "selection_end": 3, "internal_offset": float64(2),
+		},
+		Children: []*project.Node{{Handle: "box", Type: "field_box"}},
+	}
+	root := &project.Node{Handle: "form", Type: "form", Name: "profile-form", Children: []*project.Node{field}}
+	geometry := map[string]Geometry{
+		"form": {Bounds: image.Rect(0, 0, 200, 100), Clip: image.Rect(0, 0, 200, 100)},
+		"name": {Bounds: image.Rect(0, 0, 180, 40), Clip: image.Rect(0, 0, 200, 100)},
+		"box": {
+			Bounds: image.Rect(0, 0, 180, 40), Clip: image.Rect(0, 0, 200, 100),
+			Props: map[string]any{"internal_viewport_x": float64(12), "internal_viewport_y": float64(24), "internal_viewport_width": float64(120), "internal_viewport_height": float64(36)},
+		},
+	}
+	tree := Build(root, geometry, Context{Screen: "main"})
+	got := tree.Children[0]
+	if got.Role != "textbox" || got.Label != "Name" || got.Value != "Grace" || got.CommittedValue != "Ada" {
+		t.Fatalf("field values = %+v", got)
+	}
+	if !got.Required || !got.ReadOnly || !got.Dirty || !got.Touched || got.Valid == nil || *got.Valid || got.Placeholder != "Your name" || got.InternalOffset != 2 {
+		t.Fatalf("field metadata = %+v", got)
+	}
+	if got.Form != tree.ID || got.FocusOrder != 0 || !containsOperation(got.Operations, "select_all") {
+		t.Fatalf("field operations = %+v", got)
+	}
+	if got.InternalTextViewport == nil || *got.InternalTextViewport != (Rect{X: 12, Y: 24, Width: 120, Height: 36}) {
+		t.Fatalf("internal text viewport = %+v", got.InternalTextViewport)
+	}
+}
+
+func containsOperation(operations []string, wanted string) bool {
+	for _, operation := range operations {
+		if operation == wanted {
+			return true
+		}
+	}
+	return false
+}
+
 func TestBuildExposesSemanticControlRolesValuesAndCompositeFocus(t *testing.T) {
 	minimum, maximum, step := 0.0, 100.0, 5.0
 	root := &project.Node{Handle: "root", Type: "stack", Children: []*project.Node{

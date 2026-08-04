@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
+	"net/url"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,6 +34,8 @@ type Snapshot struct {
 	Scroll             map[string]image.Point
 	Transient          interaction.Transient
 	StateValues        map[string]map[string]any
+	Editing            map[string]interaction.EditingState
+	EditingRevision    uint64
 	Revision           uint64
 	NavigationRevision uint64
 	HasState           bool
@@ -43,31 +47,33 @@ type Snapshot struct {
 }
 
 type Runtime struct {
-	mu                 sync.RWMutex
-	reloadMu           sync.Mutex
-	root               string
-	entry              string
-	loaded             *project.Loaded
-	selected           string
-	viewport           image.Point
-	viewportExplicit   bool
-	diagnostics        []document.Diagnostic
-	invalid            bool
-	scroll             map[string]image.Point
-	state              *interaction.Store
-	navigation         *navigation.History
-	navigationRevision uint64
-	runtimeRevision    uint64
-	effectiveRoot      *project.Node
-	effectiveSource    *project.Node
-	effectiveScreen    string
-	effectiveRevision  uint64
-	effectiveTransient interaction.Transient
-	publishedTree      *semantic.Node
+	mu                       sync.RWMutex
+	reloadMu                 sync.Mutex
+	root                     string
+	entry                    string
+	loaded                   *project.Loaded
+	selected                 string
+	viewport                 image.Point
+	viewportExplicit         bool
+	diagnostics              []document.Diagnostic
+	invalid                  bool
+	scroll                   map[string]image.Point
+	state                    *interaction.Store
+	editing                  *interaction.EditingStore
+	navigation               *navigation.History
+	navigationRevision       uint64
+	runtimeRevision          uint64
+	effectiveRoot            *project.Node
+	effectiveSource          *project.Node
+	effectiveScreen          string
+	effectiveRevision        uint64
+	effectiveEditingRevision uint64
+	effectiveTransient       interaction.Transient
+	publishedTree            *semantic.Node
 }
 
 func NewRuntime(root, entry string) (*Runtime, error) {
-	runtime := &Runtime{root: root, entry: entry, scroll: make(map[string]image.Point), state: interaction.NewStore()}
+	runtime := &Runtime{root: root, entry: entry, scroll: make(map[string]image.Point), state: interaction.NewStore(), editing: interaction.NewEditingStore()}
 	runtime.Reload()
 	runtime.mu.RLock()
 	defer runtime.mu.RUnlock()
@@ -80,7 +86,7 @@ func NewRuntime(root, entry string) (*Runtime, error) {
 // NewRuntimeAllowInvalid creates a headless-compatible runtime while retaining
 // diagnostics when the initial source has no valid frame.
 func NewRuntimeAllowInvalid(root, entry string) *Runtime {
-	runtime := &Runtime{root: root, entry: entry, scroll: make(map[string]image.Point), state: interaction.NewStore()}
+	runtime := &Runtime{root: root, entry: entry, scroll: make(map[string]image.Point), state: interaction.NewStore(), editing: interaction.NewEditingStore()}
 	runtime.Reload()
 	return runtime
 }
@@ -151,6 +157,11 @@ func (runtime *Runtime) Reload() {
 	} else {
 		runtime.state.Reconcile(specs)
 	}
+	if runtime.editing == nil {
+		runtime.editing = interaction.NewEditingStore()
+	}
+	runtime.reconcileEditingLocked()
+	runtime.editing.SyncCommitted(runtime.state.AllValues())
 	runtime.effectiveRoot = nil
 	runtime.pruneScroll(loaded)
 	runtime.runtimeRevision++
@@ -171,6 +182,10 @@ func (runtime *Runtime) Snapshot() Snapshot {
 		Revision:           runtime.state.Revision(),
 		NavigationRevision: runtime.navigationRevision,
 		Document:           runtime.entry, RuntimeRevision: runtime.runtimeRevision,
+	}
+	if runtime.editing != nil {
+		snapshot.Editing = runtime.editing.States()
+		snapshot.EditingRevision = runtime.editing.Revision()
 	}
 	if runtime.loaded == nil {
 		return snapshot
@@ -197,19 +212,119 @@ func (runtime *Runtime) Snapshot() Snapshot {
 		}
 	}
 	transientGeometryChanged := runtime.effectiveTransient.OpenSelect != snapshot.Transient.OpenSelect || runtime.effectiveTransient.ActiveOption != snapshot.Transient.ActiveOption
-	if snapshot.Root != nil && (runtime.effectiveRoot == nil || runtime.effectiveSource != snapshot.Root || runtime.effectiveScreen != runtime.selected || runtime.effectiveRevision != snapshot.Revision || transientGeometryChanged) {
+	if snapshot.Root != nil && (runtime.effectiveRoot == nil || runtime.effectiveSource != snapshot.Root || runtime.effectiveScreen != runtime.selected || runtime.effectiveRevision != snapshot.Revision || runtime.effectiveEditingRevision != snapshot.EditingRevision || transientGeometryChanged) {
 		runtime.effectiveSource = snapshot.Root
 		runtime.effectiveScreen = runtime.selected
 		runtime.effectiveRevision = snapshot.Revision
+		runtime.effectiveEditingRevision = snapshot.EditingRevision
 		runtime.effectiveTransient = snapshot.Transient
 		if snapshot.Transient.OpenSelect != "" {
-			runtime.effectiveRoot = interaction.ResolveTree(snapshot.Root, snapshot.StateValues, snapshot.Transient)
+			runtime.effectiveRoot = interaction.ResolveTreeWithFields(snapshot.Root, snapshot.StateValues, snapshot.Transient, snapshot.Editing, snapshot.Screen)
 		} else {
-			runtime.effectiveRoot = interaction.ResolvePersistentTree(snapshot.Root, snapshot.StateValues)
+			runtime.effectiveRoot = interaction.ResolvePersistentTreeWithFields(snapshot.Root, snapshot.StateValues, snapshot.Editing, snapshot.Screen)
 		}
 	}
 	snapshot.Root = runtime.effectiveRoot
 	return snapshot
+}
+
+func (runtime *Runtime) reconcileEditingLocked() {
+	if runtime.loaded == nil || runtime.editing == nil || runtime.state == nil {
+		return
+	}
+	values := runtime.state.AllValues()
+	var specs []interaction.FieldSpec
+	collect := func(root *project.Node, selection string) {
+		var walk func(*project.Node)
+		walk = func(node *project.Node) {
+			if node == nil {
+				return
+			}
+			if node.Type == "text_field" || node.Type == "text_area" {
+				declaration := document.StateDeclaration{}
+				if node.BindingState != nil {
+					declaration = *node.BindingState
+				}
+				spec := interaction.FieldSpec{
+					ID: semantic.StableID(node, selection), Scope: node.Scope, Binding: node.Binding,
+					Type: declaration.Type, Multiline: node.Type == "text_area", Value: values[node.Scope][node.Binding], Declaration: declaration,
+					Disabled:  resolvedRuntimeBool(node.Props["disabled"], values),
+					Required:  resolvedRuntimeBool(node.Props["required"], values),
+					MinLength: resolvedRuntimeInt(node.Props["min_length"]), MaxLength: resolvedRuntimeInt(node.Props["max_length"]),
+					MinLines: resolvedRuntimeInt(node.Props["min_lines"]), MaxLines: resolvedRuntimeInt(node.Props["max_lines"]),
+				}
+				spec.Pattern, spec.HasPattern = node.Props["pattern"].(string)
+				specs = append(specs, spec)
+			}
+			for _, child := range node.Children {
+				walk(child)
+			}
+		}
+		walk(root)
+	}
+	if runtime.loaded.Document.Kind == document.KindApp {
+		for name, root := range runtime.loaded.Screens {
+			collect(root, name)
+		}
+	} else {
+		collect(runtime.loaded.Root, runtime.loaded.Selected)
+	}
+	runtime.editing.Reconcile(specs)
+}
+
+func resolvedRuntimeBool(value any, values map[string]map[string]any) bool {
+	if reference, ok := value.(project.StateReference); ok {
+		resolved, _ := values[reference.Scope][reference.Name].(bool)
+		return resolved
+	}
+	resolved, _ := value.(bool)
+	return resolved
+}
+
+func resolvedRuntimeInt(value any) *int {
+	var number float64
+	switch typed := value.(type) {
+	case int:
+		number = float64(typed)
+	case int64:
+		number = float64(typed)
+	case float64:
+		number = typed
+	default:
+		return nil
+	}
+	if number < 0 || number != float64(int(number)) {
+		return nil
+	}
+	result := int(number)
+	return &result
+}
+
+func (runtime *Runtime) syncEditingFromStateLocked() {
+	if runtime.editing == nil || runtime.state == nil {
+		return
+	}
+	runtime.reconcileEditingLocked()
+	runtime.editing.SyncCommitted(runtime.state.AllValues())
+}
+
+func (runtime *Runtime) publishValidFieldDraftLocked(id string) error {
+	if runtime.editing == nil || runtime.state == nil {
+		return nil
+	}
+	spec, value, ok := runtime.editing.PublishableValue(id)
+	if !ok {
+		return nil
+	}
+	if err := runtime.state.SetValues(spec.Scope, map[string]any{spec.Binding: value}); err != nil {
+		return err
+	}
+	normalized := runtime.state.Values(spec.Scope)[spec.Binding]
+	if err := runtime.editing.AcceptPublished(id, normalized); err != nil {
+		return err
+	}
+	runtime.editing.SyncCommitted(runtime.state.AllValues())
+	return nil
 }
 
 // Dependencies returns the current last-good project dependency set.
@@ -251,29 +366,11 @@ func (runtime *Runtime) Activate(activation interaction.Activation) error {
 		return err
 	}
 	changed = runtime.state.Revision() != stateRevision
-	if navigationAction != nil && runtime.navigation != nil && runtime.loaded != nil && runtime.loaded.Document.Kind == document.KindApp {
-		var transition navigation.Transition
-		currentScroll := cloneScroll(runtime.scroll)
-		switch navigationAction.Action {
-		case "navigate":
-			transition = runtime.navigation.Navigate(navigationAction.To, currentScroll)
-		case "replace":
-			transition = runtime.navigation.Replace(navigationAction.To, currentScroll)
-		case "back":
-			transition = runtime.navigation.Back(currentScroll)
-		case "forward":
-			transition = runtime.navigation.Forward(currentScroll)
-		}
-		if transition.Changed {
-			runtime.selected = transition.Screen
-			runtime.scroll = cloneScroll(transition.Scroll)
-			if runtime.scroll == nil {
-				runtime.scroll = make(map[string]image.Point)
-			}
-			runtime.state.SetTransient(interaction.Transient{})
-			runtime.navigationRevision++
-			changed = true
-		}
+	if changed {
+		runtime.syncEditingFromStateLocked()
+	}
+	if navigationAction != nil && runtime.applyNavigationLocked(navigationAction) {
+		changed = true
 	}
 	if activation.CloseSelect {
 		transient := runtime.state.Transient()
@@ -291,6 +388,35 @@ func (runtime *Runtime) Activate(activation interaction.Activation) error {
 	return nil
 }
 
+func (runtime *Runtime) applyNavigationLocked(action *document.Action) bool {
+	if action == nil || runtime.navigation == nil || runtime.loaded == nil || runtime.loaded.Document.Kind != document.KindApp {
+		return false
+	}
+	var transition navigation.Transition
+	currentScroll := cloneScroll(runtime.scroll)
+	switch action.Action {
+	case "navigate":
+		transition = runtime.navigation.Navigate(action.To, currentScroll)
+	case "replace":
+		transition = runtime.navigation.Replace(action.To, currentScroll)
+	case "back":
+		transition = runtime.navigation.Back(currentScroll)
+	case "forward":
+		transition = runtime.navigation.Forward(currentScroll)
+	}
+	if !transition.Changed {
+		return false
+	}
+	runtime.selected = transition.Screen
+	runtime.scroll = cloneScroll(transition.Scroll)
+	if runtime.scroll == nil {
+		runtime.scroll = make(map[string]image.Point)
+	}
+	runtime.state.SetTransient(interaction.Transient{})
+	runtime.navigationRevision++
+	return true
+}
+
 func (runtime *Runtime) SetTransient(transient interaction.Transient) {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
@@ -299,7 +425,17 @@ func (runtime *Runtime) SetTransient(transient interaction.Transient) {
 	}
 	if runtime.state.Transient() != transient {
 		previous := runtime.state.Transient()
+		if previous.Focused != "" && previous.Focused != transient.Focused && runtime.editing != nil {
+			if field := semanticNodeByHandle(runtime.publishedTree, previous.Focused); field != nil && field.Role == "textbox" {
+				if runtime.editing.Touch(field.ID) {
+					_ = runtime.publishValidFieldDraftLocked(field.ID)
+				}
+			}
+		}
 		runtime.state.SetTransient(transient)
+		if previous.Focused != transient.Focused && transient.Focused != "" {
+			runtime.revealFocusedLocked(transient.Focused)
+		}
 		if previous.OpenSelect != transient.OpenSelect || previous.ActiveOption != transient.ActiveOption {
 			runtime.effectiveRoot = nil
 		}
@@ -307,11 +443,86 @@ func (runtime *Runtime) SetTransient(transient interaction.Transient) {
 	}
 }
 
+func (runtime *Runtime) revealFocusedLocked(handle string) {
+	var walk func(*semantic.Node) (*semantic.Rect, bool)
+	walk = func(node *semantic.Node) (*semantic.Rect, bool) {
+		if node == nil {
+			return nil, false
+		}
+		if node.Handle == handle && node.Bounds != nil {
+			if node.Role == "textbox" {
+				for _, child := range node.Children {
+					if child != nil && child.Type == "field_box" && child.Bounds != nil {
+						caret := render.FieldCaretRect(child.Props, child.Bounds.ImageRectangle())
+						if !caret.Empty() {
+							return &semantic.Rect{X: caret.Min.X, Y: caret.Min.Y, Width: caret.Dx(), Height: caret.Dy()}, true
+						}
+					}
+				}
+			}
+			return node.Bounds, true
+		}
+		for _, child := range node.Children {
+			bounds, found := walk(child)
+			if !found {
+				continue
+			}
+			if node.Type == "scroll" && node.Bounds != nil {
+				axis, _ := node.Props["axis"].(string)
+				key := semanticScrollKey(node)
+				offset := runtime.scroll[key]
+				previousOffset := offset
+				if axis == "horizontal" {
+					if bounds.X < node.Bounds.X {
+						offset.X = max(0, offset.X-(node.Bounds.X-bounds.X))
+					} else if bounds.X+bounds.Width > node.Bounds.X+node.Bounds.Width {
+						offset.X += bounds.X + bounds.Width - node.Bounds.X - node.Bounds.Width
+					}
+				} else {
+					if bounds.Y < node.Bounds.Y {
+						offset.Y = max(0, offset.Y-(node.Bounds.Y-bounds.Y))
+					} else if bounds.Y+bounds.Height > node.Bounds.Y+node.Bounds.Height {
+						offset.Y += bounds.Y + bounds.Height - node.Bounds.Y - node.Bounds.Height
+					}
+				}
+				if len(node.Children) == 1 && node.Children[0] != nil && node.Children[0].Bounds != nil {
+					if axis == "horizontal" {
+						offset.X = min(offset.X, max(0, node.Children[0].Bounds.Width-node.Bounds.Width))
+					} else {
+						offset.Y = min(offset.Y, max(0, node.Children[0].Bounds.Height-node.Bounds.Height))
+					}
+				}
+				runtime.scroll[key] = offset
+				adjusted := *bounds
+				adjusted.X -= offset.X - previousOffset.X
+				adjusted.Y -= offset.Y - previousOffset.Y
+				bounds = &adjusted
+			}
+			return bounds, true
+		}
+		return nil, false
+	}
+	_, _ = walk(runtime.publishedTree)
+}
+
+func semanticScrollKey(node *semantic.Node) string {
+	if node.Name == "" {
+		return node.Handle
+	}
+	parts := make([]string, 0, len(node.Breadcrumb)+1)
+	for _, segment := range node.Breadcrumb {
+		parts = append(parts, url.PathEscape(segment))
+	}
+	parts = append(parts, url.PathEscape(node.Name))
+	return strings.Join(parts, "/")
+}
+
 func (runtime *Runtime) ResetState() {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 	if runtime.state != nil {
 		runtime.state.ResetContext(runtime.selected)
+		runtime.syncEditingFromStateLocked()
 		runtime.effectiveRoot = nil
 		runtime.runtimeRevision++
 	}
@@ -344,6 +555,7 @@ func (runtime *Runtime) SelectScreen(screen string) bool {
 		if runtime.state != nil {
 			runtime.state.SetTransient(interaction.Transient{})
 		}
+		runtime.replaceEditingDraftsForSelectionLocked(screen)
 		runtime.navigationRevision++
 		runtime.runtimeRevision++
 		runtime.effectiveRoot = nil
@@ -353,6 +565,30 @@ func (runtime *Runtime) SelectScreen(screen string) bool {
 		runtime.Reload()
 	}
 	return true
+}
+
+func (runtime *Runtime) replaceEditingDraftsForSelectionLocked(selection string) {
+	if runtime.loaded == nil || runtime.editing == nil || runtime.state == nil {
+		return
+	}
+	root := runtime.loaded.Root
+	if runtime.loaded.Document.Kind == document.KindApp {
+		root = runtime.loaded.Screens[selection]
+	}
+	values := runtime.state.AllValues()
+	var walk func(*project.Node)
+	walk = func(node *project.Node) {
+		if node == nil {
+			return
+		}
+		if node.Type == "text_field" || node.Type == "text_area" {
+			_ = runtime.editing.ReplaceCommitted(semantic.StableID(node, selection), values[node.Scope][node.Binding])
+		}
+		for _, child := range node.Children {
+			walk(child)
+		}
+	}
+	walk(root)
 }
 
 func (runtime *Runtime) SetViewport(width, height int) {
@@ -478,7 +714,9 @@ func (runtime *Runtime) RuntimeTree() (*semantic.Node, error) {
 	if snapshot.Root == nil {
 		return nil, fmt.Errorf("no valid runtime tree is available")
 	}
-	return render.Render(snapshot.Root, snapshot.Viewport, renderState(snapshot)).Tree, nil
+	tree := render.Render(snapshot.Root, snapshot.Viewport, renderState(snapshot)).Tree
+	runtime.PublishTree(tree)
+	return tree, nil
 }
 
 // ActivateSemanticID performs the completed semantic activation represented by id.
@@ -491,15 +729,361 @@ func (runtime *Runtime) ActivateSemanticID(id string) error {
 		if node.ID != id {
 			continue
 		}
+		if !node.Visible || !node.InViewport || !node.Enabled {
+			return fmt.Errorf("semantic node %q is not activatable", id)
+		}
 		if node.Type == "select" && node.Visible && node.InViewport && node.Enabled {
 			return runtime.Activate(interaction.Activation{OpenSelect: node.Handle, ActiveOption: initialSelectOption(node)})
 		}
-		if !node.Visible || !node.InViewport || !node.Enabled || len(node.Actions) == 0 {
+		if node.Type == "button" {
+			if action, _ := node.Props["form_action"].(string); action != "" {
+				form := semanticNodeByHandle(tree, node.FormHandle)
+				if form == nil {
+					return fmt.Errorf("form for semantic node %q is unavailable", id)
+				}
+				if action == "submit" {
+					return runtime.SubmitForm(form.ID)
+				}
+				return runtime.ResetForm(form.ID)
+			}
+		}
+		if len(node.Actions) == 0 {
 			return fmt.Errorf("semantic node %q is not activatable", id)
 		}
 		return runtime.Activate(interaction.Activation{Scope: node.Scope, Actions: node.Actions})
 	}
 	return fmt.Errorf("unknown semantic node %q", id)
+}
+
+func semanticNodeByHandle(root *semantic.Node, handle string) *semantic.Node {
+	for _, node := range semantic.Flatten(root) {
+		if node.Handle == handle {
+			return node
+		}
+	}
+	return nil
+}
+
+// SetFieldDraft replaces one visible editable field's draft and publishes it
+// when the resulting typed value is valid.
+func (runtime *Runtime) SetFieldDraft(id, draft string) error {
+	tree, err := runtime.RuntimeTree()
+	if err != nil {
+		return err
+	}
+	var field *semantic.Node
+	for _, node := range semantic.Flatten(tree) {
+		if node.ID == id {
+			field = node
+			break
+		}
+	}
+	if field == nil || field.Role != "textbox" {
+		return fmt.Errorf("unknown semantic field %q", id)
+	}
+	if !field.Visible || !field.InViewport || !field.Enabled || field.ReadOnly {
+		return fmt.Errorf("semantic field %q is not editable", id)
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	before := runtime.editing.Revision()
+	if err := runtime.editing.SetDraft(id, draft); err != nil {
+		return err
+	}
+	if runtime.editing.Revision() == before {
+		return nil
+	}
+	if err := runtime.publishValidFieldDraftLocked(id); err != nil {
+		return err
+	}
+	runtime.effectiveRoot = nil
+	runtime.runtimeRevision++
+	return nil
+}
+
+func (runtime *Runtime) ApplyFieldEdit(id string, start, end int, text string) error {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.editing == nil {
+		return fmt.Errorf("field editing is unavailable")
+	}
+	before := runtime.editing.Revision()
+	if err := runtime.editing.ApplyRuneEdit(id, start, end, text); err != nil {
+		return err
+	}
+	if runtime.editing.Revision() == before {
+		return nil
+	}
+	if err := runtime.publishValidFieldDraftLocked(id); err != nil {
+		return err
+	}
+	runtime.effectiveRoot = nil
+	runtime.runtimeRevision++
+	return nil
+}
+
+func (runtime *Runtime) SetFieldSelection(id string, start, end int) error {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	before := runtime.editing.Revision()
+	if err := runtime.editing.SetRuneSelection(id, start, end); err != nil {
+		return err
+	}
+	if runtime.editing.Revision() == before {
+		return nil
+	}
+	runtime.effectiveRoot = nil
+	runtime.runtimeRevision++
+	return nil
+}
+
+func (runtime *Runtime) SetFieldComposition(id string, start, end int) error {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	before := runtime.editing.Revision()
+	if err := runtime.editing.SetComposition(id, start, end); err != nil {
+		return err
+	}
+	if runtime.editing.Revision() == before {
+		return nil
+	}
+	if err := runtime.publishValidFieldDraftLocked(id); err != nil {
+		return err
+	}
+	runtime.effectiveRoot = nil
+	runtime.runtimeRevision++
+	return nil
+}
+
+func (runtime *Runtime) CancelFieldComposition(id string) bool {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if !runtime.editing.CancelComposition(id) {
+		return false
+	}
+	if err := runtime.publishValidFieldDraftLocked(id); err != nil {
+		return false
+	}
+	runtime.effectiveRoot = nil
+	runtime.runtimeRevision++
+	return true
+}
+
+func (runtime *Runtime) MoveFieldSelection(id, movement string, extend bool) bool {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if !runtime.editing.MoveSelection(id, movement, extend) {
+		return false
+	}
+	runtime.effectiveRoot = nil
+	runtime.runtimeRevision++
+	return true
+}
+
+func (runtime *Runtime) SetFieldVisualColumns(id string, columns int) bool {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if !runtime.editing.SetVisualColumns(id, columns) {
+		return false
+	}
+	runtime.effectiveRoot = nil
+	runtime.runtimeRevision++
+	return true
+}
+
+func (runtime *Runtime) ScrollFieldInternal(id string, lines int) bool {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.editing == nil || !runtime.editing.ScrollInternal(id, lines) {
+		return false
+	}
+	runtime.effectiveRoot = nil
+	runtime.runtimeRevision++
+	return true
+}
+
+func (runtime *Runtime) DeleteFieldSelection(id string, backward, word bool) bool {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if !runtime.editing.DeleteSelection(id, backward, word) {
+		return false
+	}
+	if err := runtime.publishValidFieldDraftLocked(id); err != nil {
+		return false
+	}
+	runtime.effectiveRoot = nil
+	runtime.runtimeRevision++
+	return true
+}
+
+func (runtime *Runtime) TouchField(id string) bool {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if !runtime.editing.Touch(id) {
+		return false
+	}
+	if err := runtime.publishValidFieldDraftLocked(id); err != nil {
+		return false
+	}
+	runtime.effectiveRoot = nil
+	runtime.runtimeRevision++
+	return true
+}
+
+func (runtime *Runtime) FieldRuneSelection(id string) (int, int, bool) {
+	runtime.mu.RLock()
+	defer runtime.mu.RUnlock()
+	if runtime.editing == nil {
+		return 0, 0, false
+	}
+	return runtime.editing.RuneSelection(id)
+}
+
+func (runtime *Runtime) FieldSelectedText(id string) (string, bool) {
+	runtime.mu.RLock()
+	defer runtime.mu.RUnlock()
+	return runtime.editing.SelectedText(id)
+}
+
+func (runtime *Runtime) FieldDraft(id string) (string, bool) {
+	runtime.mu.RLock()
+	defer runtime.mu.RUnlock()
+	return runtime.editing.Draft(id)
+}
+
+func (runtime *Runtime) UndoField(id string) bool {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	changed := runtime.editing.Undo(id)
+	if changed {
+		if err := runtime.publishValidFieldDraftLocked(id); err != nil {
+			return false
+		}
+		runtime.effectiveRoot = nil
+		runtime.runtimeRevision++
+	}
+	return changed
+}
+
+func (runtime *Runtime) RedoField(id string) bool {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	changed := runtime.editing.Redo(id)
+	if changed {
+		if err := runtime.publishValidFieldDraftLocked(id); err != nil {
+			return false
+		}
+		runtime.effectiveRoot = nil
+		runtime.runtimeRevision++
+	}
+	return changed
+}
+
+// SubmitForm validates all enabled descendant fields, publishes their drafts,
+// then performs the form's transactional authored submit effects.
+func (runtime *Runtime) SubmitForm(id string) error {
+	tree, err := runtime.RuntimeTree()
+	if err != nil {
+		return err
+	}
+	var form *semantic.Node
+	for _, node := range semantic.Flatten(tree) {
+		if node.ID == id && node.Role == "form" {
+			form = node
+			break
+		}
+	}
+	if form == nil {
+		return fmt.Errorf("unknown semantic form %q", id)
+	}
+	runtime.mu.Lock()
+	changes := make(map[string]map[string]any)
+	var firstInvalid *semantic.Node
+	var firstValidationError error
+	var accepted []struct {
+		id    string
+		value any
+	}
+	for _, field := range semantic.Flatten(form) {
+		if field.Role != "textbox" || !field.Enabled {
+			continue
+		}
+		value, prepareErr := runtime.editing.PrepareCommit(field.ID)
+		if prepareErr != nil {
+			if firstInvalid == nil {
+				firstInvalid = field
+				firstValidationError = prepareErr
+			}
+			continue
+		}
+		if changes[field.Scope] == nil {
+			changes[field.Scope] = make(map[string]any)
+		}
+		changes[field.Scope][field.Binding] = value
+		accepted = append(accepted, struct {
+			id    string
+			value any
+		}{field.ID, value})
+	}
+	if firstInvalid != nil {
+		transient := runtime.state.Transient()
+		transient.Focused = firstInvalid.Handle
+		runtime.state.SetTransient(transient)
+		runtime.revealFocusedLocked(firstInvalid.Handle)
+		runtime.effectiveRoot = nil
+		runtime.runtimeRevision++
+		runtime.mu.Unlock()
+		return firstValidationError
+	}
+	navigationAction, err := runtime.state.ApplyForm(changes, form.Scope, form.Actions)
+	if err != nil {
+		runtime.mu.Unlock()
+		return err
+	}
+	for _, field := range accepted {
+		_ = runtime.editing.AcceptCommitted(field.id, field.value)
+	}
+	runtime.syncEditingFromStateLocked()
+	runtime.effectiveRoot = nil
+	runtime.runtimeRevision++
+	runtime.applyNavigationLocked(navigationAction)
+	runtime.mu.Unlock()
+	return nil
+}
+
+// ResetForm resets only states bound to fields beneath the selected form.
+func (runtime *Runtime) ResetForm(id string) error {
+	tree, err := runtime.RuntimeTree()
+	if err != nil {
+		return err
+	}
+	var form *semantic.Node
+	for _, node := range semantic.Flatten(tree) {
+		if node.ID == id && node.Role == "form" {
+			form = node
+			break
+		}
+	}
+	if form == nil {
+		return fmt.Errorf("unknown semantic form %q", id)
+	}
+	names := make(map[string][]string)
+	var ids []string
+	for _, field := range semantic.Flatten(form) {
+		if field.Role == "textbox" {
+			names[field.Scope] = append(names[field.Scope], field.Binding)
+			ids = append(ids, field.ID)
+		}
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if err := runtime.state.ResetScopedValues(names); err != nil {
+		return err
+	}
+	runtime.editing.Reset(ids, runtime.state.AllValues())
+	runtime.effectiveRoot = nil
+	runtime.runtimeRevision++
+	return nil
 }
 
 func initialSelectOption(selectNode *semantic.Node) string {
@@ -543,12 +1127,25 @@ func (runtime *Runtime) SetControlValue(id string, value any) (any, error) {
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
+	if control.Type == "text_field" || control.Type == "text_area" {
+		value, err = runtime.editing.ValidateCommitted(id, value)
+		if err != nil {
+			return nil, err
+		}
+	}
 	before := runtime.state.Revision()
+	editingBefore := runtime.editing.Revision()
 	if err := runtime.state.SetValues(control.Scope, map[string]any{control.Binding: value}); err != nil {
 		return nil, err
 	}
 	normalized := runtime.state.Values(control.Scope)[control.Binding]
-	if runtime.state.Revision() != before {
+	if control.Type == "text_field" || control.Type == "text_area" {
+		_ = runtime.editing.ReplaceCommitted(id, normalized)
+		runtime.editing.SyncCommitted(runtime.state.AllValues())
+	} else {
+		runtime.syncEditingFromStateLocked()
+	}
+	if runtime.state.Revision() != before || runtime.editing.Revision() != editingBefore {
 		runtime.effectiveRoot = nil
 		runtime.runtimeRevision++
 	}
@@ -557,7 +1154,7 @@ func (runtime *Runtime) SetControlValue(id string, value any) (any, error) {
 
 func settableControlType(nodeType string) bool {
 	switch nodeType {
-	case "toggle", "checkbox", "radio_group", "tabs", "select", "slider", "stepper":
+	case "text_field", "text_area", "toggle", "checkbox", "radio_group", "tabs", "select", "slider", "stepper":
 		return true
 	default:
 		return false
@@ -616,6 +1213,7 @@ func (runtime *Runtime) SetStateValues(scope string, values map[string]any) erro
 	if err := runtime.state.SetValues(scope, values); err != nil {
 		return err
 	}
+	runtime.syncEditingFromStateLocked()
 	runtime.effectiveRoot = nil
 	runtime.runtimeRevision++
 	return nil
@@ -646,6 +1244,7 @@ func (runtime *Runtime) ResetStateScope(scope string) error {
 	if err := runtime.state.ResetScope(scope); err != nil {
 		return err
 	}
+	runtime.syncEditingFromStateLocked()
 	runtime.effectiveRoot = nil
 	runtime.runtimeRevision++
 	return nil

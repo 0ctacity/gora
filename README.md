@@ -4,13 +4,14 @@ Gora is a cross-platform preview runtime for strict, local `.gora` UI documents.
 It turns a small YAML document into a live native app window, an optional Studio
 canvas, or a headless automation session with responsive breakpoints,
 scrolling, deterministic local state, semantic buttons, links, toggles,
-checkboxes, radio groups, tabs, selects, sliders, and steppers, named-screen
+checkboxes, radio groups, tabs, selects, sliders, steppers, text fields, text
+areas, and local forms, named-screen
 navigation, live semantic inspection, deterministic PNG capture, and a
 project-oriented MCP control server.
 
 V1 is deliberately a preview tool. It does not generate production UI code and
-does not include text inputs/forms, URL routing, animation, remote assets, SVG,
-or raw input injection.
+does not include URL routing, animation, remote assets, SVG, secure/password
+fields, file inputs, or raw input injection.
 
 ## Install
 
@@ -82,6 +83,13 @@ rendering, roving keyboard focus, slider dragging, and numeric normalization:
 
 ```sh
 ./gora run examples/semantic-controls/app.gora --root . --studio
+```
+
+To exercise text/number drafts, validation, IME editing, local submit/reset,
+read-only and disabled fields, and component-local form bindings:
+
+```sh
+./gora run examples/forms/app.gora --root . --studio
 ```
 
 While a session is open, capture its current screen, viewport, responsive
