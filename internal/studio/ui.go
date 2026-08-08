@@ -240,9 +240,8 @@ func layoutStudioCanvas(gtx layout.Context, theme *material.Theme, runtime *Runt
 	if state.inspecting && state.selectedHandle != "" {
 		paintHighlight(previewGtx, result.Bounds[state.selectedHandle])
 	}
-	layoutPreviewScrollbar(previewGtx, theme, runtime, state, snapshot, result, window)
 	state.runtimeTree = result.Tree
-	runtime.PublishTree(result.Tree)
+	runtime.PublishFrame(result.Tree, result.Scroll)
 	if state.router == nil {
 		state.router = interaction.NewRouter()
 	}
@@ -251,6 +250,7 @@ func layoutStudioCanvas(gtx layout.Context, theme *material.Theme, runtime *Runt
 		runtime.SetTransient(state.router.Transient())
 		window.Invalidate()
 	}
+	runtime.PublishRouterSnapshot(state.router.Snapshot())
 	offset.Pop()
 	hardClip.Pop()
 	return layout.Dimensions{Size: viewport}
@@ -487,38 +487,16 @@ func handleActions(gtx layout.Context, runtime *Runtime, state *uiState, snapsho
 	}
 	handleDocumentInteraction(gtx, runtime, state, window)
 	scrollEvents := collectCanvasScrollEvents(gtx, state)
-	zoomScroll, horizontalScroll, verticalScroll := scrollEvents.zoom, scrollEvents.horizontal, scrollEvents.vertical
-	for _, fieldScroll := range scrollEvents.fields {
-		if columns, ok := fieldVisualColumns(fieldScroll.field); ok {
-			runtime.SetFieldVisualColumns(fieldScroll.field.ID, columns)
-		}
-		lines := int(math.Round(float64(fieldScroll.delta) / 16))
-		if lines == 0 {
-			lines = 1
-			if fieldScroll.delta < 0 {
-				lines = -1
-			}
-		}
-		if !runtime.ScrollFieldInternal(fieldScroll.field.ID, lines) {
-			verticalScroll += fieldScroll.delta
-		}
+	blockPageScroll := state.blockPageScroll(gtx.Now, scrollEvents.zoom, float32(len(scrollEvents.events)))
+	if scrollEvents.zoom != 0 {
+		state.zoomValue = zoomAfterTrackpadScroll(state.zoomValue, scrollEvents.zoom)
 	}
-	axis, scroll := dominantPageScroll(horizontalScroll, verticalScroll)
-	blockPageScroll := state.blockPageScroll(gtx.Now, zoomScroll, scroll)
-	if zoomScroll != 0 {
-		state.zoomValue = zoomAfterTrackpadScroll(state.zoomValue, zoomScroll)
-	}
-	if !blockPageScroll && scroll != 0 {
-		if !state.panCanvas(axis, scroll) {
-			scale := state.zoomValue * gtx.Metric.PxPerDp
-			logicalScroll := int(math.Round(float64(float32(scroll) / scale)))
-			if logicalScroll == 0 {
-				logicalScroll = 1
-				if scroll < 0 {
-					logicalScroll = -1
-				}
-			}
-			scrollDocument(runtime, state, snapshot, axis, logicalScroll)
+	if !blockPageScroll && !state.router.ScrollbarPointerOwned() && len(scrollEvents.events) != 0 {
+		scale := state.zoomValue * gtx.Metric.PxPerDp
+		if routeScrollEvents(runtime, state, snapshot, scrollEvents.events, scale, func(delta float32) bool {
+			return state.panCanvas("horizontal", delta)
+		}) {
+			window.Invalidate()
 		}
 	}
 	if state.nextScreen.Clicked(gtx) && len(snapshot.Screens) > 0 {
@@ -562,18 +540,16 @@ func handleActions(gtx layout.Context, runtime *Runtime, state *uiState, snapsho
 	}
 	if state.inspectPending && state.inspecting && snapshot.Root != nil {
 		state.inspectPending = false
-		nodes := semantic.Flatten(state.runtimeTree)
-		for index := len(nodes) - 1; index >= 0; index-- {
-			node := nodes[index]
-			if node.Bounds != nil && node.Clip != nil && state.inspectPoint.In(node.Bounds.ImageRectangle().Intersect(node.Clip.ImageRectangle())) {
-				state.selectedHandle = node.Handle
-				state.selected = fmt.Sprintf("%s %q role=%s label=%q enabled=%t hovered=%t pressed=%t focused=%t scope=%s state=%v actions=%v bounds=%v clip=%v props=%v · %s:%d · %v",
-					node.Type, node.Name,
-					node.Role, node.Label, node.Enabled, node.Hovered, node.Pressed, node.Focused,
-					node.Scope, node.State, node.Effects, node.Bounds.ImageRectangle(), node.Clip.ImageRectangle(), node.Props,
-					filepath.Base(node.Source.File), node.Source.Line, node.Breadcrumb)
-				break
-			}
+		node := semantic.TopmostAt(state.runtimeTree, state.inspectPoint, func(node *semantic.Node) bool {
+			return node.Visible
+		})
+		if node != nil {
+			state.selectedHandle = node.Handle
+			state.selected = fmt.Sprintf("%s %q role=%s label=%q enabled=%t hovered=%t pressed=%t focused=%t scope=%s state=%v actions=%v bounds=%v clip=%v props=%v · %s:%d · %v",
+				node.Type, node.Name,
+				node.Role, node.Label, node.Enabled, node.Hovered, node.Pressed, node.Focused,
+				node.Scope, node.State, node.Effects, node.Bounds.ImageRectangle(), node.Clip.ImageRectangle(), node.Props,
+				filepath.Base(node.Source.File), node.Source.Line, node.Breadcrumb)
 		}
 	}
 	if state.capture.Clicked(gtx) {
@@ -622,9 +598,14 @@ func handleDocumentInteraction(gtx layout.Context, runtime *Runtime, state *uiSt
 		}
 		point := documentPoint(state, gtx.Metric, event.Position)
 		touch := event.Source == pointer.Touch
+		source := "mouse"
+		if touch {
+			source = "touch"
+		}
+		state.router.SetPointerMetadata(source, int(event.Buttons), point)
 		switch event.Kind {
 		case pointer.Enter, pointer.Move, pointer.Drag:
-			state.router.Move(point, touch)
+			state.router.MovePointer(int(event.PointerID), point, touch)
 			if event.Kind == pointer.Drag && state.fieldSelectionID != "" && state.fieldPointerID == int(event.PointerID) {
 				if field := semanticNodeByID(state.runtimeTree, state.fieldSelectionID); field != nil {
 					caret := fieldRuneAtPoint(field, point)
@@ -634,7 +615,7 @@ func handleDocumentInteraction(gtx layout.Context, runtime *Runtime, state *uiSt
 				}
 			}
 		case pointer.Leave:
-			state.router.Move(image.Pt(-1, -1), touch)
+			state.router.MovePointer(int(event.PointerID), image.Pt(-1, -1), touch)
 		case pointer.Press:
 			if touch || event.Buttons.Contain(pointer.ButtonPrimary) {
 				if state.inspecting {
@@ -644,6 +625,11 @@ func handleDocumentInteraction(gtx layout.Context, runtime *Runtime, state *uiSt
 					continue
 				}
 				if state.router.Press(int(event.PointerID), point) {
+					if state.router.ScrollbarPointerOwned() {
+						gtx.Execute(pointer.GrabCmd{Tag: &state.interactionInput, ID: event.PointerID})
+						gtx.Execute(key.FocusCmd{Tag: &state.interactionInput})
+						continue
+					}
 					if field := hitTextField(state.runtimeTree, point); fieldAllowsPointerSelection(field) {
 						caret := fieldRuneAtPoint(field, point)
 						if state.lastFieldClickID == field.ID && event.Time-state.lastFieldClick <= 400*time.Millisecond {
@@ -954,6 +940,13 @@ func handleDocumentInteraction(gtx layout.Context, runtime *Runtime, state *uiSt
 			mutated = true
 		}
 	}
+	if change, ok := state.router.TakeScrollChange(); ok {
+		if err := runtime.ScrollSemanticID(change.ID, change.Mode, change.X, change.Y); err != nil {
+			state.status = err.Error()
+		} else {
+			mutated = true
+		}
+	}
 	transient := state.router.Transient()
 	if transient != before {
 		runtime.SetTransient(transient)
@@ -993,14 +986,9 @@ func semanticNodeByID(root *semantic.Node, id string) *semantic.Node {
 }
 
 func hitTextField(root *semantic.Node, point image.Point) *semantic.Node {
-	nodes := semantic.Flatten(root)
-	for index := len(nodes) - 1; index >= 0; index-- {
-		node := nodes[index]
-		if node.Role == "textbox" && node.Bounds != nil && node.Clip != nil && point.In(node.Bounds.ImageRectangle().Intersect(node.Clip.ImageRectangle())) {
-			return node
-		}
-	}
-	return nil
+	return semantic.TopmostAt(root, point, func(node *semantic.Node) bool {
+		return node.Role == "textbox"
+	})
 }
 
 func fieldAllowsPointerSelection(field *semantic.Node) bool {
@@ -1160,6 +1148,12 @@ type canvasScrollInput struct {
 	horizontal float32
 	vertical   float32
 	fields     []fieldScrollInput
+	events     []canvasScrollEvent
+}
+
+type canvasScrollEvent struct {
+	point image.Point
+	delta f32.Point
 }
 
 func collectCanvasScrollEvents(gtx layout.Context, state *uiState) (result canvasScrollInput) {
@@ -1177,6 +1171,8 @@ func collectCanvasScrollEvents(gtx layout.Context, state *uiState) (result canva
 			result.zoom += trackpadZoomDelta(scrollEvent)
 			continue
 		}
+		point := documentPoint(state, gtx.Metric, scrollEvent.Position)
+		result.events = append(result.events, canvasScrollEvent{point: point, delta: scrollEvent.Scroll})
 		axis, delta := canvasScrollDelta(scrollEvent)
 		if axis == "horizontal" {
 			result.horizontal += delta
@@ -1201,17 +1197,54 @@ func collectCanvasScrollEvents(gtx layout.Context, state *uiState) (result canva
 	}
 }
 
-func textAreaScrollTarget(root *semantic.Node, point image.Point) *semantic.Node {
-	var target *semantic.Node
-	for _, node := range semantic.Flatten(root) {
-		if node == nil || node.Type != "text_area" || !node.Enabled || !node.Visible || !node.InViewport || node.Bounds == nil || node.Clip == nil {
+func routeScrollEvents(runtime *Runtime, state *uiState, snapshot Snapshot, events []canvasScrollEvent, scale float32, panHorizontal func(float32) bool) bool {
+	if runtime == nil || state == nil || state.runtimeTree == nil {
+		return false
+	}
+	if scale <= 0 {
+		scale = 1
+	}
+	working := cloneScroll(snapshot.Scroll)
+	changes := make(map[string]image.Point)
+	metrics := runtime.publishedScrollMetrics()
+	for _, event := range events {
+		delta := logicalScrollDelta(event.delta.X, event.delta.Y, scale)
+		if delta.Y != 0 {
+			if field := textAreaScrollTarget(state.runtimeTree, event.point); field != nil {
+				if columns, ok := fieldVisualColumns(field); ok {
+					runtime.SetFieldVisualColumns(field.ID, columns)
+				}
+				lines := int(math.Round(float64(event.delta.Y) / 16))
+				if lines == 0 {
+					lines = 1
+					if event.delta.Y < 0 {
+						lines = -1
+					}
+				}
+				if runtime.ScrollFieldInternal(field.ID, lines) {
+					delta.Y = 0
+				}
+			}
+		}
+		if delta.X != 0 && panHorizontal != nil && panHorizontal(event.delta.X) {
+			delta.X = 0
+		}
+		if delta == (image.Point{}) {
 			continue
 		}
-		if point.In(node.Bounds.ImageRectangle().Intersect(node.Clip.ImageRectangle())) {
-			target = node
+		planned := planScrollChain(state.runtimeTree, metrics, working, event.point, delta)
+		for key, offset := range planned.Updates {
+			working[key] = offset
+			changes[key] = offset
 		}
 	}
-	return target
+	return runtime.setScrollPoints(changes)
+}
+
+func textAreaScrollTarget(root *semantic.Node, point image.Point) *semantic.Node {
+	return semantic.TopmostAt(root, point, func(node *semantic.Node) bool {
+		return node.Type == "text_area" && node.Enabled && node.InViewport
+	})
 }
 
 func trackpadZoomDelta(scrollEvent pointer.Event) float32 {

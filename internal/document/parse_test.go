@@ -163,3 +163,74 @@ screens:
 		t.Fatal("Parse accepted duplicate authored names")
 	}
 }
+
+func TestParseScrollOneAxisBaselineContract(t *testing.T) {
+	tests := []struct {
+		name          string
+		props         string
+		wantAxis      string
+		wantScrollbar any
+	}{
+		{name: "default vertical", props: "", wantAxis: ""},
+		{name: "vertical", props: "axis: vertical", wantAxis: "vertical"},
+		{name: "horizontal", props: "axis: horizontal", wantAxis: "horizontal"},
+		{name: "legacy scrollbar true", props: "axis: vertical\nscrollbar: true", wantAxis: "vertical", wantScrollbar: true},
+		{name: "legacy scrollbar false", props: "axis: horizontal\nscrollbar: false", wantAxis: "horizontal", wantScrollbar: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			source := "gora: 1\nkind: app\nviewport: { width: 100, height: 80 }\nentry: main\nscreens:\n  main:\n    type: scroll\n"
+			if test.props != "" {
+				source += "    props:\n      " + strings.ReplaceAll(test.props, "\n", "\n      ") + "\n"
+			}
+			source += "    children: [{ type: spacer, props: { height: 200 } }]\n"
+			doc, diagnostics := Parse(test.name+".gora", []byte(source))
+			if len(diagnostics) != 0 {
+				t.Fatalf("Parse returned diagnostics: %+v", diagnostics)
+			}
+			if doc == nil || doc.Screens["main"] == nil {
+				t.Fatal("Parse returned no main scroll node")
+			}
+			scroll := doc.Screens["main"]
+			if got := testStringValue(scroll.Props["axis"], ""); got != test.wantAxis {
+				t.Fatalf("authored axis = %q, want %q", got, test.wantAxis)
+			}
+			if got, exists := scroll.Props["scrollbar"]; exists {
+				if got != test.wantScrollbar {
+					t.Fatalf("legacy scrollbar = %#v, want %#v", got, test.wantScrollbar)
+				}
+			} else if test.wantScrollbar != nil {
+				t.Fatalf("legacy scrollbar missing, want %#v", test.wantScrollbar)
+			}
+		})
+	}
+}
+
+func TestParseScrollRejectsMultipleChildren(t *testing.T) {
+	_, diagnostics := Parse("scroll-children.gora", []byte(`
+gora: 1
+kind: app
+viewport: { width: 100, height: 80 }
+entry: main
+screens:
+  main:
+    type: scroll
+    children:
+      - { type: spacer, props: { height: 100 } }
+      - { type: spacer, props: { height: 100 } }
+`))
+	for _, diagnostic := range diagnostics {
+		if diagnostic.Code == "schema.children" {
+			return
+		}
+	}
+	t.Fatalf("Parse accepted multiple scroll children: %+v", diagnostics)
+}
+
+func testStringValue(value any, fallback string) string {
+	text, ok := value.(string)
+	if !ok {
+		return fallback
+	}
+	return text
+}

@@ -40,6 +40,7 @@ type LaunchConfig struct {
 	SocketPath string
 	Mode       LaunchMode
 	Listen     string
+	Automation bool
 }
 
 type Launcher func(LaunchConfig) error
@@ -77,6 +78,7 @@ func mcpCommand(args []string, stderr io.Writer, launch Launcher) int {
 	flags := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	listen := flags.String("listen", "127.0.0.1:8787", "loopback listen address")
+	automation := flags.Bool("automation", false, "enable deterministic MCP automation tools and resources")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
 		return ExitFailure
 	}
@@ -94,7 +96,7 @@ func mcpCommand(args []string, stderr io.Writer, launch Launcher) int {
 		fmt.Fprintln(stderr, "MCP server launcher is unavailable")
 		return ExitFailure
 	}
-	if err := launch(LaunchConfig{Mode: LaunchMCP, Listen: *listen}); err != nil {
+	if err := launch(LaunchConfig{Mode: LaunchMCP, Listen: *listen, Automation: *automation}); err != nil {
 		fmt.Fprintln(stderr, err)
 		return ExitFailure
 	}
@@ -411,5 +413,5 @@ func usage(output io.Writer) {
 	fmt.Fprintln(output, "  gora validate <file> [--root <dir>] [--format text|json]")
 	fmt.Fprintln(output, "  gora render <file> --output <new.png> [--scale <positive-integer>] [--root <dir>] [--from app|studio|headless]")
 	fmt.Fprintln(output, "  gora inspect <file> [--root <dir>] [--from app|studio|headless]")
-	fmt.Fprintln(output, "  gora mcp [--listen 127.0.0.1:<port>]")
+	fmt.Fprintln(output, "  gora mcp [--listen 127.0.0.1:<port>] [--automation]")
 }

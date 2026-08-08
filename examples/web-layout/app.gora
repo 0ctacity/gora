@@ -47,10 +47,10 @@ screens:
                     props: { width: 34, height: 34, background: { ref: theme.color.primary }, radius: 10 }
                     children:
                       - type: text
-                        props: { text: G, size: 16, weight: 700, color: "#FFFFFF", font: ../dashboard/assets/StudioSans.ttf }
+                        props: { text: G, size: 16, weight: 700, color: "#FFFFFF", font: assets/StudioSans.ttf }
                         place: { alignment: center }
                   - type: text
-                    props: { text: GORA, size: 15, weight: 700, letter_spacing: 1.4, color: { ref: theme.color.ink }, font: ../dashboard/assets/StudioSans.ttf }
+                    props: { text: GORA, size: 15, weight: 700, letter_spacing: 1.4, color: { ref: theme.color.ink }, font: assets/StudioSans.ttf }
               - type: spacer
                 place: { grow: 1, basis: 24 }
               - type: stack
@@ -59,17 +59,17 @@ screens:
                   narrow: { visible: false }
                 children:
                   - type: text
-                    props: { text: Product, size: 13, weight: 600, color: { ref: theme.color.ink }, font: ../dashboard/assets/StudioSans.ttf }
+                    props: { text: Product, size: 13, weight: 600, color: { ref: theme.color.ink }, font: assets/StudioSans.ttf }
                   - type: text
-                    props: { text: Principles, size: 13, weight: 600, color: { ref: theme.color.ink }, font: ../dashboard/assets/StudioSans.ttf }
+                    props: { text: Principles, size: 13, weight: 600, color: { ref: theme.color.ink }, font: assets/StudioSans.ttf }
                   - type: text
-                    props: { text: Changelog, size: 13, weight: 600, color: { ref: theme.color.ink }, font: ../dashboard/assets/StudioSans.ttf }
+                    props: { text: Changelog, size: 13, weight: 600, color: { ref: theme.color.ink }, font: assets/StudioSans.ttf }
               - type: surface
                 props: { width: 124, height: 40, background: { ref: theme.color.ink }, radius: 10 }
                 place: { alignment: center }
                 children:
                   - type: text
-                    props: { text: Open Studio, size: 12, weight: 600, color: "#FFFFFF", font: ../dashboard/assets/StudioSans.ttf }
+                    props: { text: Open Studio, size: 12, weight: 600, color: "#FFFFFF", font: assets/StudioSans.ttf }
                     place: { alignment: center }
           - type: surface
             name: percentage-hero
@@ -89,7 +89,7 @@ screens:
               - type: overlay
                 children:
                   - type: image
-                    props: { src: ../dashboard/assets/dashboard.jpg, width: { percent: 100 }, height: { percent: 100 }, fit: cover, opacity: 0.16 }
+                    props: { src: assets/dashboard.jpg, width: { percent: 100 }, height: { percent: 100 }, fit: cover, opacity: 0.16 }
                   - type: stack
                     props: { direction: vertical, gap: 14, width: { percent: 58 }, alignment: start }
                     place: { x: 40, y: 36 }
@@ -99,18 +99,18 @@ screens:
                         place: { x: 24, y: 28 }
                     children:
                       - type: text
-                        props: { text: WEB LAYOUT, size: 11, weight: 700, letter_spacing: 1.6, color: "#B9B7FF", font: ../dashboard/assets/StudioSans.ttf }
+                        props: { text: WEB LAYOUT, size: 11, weight: 700, letter_spacing: 1.6, color: "#B9B7FF", font: assets/StudioSans.ttf }
                       - type: text
-                        props: { text: Responsive by construction., size: 36, weight: 700, line_height: 42, wrap: true, color: "#FFFFFF", font: ../dashboard/assets/StudioSans.ttf }
+                        props: { text: Responsive by construction., size: 36, weight: 700, line_height: 42, wrap: true, color: "#FFFFFF", font: assets/StudioSans.ttf }
                       - type: text
-                        props: { text: "Percentages, intrinsic measurement, ratios, wrapping, growth, and shrink now resolve through one deterministic geometry model.", size: 14, line_height: 21, wrap: true, color: "#E5E4FF", font: ../dashboard/assets/StudioSans.ttf }
+                        props: { text: "Percentages, intrinsic measurement, ratios, wrapping, growth, and shrink now resolve through one deterministic geometry model.", size: 14, line_height: 21, wrap: true, color: "#E5E4FF", font: assets/StudioSans.ttf }
           - type: stack
             props: { direction: vertical, gap: 10, alignment: start }
             children:
               - type: text
-                props: { text: A web-shaped layout vocabulary, size: 28, weight: 700, color: { ref: theme.color.ink }, font: ../dashboard/assets/StudioSans.ttf }
+                props: { text: A web-shaped layout vocabulary, size: 28, weight: 700, color: { ref: theme.color.ink }, font: assets/StudioSans.ttf }
               - type: text
-                props: { text: Resize Studio to watch percentage bases pack into deterministic lines., size: 14, color: { ref: theme.color.muted }, font: ../dashboard/assets/StudioSans.ttf }
+                props: { text: Resize Studio to watch percentage bases pack into deterministic lines., size: 14, color: { ref: theme.color.muted }, font: assets/StudioSans.ttf }
           - type: stack
             name: wrapping-card-deck
             props: { direction: horizontal, wrap: true, column_gap: 22, row_gap: 28, alignment: stretch }
@@ -137,4 +137,4 @@ screens:
               - type: surface
                 props: { width: { ref: theme.dimension.half }, height: 2, background: { ref: theme.color.primary } }
               - type: text
-                props: { text: "50% token", size: 11, weight: 700, color: { ref: theme.color.primary }, font: ../dashboard/assets/StudioSans.ttf }
+                props: { text: "50% token", size: 11, weight: 700, color: { ref: theme.color.primary }, font: assets/StudioSans.ttf }

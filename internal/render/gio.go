@@ -31,6 +31,9 @@ import (
 type GioResult struct {
 	Bounds   map[string]image.Rectangle
 	Geometry map[string]semantic.Geometry
+	Layout   map[string]LayoutRecord
+	Scroll   map[string]ScrollMetrics
+	Derived  []semantic.DerivedDescriptor
 	Tree     *semantic.Node
 }
 
@@ -42,10 +45,18 @@ type gioRenderer struct {
 	opacity       float64
 	scene         *gioScene
 	scrolls       []sceneScroll
+	stickies      []sceneSticky
 	paintOrder    int
 	geometryOrder []string
 	viewport      image.Rectangle
 	topLayers     []topLayer
+	layoutMeta    layoutMeta
+	sourceOrder   int
+	sourceRanks   map[string]int
+	rootHandle    string
+	paintOwner    string
+	deferred      map[string]map[string]positionedPlacement
+	painted       map[string]bool
 }
 
 type nativeFont struct {
@@ -77,18 +88,19 @@ func LayoutGio(gtx layout.Context, theme *material.Theme, root *project.Node, vi
 	if theme == nil {
 		theme = material.NewTheme()
 	}
-	result := GioResult{Bounds: make(map[string]image.Rectangle), Geometry: make(map[string]semantic.Geometry)}
+	result := GioResult{Bounds: make(map[string]image.Rectangle), Geometry: make(map[string]semantic.Geometry), Layout: make(map[string]LayoutRecord), Scroll: make(map[string]ScrollMetrics)}
 	if root == nil || viewport.X <= 0 || viewport.Y <= 0 {
 		return result
 	}
-	r := gioRenderer{gtx: gtx, theme: theme, state: state, result: result, opacity: 1, viewport: image.Rectangle{Max: viewport}}
+	r := gioRenderer{gtx: gtx, theme: theme, state: state, result: result, opacity: 1, viewport: image.Rectangle{Max: viewport}, layoutMeta: layoutMeta{parentInner: image.Rectangle{Max: viewport}}, sourceRanks: sourceOrderRanks(root), deferred: make(map[string]map[string]positionedPlacement), painted: make(map[string]bool)}
+	r.rootHandle = root.Handle
 	bounds := image.Rectangle{Max: viewport}
 	r.layout(root, bounds, bounds)
 	for index := 0; index < len(r.topLayers); index++ {
 		layer := r.topLayers[index]
 		r.layoutFinal(layer.node, layer.bounds, r.viewport)
 	}
-	r.result.Tree = semantic.Build(root, r.result.Geometry, semanticContext(state))
+	r.result.Tree = semantic.Build(root, r.result.Geometry, semanticContext(state), r.result.Derived)
 	return r.result
 }
 
@@ -127,12 +139,173 @@ func (r *gioRenderer) layoutFinal(node *project.Node, bounds, currentClip image.
 	r.layoutNode(node, bounds, currentClip, true)
 }
 
-func (r *gioRenderer) layoutNode(node *project.Node, bounds, currentClip image.Rectangle, final bool) {
-	if node == nil || node.Hidden || bounds.Empty() {
+func (r *gioRenderer) layoutChild(node *project.Node, bounds, currentClip, parentInner image.Rectangle, ancestors []string, normal image.Rectangle, final bool) {
+	if !final {
+		normal = applySize(node, normal)
+	}
+	previous := r.layoutMeta
+	r.layoutMeta = layoutMeta{
+		parentInner:         parentInner,
+		scrollAncestors:     append([]string(nil), ancestors...),
+		scrollports:         append([]stickyScrollport(nil), previous.scrollports...),
+		ancestorTranslation: previous.ancestorTranslation,
+		normal:              normal,
+		hasNormal:           true,
+	}
+	r.layoutNode(node, bounds, currentClip, final)
+	r.layoutMeta = previous
+}
+
+func (r *gioRenderer) layoutChildInScroll(node *project.Node, bounds, currentClip, parentInner image.Rectangle, ancestors []string, normal image.Rectangle, final bool, scrollports []stickyScrollport, translation image.Point) {
+	previous := r.layoutMeta
+	r.layoutMeta.scrollports = append([]stickyScrollport(nil), scrollports...)
+	r.layoutMeta.ancestorTranslation = translation
+	r.layoutChild(node, bounds, currentClip, parentInner, ancestors, normal, final)
+	r.layoutMeta = previous
+}
+
+func (r *gioRenderer) deferPositioned(p positionedPlacement) {
+	if p.node == nil || p.owner == "" {
 		return
+	}
+	byOwner := r.deferred[p.owner]
+	if byOwner == nil {
+		byOwner = make(map[string]positionedPlacement)
+		r.deferred[p.owner] = byOwner
+	}
+	byOwner[p.node.Handle] = p
+}
+
+func (r *gioRenderer) positionedPlacement(node *project.Node) (positionedPlacement, bool) {
+	if node == nil {
+		return positionedPlacement{}, false
+	}
+	p, ok := r.deferred[r.paintOwner][node.Handle]
+	return p, ok
+}
+
+func (r *gioRenderer) deferPositionedChild(node *project.Node, bounds, clip, parentInner image.Rectangle, ancestors []string, normal image.Rectangle, final bool) {
+	if node == nil || !isPositionedContext(node) {
+		return
+	}
+	r.deferPositioned(positionedPlacement{node: node, bounds: bounds, clip: clip, parentInner: parentInner, ancestors: append([]string(nil), ancestors...), scrollports: append([]stickyScrollport(nil), r.layoutMeta.scrollports...), translation: r.layoutMeta.ancestorTranslation, scrolls: append([]sceneScroll(nil), r.scrolls...), stickies: append([]sceneSticky(nil), r.stickies...), normal: normal, final: final, owner: r.paintOwner})
+}
+
+func (r *gioRenderer) paintPositioned(p positionedPlacement) {
+	if p.node == nil || r.painted[p.node.Handle] {
+		return
+	}
+	r.painted[p.node.Handle] = true
+	if isFixedPositioned(p.node) {
+		r.layoutFixedNode(p.node)
+		return
+	}
+	previous := r.layoutMeta
+	previousScrolls := r.scrolls
+	previousStickies := r.stickies
+	r.layoutMeta.scrollports = append([]stickyScrollport(nil), p.scrollports...)
+	r.layoutMeta.ancestorTranslation = p.translation
+	r.scrolls = append([]sceneScroll(nil), p.scrolls...)
+	r.stickies = append([]sceneSticky(nil), p.stickies...)
+	r.layoutChild(p.node, p.bounds, p.clip, p.parentInner, p.ancestors, p.normal, p.final)
+	r.layoutMeta = previous
+	r.scrolls = previousScrolls
+	r.stickies = previousStickies
+}
+
+func (r *gioRenderer) paintPositionedChild(node *project.Node, bounds, clip, parentInner image.Rectangle, ancestors []string, normal image.Rectangle, final bool) {
+	if node == nil || !isPositionedContext(node) {
+		return
+	}
+	if placement, ok := r.positionedPlacement(node); ok {
+		r.paintPositioned(placement)
+		return
+	}
+	r.paintPositioned(positionedPlacement{node: node, bounds: bounds, clip: clip, parentInner: parentInner, ancestors: append([]string(nil), ancestors...), scrollports: append([]stickyScrollport(nil), r.layoutMeta.scrollports...), translation: r.layoutMeta.ancestorTranslation, scrolls: append([]sceneScroll(nil), r.scrolls...), stickies: append([]sceneSticky(nil), r.stickies...), normal: normal, final: final, owner: r.paintOwner})
+}
+
+func (r *gioRenderer) paintPromotedPositioned(node *project.Node) {
+	if node == nil || node.Handle != r.paintOwner {
+		return
+	}
+	for _, child := range paintContextChildren(node.Children) {
+		if !isPositionedContext(child) {
+			continue
+		}
+		if placement, ok := r.positionedPlacement(child); ok {
+			r.paintPositioned(placement)
+		}
+	}
+}
+
+// layoutFixedNode lays out a fixed subtree against the logical view viewport.
+// Its positioning context is reset so ancestor scrollports, sticky deltas, and
+// clips cannot affect the fixed subtree. Fixed descendants get the same fresh
+// context when they are encountered recursively.
+func (r *gioRenderer) layoutFixedNode(node *project.Node) {
+	if node == nil || node.Hidden {
+		return
+	}
+	planned, ok := planFixedViewport(node, r.viewport, fixedIntrinsicSize(node, r.viewport.Size(), r.intrinsicLeafSize))
+	if !ok || planned.Empty() {
+		return
+	}
+	previousMeta := r.layoutMeta
+	previousScrolls := r.scrolls
+	previousStickies := r.stickies
+	previousOwner := r.paintOwner
+	r.layoutMeta = layoutMeta{parentInner: r.viewport, normal: planned, hasNormal: true}
+	r.scrolls = nil
+	r.stickies = nil
+	clone := *node
+	clone.Place = cloneMap(node.Place)
+	if clone.Place == nil {
+		clone.Place = make(map[string]any)
+	}
+	clone.Place["position"] = "flow"
+	r.paintOwner = node.Handle
+	r.layoutNode(&clone, planned, r.viewport, true)
+	r.paintOwner = previousOwner
+	r.layoutMeta = previousMeta
+	r.scrolls = previousScrolls
+	r.stickies = previousStickies
+}
+
+func (r *gioRenderer) layoutNode(node *project.Node, bounds, currentClip image.Rectangle, final bool) {
+	if node == nil {
+		return
+	}
+	if isFixedPositioned(node) {
+		r.layoutFixedNode(node)
+		return
+	}
+	if node.Hidden || bounds.Empty() {
+		return
+	}
+	previousOwner := r.paintOwner
+	isContext := node.Handle == r.rootHandle || node.Handle == r.paintOwner || isPositionedContext(node)
+	if isContext {
+		r.paintOwner = node.Handle
+	}
+	defer func() {
+		if isContext {
+			r.paintPromotedPositioned(node)
+		}
+		r.paintOwner = previousOwner
+	}()
+	normalBounds := bounds
+	if r.layoutMeta.hasNormal {
+		normalBounds = r.layoutMeta.normal
 	}
 	if !final {
 		bounds = applySize(node, bounds)
+	}
+	var stickyDelta image.Point
+	if isStickyPositioned(node) {
+		var planned image.Rectangle
+		planned, stickyDelta = planStickyRect(node, bounds, stickyParentInner(r.layoutMeta), stickyViewport(r.layoutMeta, r.viewport))
+		bounds = planned
+		r.layoutMeta.ancestorTranslation = r.layoutMeta.ancestorTranslation.Add(stickyDelta)
 	}
 	node = interactiveNodeForState(node, r.state)
 	if node.Type == "field_box" {
@@ -144,6 +317,28 @@ func (r *gioRenderer) layoutNode(node *project.Node, bounds, currentClip image.R
 	defer func() { r.opacity = previousOpacity }()
 
 	r.result.Bounds[node.Handle] = bounds
+	record := r.result.Layout[node.Handle]
+	if record.Normal.Empty() || !final {
+		record.Normal = normalBounds
+	}
+	record.Final = bounds
+	record.ParentInner = r.layoutMeta.parentInner
+	record.ScrollAncestors = append([]string(nil), r.layoutMeta.scrollAncestors...)
+	if rank, ok := r.sourceRanks[node.Handle]; ok {
+		record.SourceOrder = rank
+	} else {
+		record.SourceOrder = r.sourceOrder
+	}
+	record.ContainingViewport = r.viewport
+	r.result.Layout[node.Handle] = record
+	r.sourceOrder++
+	stickyDepth := len(r.stickies)
+	if r.scene != nil && isStickyPositioned(node) {
+		r.stickies = append(r.stickies, sceneSticky{
+			node: node, record: record, ancestorCount: len(r.scrolls), delta: stickyDelta,
+		})
+		defer func() { r.stickies = r.stickies[:stickyDepth] }()
+	}
 	r.result.Geometry[node.Handle] = semantic.Geometry{
 		Bounds: bounds, Clip: nodeClip, PaintOrder: r.paintOrder, Props: cloneMap(node.Props),
 	}
@@ -151,8 +346,9 @@ func (r *gioRenderer) layoutNode(node *project.Node, bounds, currentClip image.R
 	r.paintOrder++
 	if r.scene != nil {
 		r.scene.geometries = append(r.scene.geometries, sceneGeometry{
-			handle: node.Handle, geometry: r.result.Geometry[node.Handle], node: node,
-			scrolls: append([]sceneScroll(nil), r.scrolls...),
+			handle: node.Handle, geometry: r.result.Geometry[node.Handle], paintOrder: r.result.Geometry[node.Handle].PaintOrder, layout: r.result.Layout[node.Handle], node: node,
+			scrolls:  append([]sceneScroll(nil), r.scrolls...),
+			stickies: append([]sceneSticky(nil), r.stickies...),
 		})
 	}
 
@@ -161,26 +357,63 @@ func (r *gioRenderer) layoutNode(node *project.Node, bounds, currentClip image.R
 		r.recordPaint(func() {
 			r.paintBackground(bounds, currentClip, node.Props["background"], 0)
 		})
-		if len(node.Children) == 1 {
-			r.layout(node.Children[0], bounds, nodeClip)
+		children := node.Children
+		if node.Handle == r.paintOwner {
+			children = paintContextChildren(node.Children)
+		}
+		if len(children) == 1 || node.Handle == r.paintOwner {
+			parentNormal := normalLayoutBounds(r.layoutMeta, bounds)
+			for _, child := range children {
+				if isPositionedContext(child) {
+					if placement, ok := r.positionedPlacement(child); ok {
+						r.paintPositioned(placement)
+					} else if node.Handle == r.paintOwner {
+						r.paintPositionedChild(child, bounds, nodeClip, parentNormal, r.layoutMeta.scrollAncestors, parentNormal, false)
+					} else {
+						r.deferPositionedChild(child, bounds, nodeClip, parentNormal, r.layoutMeta.scrollAncestors, parentNormal, false)
+					}
+					continue
+				}
+				r.layoutChild(child, bounds, nodeClip, parentNormal, r.layoutMeta.scrollAncestors, parentNormal, false)
+			}
 		}
 	case "form", "surface", "toggle", "checkbox", "radio", "tab", "tab_panel", "option", "select_trigger", "field_support",
 		"slider_track", "slider_fill", "slider_thumb", "stepper_decrement", "stepper_value", "stepper_increment":
 		r.recordPaint(func() {
 			r.paintSurfaceGio(node, bounds, currentClip)
 		})
-		if len(node.Children) == 1 {
+		children := node.Children
+		if node.Handle == r.paintOwner {
+			children = paintContextChildren(node.Children)
+		}
+		if len(children) == 1 || node.Handle == r.paintOwner {
 			inner := inset(bounds, insets(node.Props["padding"]))
-			childBounds := r.surfaceChildBounds(node.Children[0], inner)
-			r.layout(node.Children[0], childBounds, chooseClip(node, currentClip, bounds))
+			normalInner := inset(normalLayoutBounds(r.layoutMeta, bounds), insets(node.Props["padding"]))
+			childClip := chooseClip(node, currentClip, bounds)
+			for _, child := range children {
+				if isPositionedContext(child) {
+					if placement, ok := r.positionedPlacement(child); ok {
+						r.paintPositioned(placement)
+					} else if node.Handle == r.paintOwner {
+						r.paintPositionedChild(child, inner, childClip, normalInner, r.layoutMeta.scrollAncestors, normalInner, false)
+					} else {
+						r.deferPositionedChild(child, inner, childClip, normalInner, r.layoutMeta.scrollAncestors, normalInner, false)
+					}
+					continue
+				}
+				childBounds := r.surfaceChildBounds(child, inner)
+				normalChildBounds := r.surfaceChildBounds(child, normalInner)
+				r.layoutChild(child, childBounds, childClip, normalInner, r.layoutMeta.scrollAncestors, normalChildBounds, false)
+			}
 		}
 	case "field_box":
 		if r.scene == nil {
 			r.paintFieldBoxGio(node, bounds, currentClip)
 		} else {
 			r.scene.items = append(r.scene.items, sceneItem{
-				field:   &sceneField{node: node, bounds: bounds, clip: currentClip, opacity: r.opacity},
-				scrolls: append([]sceneScroll(nil), r.scrolls...),
+				field:    &sceneField{node: node, bounds: bounds, clip: currentClip, opacity: r.opacity},
+				scrolls:  append([]sceneScroll(nil), r.scrolls...),
+				stickies: append([]sceneSticky(nil), r.stickies...),
 			})
 		}
 	case "text_field", "text_area":
@@ -204,14 +437,34 @@ func (r *gioRenderer) layoutNode(node *project.Node, bounds, currentClip image.R
 			r.paintSurfaceGio(node, bounds, currentClip)
 		} else {
 			r.scene.items = append(r.scene.items, sceneItem{
-				button:  &sceneButton{node: node, bounds: bounds, clip: currentClip, opacity: r.opacity},
-				scrolls: append([]sceneScroll(nil), r.scrolls...),
+				button:   &sceneButton{node: node, bounds: bounds, clip: currentClip, opacity: r.opacity},
+				scrolls:  append([]sceneScroll(nil), r.scrolls...),
+				stickies: append([]sceneSticky(nil), r.stickies...),
 			})
 		}
-		if len(node.Children) == 1 {
+		children := node.Children
+		if node.Handle == r.paintOwner {
+			children = paintContextChildren(node.Children)
+		}
+		if len(children) == 1 || node.Handle == r.paintOwner {
 			inner := inset(bounds, insets(node.Props["padding"]))
-			childBounds := r.surfaceChildBounds(node.Children[0], inner)
-			r.layout(node.Children[0], childBounds, chooseClip(node, currentClip, bounds))
+			normalInner := inset(normalLayoutBounds(r.layoutMeta, bounds), insets(node.Props["padding"]))
+			childClip := chooseClip(node, currentClip, bounds)
+			for _, child := range children {
+				if isPositionedContext(child) {
+					if placement, ok := r.positionedPlacement(child); ok {
+						r.paintPositioned(placement)
+					} else if node.Handle == r.paintOwner {
+						r.paintPositionedChild(child, inner, childClip, normalInner, r.layoutMeta.scrollAncestors, normalInner, false)
+					} else {
+						r.deferPositionedChild(child, inner, childClip, normalInner, r.layoutMeta.scrollAncestors, normalInner, false)
+					}
+					continue
+				}
+				childBounds := r.surfaceChildBounds(child, inner)
+				normalChildBounds := r.surfaceChildBounds(child, normalInner)
+				r.layoutChild(child, childBounds, childClip, normalInner, r.layoutMeta.scrollAncestors, normalChildBounds, false)
+			}
 		}
 	case "stack", "radio_group":
 		r.stackGio(node, bounds, nodeClip)
@@ -223,22 +476,41 @@ func (r *gioRenderer) layoutNode(node *project.Node, bounds, currentClip image.R
 	case "slider":
 		r.recordPaint(func() { r.paintSurfaceGio(node, bounds, currentClip) })
 		parts := sliderParts(node, inset(bounds, insets(node.Props["padding"])))
-		for _, child := range node.Children {
+		normalParts := sliderParts(node, inset(normalLayoutBounds(r.layoutMeta, bounds), insets(node.Props["padding"])))
+		for _, child := range paintChildrenForNode(node, r.paintOwner) {
+			if isPositionedContext(child) {
+				if placement, ok := r.positionedPlacement(child); ok {
+					r.paintPositioned(placement)
+				} else if childBounds, ok := parts[child.Handle]; ok {
+					r.paintPositionedChild(child, childBounds, nodeClip, inset(normalLayoutBounds(r.layoutMeta, bounds), insets(node.Props["padding"])), r.layoutMeta.scrollAncestors, normalParts[child.Handle], true)
+				}
+				continue
+			}
 			if childBounds, ok := parts[child.Handle]; ok && !childBounds.Empty() {
-				r.layoutFinal(child, childBounds, nodeClip)
+				r.layoutChild(child, childBounds, nodeClip, inset(normalLayoutBounds(r.layoutMeta, bounds), insets(node.Props["padding"])), r.layoutMeta.scrollAncestors, normalParts[child.Handle], true)
 			}
 		}
 	case "tabs":
 		parts := tabsParts(node, inset(bounds, insets(node.Props["padding"])), r.intrinsicLeafSize)
-		for _, child := range node.Children {
+		normalParts := tabsParts(node, inset(normalLayoutBounds(r.layoutMeta, bounds), insets(node.Props["padding"])), r.intrinsicLeafSize)
+		for _, child := range paintChildrenForNode(node, r.paintOwner) {
+			if isPositionedContext(child) {
+				if placement, ok := r.positionedPlacement(child); ok {
+					r.paintPositioned(placement)
+				} else if childBounds, ok := parts[child.Handle]; ok {
+					r.paintPositionedChild(child, childBounds, nodeClip, inset(normalLayoutBounds(r.layoutMeta, bounds), insets(node.Props["padding"])), r.layoutMeta.scrollAncestors, normalParts[child.Handle], true)
+				}
+				continue
+			}
 			if childBounds, ok := parts[child.Handle]; ok && !childBounds.Empty() {
-				r.layoutFinal(child, childBounds, nodeClip)
+				r.layoutChild(child, childBounds, nodeClip, inset(normalLayoutBounds(r.layoutMeta, bounds), insets(node.Props["padding"])), r.layoutMeta.scrollAncestors, normalParts[child.Handle], true)
 			}
 		}
 	case "select":
 		trigger, popup, popupBounds := selectPopupBounds(node, bounds, r.viewport, r.intrinsicLeafSize)
 		if trigger != nil {
-			r.layoutFinal(trigger, bounds, nodeClip)
+			parentNormal := normalLayoutBounds(r.layoutMeta, bounds)
+			r.layoutChild(trigger, bounds, nodeClip, parentNormal, r.layoutMeta.scrollAncestors, parentNormal, true)
 		}
 		if popup != nil && !popupBounds.Empty() {
 			r.topLayers = append(r.topLayers, topLayer{node: popup, bounds: popupBounds})
@@ -252,8 +524,32 @@ func (r *gioRenderer) layoutNode(node *project.Node, bounds, currentClip image.R
 	case "grid":
 		r.gridGio(node, bounds, nodeClip)
 	case "overlay":
-		for _, child := range node.Children {
-			r.layout(child, overlayPlace(child, bounds), nodeClip)
+		parentNormal := normalLayoutBounds(r.layoutMeta, bounds)
+		children := node.Children
+		if node.Handle == r.paintOwner {
+			children = paintContextChildren(node.Children)
+		}
+		for _, child := range children {
+			if child == nil || child.Hidden {
+				continue
+			}
+			if isPositionedContext(child) {
+				if placement, ok := r.positionedPlacement(child); ok {
+					r.paintPositioned(placement)
+					continue
+				}
+			}
+			childBounds := overlayPlace(child, bounds)
+			normalChildBounds := overlayPlace(child, parentNormal)
+			if isPositionedContext(child) {
+				if node.Handle == r.paintOwner {
+					r.paintPositionedChild(child, childBounds, nodeClip, parentNormal, r.layoutMeta.scrollAncestors, normalChildBounds, false)
+				} else {
+					r.deferPositionedChild(child, childBounds, nodeClip, parentNormal, r.layoutMeta.scrollAncestors, normalChildBounds, false)
+				}
+				continue
+			}
+			r.layoutChild(child, childBounds, nodeClip, parentNormal, r.layoutMeta.scrollAncestors, normalChildBounds, false)
 		}
 	case "scroll":
 		r.scrollGio(node, bounds, nodeClip)
@@ -270,8 +566,32 @@ func (r *gioRenderer) layoutNode(node *project.Node, bounds, currentClip image.R
 			r.paintImageGio(node, bounds, nodeClip)
 		})
 	default:
-		for _, child := range node.Children {
-			r.layout(child, place(child, bounds), nodeClip)
+		parentNormal := normalLayoutBounds(r.layoutMeta, bounds)
+		children := node.Children
+		if node.Handle == r.paintOwner {
+			children = paintContextChildren(node.Children)
+		}
+		for _, child := range children {
+			if child == nil || child.Hidden {
+				continue
+			}
+			if isPositionedContext(child) {
+				if placement, ok := r.positionedPlacement(child); ok {
+					r.paintPositioned(placement)
+					continue
+				}
+			}
+			childBounds := place(child, bounds)
+			normalChildBounds := place(child, parentNormal)
+			if isPositionedContext(child) {
+				if node.Handle == r.paintOwner {
+					r.paintPositionedChild(child, childBounds, nodeClip, parentNormal, r.layoutMeta.scrollAncestors, normalChildBounds, false)
+				} else {
+					r.deferPositionedChild(child, childBounds, nodeClip, parentNormal, r.layoutMeta.scrollAncestors, normalChildBounds, false)
+				}
+				continue
+			}
+			r.layoutChild(child, childBounds, nodeClip, parentNormal, r.layoutMeta.scrollAncestors, normalChildBounds, false)
 		}
 	}
 }
@@ -680,8 +1000,38 @@ func (r *gioRenderer) stackGio(node *project.Node, bounds, currentClip image.Rec
 	children := visibleLayoutChildren(node.Children)
 	clone := *node
 	clone.Children = children
-	for index, childBounds := range planStack(&clone, bounds, r.intrinsicSize) {
-		r.layoutFinal(children[index], childBounds, currentClip)
+	normalBounds := normalLayoutBounds(r.layoutMeta, bounds)
+	normalInner := inset(normalBounds, insets(node.Props["padding"]))
+	normalRects := planStack(&clone, normalBounds, r.intrinsicSize)
+	finalRects := planStack(&clone, bounds, r.intrinsicSize)
+	flowRects := make(map[*project.Node][2]image.Rectangle, len(children))
+	for index, child := range children {
+		flowRects[child] = [2]image.Rectangle{finalRects[index], normalRects[index]}
+	}
+	for _, child := range node.Children {
+		if child == nil || child.Hidden || !isPositionedContext(child) {
+			continue
+		}
+		if rects, ok := flowRects[child]; ok {
+			r.deferPositionedChild(child, rects[0], currentClip, normalInner, r.layoutMeta.scrollAncestors, rects[1], true)
+		} else {
+			r.deferPositionedChild(child, bounds, currentClip, normalInner, r.layoutMeta.scrollAncestors, bounds, false)
+		}
+	}
+	for _, child := range paintChildrenForNode(node, r.paintOwner) {
+		if isPositionedContext(child) {
+			if placement, ok := r.positionedPlacement(child); ok {
+				r.paintPositioned(placement)
+			} else if rects, ok := flowRects[child]; ok {
+				r.paintPositionedChild(child, rects[0], currentClip, normalInner, r.layoutMeta.scrollAncestors, rects[1], true)
+			}
+			continue
+		}
+		if child == nil || child.Hidden {
+			continue
+		}
+		rects := flowRects[child]
+		r.layoutChild(child, rects[0], currentClip, normalInner, r.layoutMeta.scrollAncestors, rects[1], true)
 	}
 }
 
@@ -732,7 +1082,23 @@ func (r *gioRenderer) gridGio(node *project.Node, bounds, currentClip image.Rect
 	}
 	columnSizes := tracks(columnDefs, bounds.Dx(), gap)
 	rowSizes := tracks(rowDefs, bounds.Dy(), gap)
-	for index, child := range children {
+	normalBounds := normalLayoutBounds(r.layoutMeta, bounds)
+	normalColumnSizes := tracks(columnDefs, normalBounds.Dx(), gap)
+	normalRowSizes := tracks(rowDefs, normalBounds.Dy(), gap)
+	type gridRects struct {
+		final  image.Rectangle
+		normal image.Rectangle
+	}
+	flowRects := make(map[*project.Node]gridRects, len(children))
+	flowIndex := 0
+	for _, child := range node.Children {
+		if isFixedPositioned(child) {
+			continue
+		}
+		if child == nil || child.Hidden {
+			continue
+		}
+		index := flowIndex
 		column := index % columns
 		row := index / columns
 		if value, ok := child.Place["column"]; ok {
@@ -747,11 +1113,44 @@ func (r *gioRenderer) gridGio(node *project.Node, bounds, currentClip image.Rect
 		rowSpan := max(1, min(int(number(child.Place["row_span"], 1)), len(rowSizes)-row))
 		x := bounds.Min.X + trackOffset(columnSizes, column, gap)
 		y := bounds.Min.Y + trackOffset(rowSizes, row, gap)
-		r.layout(child, image.Rect(
+		childBounds := image.Rect(
 			x, y,
 			x+trackSpan(columnSizes, column, columnSpan, gap),
 			y+trackSpan(rowSizes, row, rowSpan, gap),
-		), currentClip)
+		)
+		normalX := normalBounds.Min.X + trackOffset(normalColumnSizes, column, gap)
+		normalY := normalBounds.Min.Y + trackOffset(normalRowSizes, row, gap)
+		normalChildBounds := image.Rect(normalX, normalY, normalX+trackSpan(normalColumnSizes, column, columnSpan, gap), normalY+trackSpan(normalRowSizes, row, rowSpan, gap))
+		flowRects[child] = gridRects{final: childBounds, normal: normalChildBounds}
+		flowIndex++
+	}
+	for _, child := range node.Children {
+		if child == nil || child.Hidden || !isPositionedContext(child) {
+			continue
+		}
+		if rects, ok := flowRects[child]; ok {
+			r.deferPositionedChild(child, rects.final, currentClip, normalBounds, r.layoutMeta.scrollAncestors, rects.normal, false)
+		} else {
+			r.deferPositionedChild(child, bounds, currentClip, normalBounds, r.layoutMeta.scrollAncestors, bounds, false)
+		}
+	}
+	for _, child := range paintChildrenForNode(node, r.paintOwner) {
+		if isPositionedContext(child) {
+			if placement, ok := r.positionedPlacement(child); ok {
+				r.paintPositioned(placement)
+			} else if rects, ok := flowRects[child]; ok {
+				r.paintPositionedChild(child, rects.final, currentClip, normalBounds, r.layoutMeta.scrollAncestors, rects.normal, false)
+			}
+			continue
+		}
+		if child == nil || child.Hidden {
+			continue
+		}
+		rects, ok := flowRects[child]
+		if !ok {
+			continue
+		}
+		r.layoutChild(child, rects.final, currentClip, normalBounds, r.layoutMeta.scrollAncestors, rects.normal, false)
 	}
 }
 
@@ -759,87 +1158,98 @@ func (r *gioRenderer) scrollGio(node *project.Node, bounds, currentClip image.Re
 	if len(node.Children) != 1 {
 		return
 	}
-	offset := r.state.Scroll[scrollKey(node)]
-	axis := stringValue(node.Props["axis"], "vertical")
-	childBounds := bounds
-	contentSize := scrollContentSize(node.Children[0], bounds, axis, r.intrinsicSize)
-	if axis == "vertical" {
-		offset.Y = min(max(0, offset.Y), contentSize-bounds.Dy())
-		offset.X = 0
-		childBounds = bounds.Sub(offset)
-		childBounds.Max.Y = childBounds.Min.Y + contentSize
-	} else {
-		offset.X = min(max(0, offset.X), contentSize-bounds.Dx())
-		offset.Y = 0
-		childBounds = bounds.Sub(offset)
-		childBounds.Max.X = childBounds.Min.X + contentSize
-	}
+	plan := planScroll(node, bounds, r.intrinsicSize)
+	normalPlan := planScroll(node, normalLayoutBounds(r.layoutMeta, bounds), r.intrinsicSize)
+	offset := clampScrollOffset(r.state.Scroll[scrollKey(node)], plan)
+	metrics := scrollMetrics(plan)
+	r.result.Scroll[node.Handle] = metrics
 	if r.scene != nil {
-		visibleClip := currentClip.Intersect(bounds)
-		contentClip := visibleClip
-		if axis == "vertical" {
-			childBounds = bounds
-			childBounds.Max.Y = childBounds.Min.Y + contentSize
-			contentClip.Min.Y = childBounds.Min.Y
-			contentClip.Max.Y = childBounds.Max.Y
-		} else {
-			childBounds = bounds
-			childBounds.Max.X = childBounds.Min.X + contentSize
-			contentClip.Min.X = childBounds.Min.X
-			contentClip.Max.X = childBounds.Max.X
+		r.scene.scrolls[node.Handle] = sceneScrollMetric{
+			metrics:   metrics,
+			ancestors: append([]sceneScroll(nil), r.scrolls...),
+			stickies:  append([]sceneSticky(nil), r.stickies...),
 		}
+	}
+	childBounds := plan.ContentRect.Sub(offset)
+	visibleClip := currentClip.Intersect(plan.Viewport)
+	ancestors := append(append([]string(nil), r.layoutMeta.scrollAncestors...), node.Handle)
+	translation := r.layoutMeta.ancestorTranslation.Sub(offset)
+	scrollports := append(append([]stickyScrollport(nil), r.layoutMeta.scrollports...), stickyScrollport{
+		NormalViewport: normalPlan.Viewport, Viewport: plan.Viewport,
+		Translation: r.layoutMeta.ancestorTranslation, Offset: offset,
+	})
+	if r.scene != nil {
+		childBounds = plan.ContentRect
 		scroll := sceneScroll{
-			key:         scrollKey(node),
-			axis:        axis,
-			viewport:    bounds,
-			contentSize: contentSize,
+			key:      scrollKey(node),
+			metrics:  metrics,
+			stickies: append([]sceneSticky(nil), r.stickies...),
 		}
 		r.scrolls = append(r.scrolls, scroll)
-		r.layoutFinal(node.Children[0], childBounds, contentClip)
-		r.scrolls = r.scrolls[:len(r.scrolls)-1]
-		if boolValue(node.Props["scrollbar"], false) && contentSize > scroll.viewportSize() {
-			r.scene.items = append(r.scene.items, sceneItem{
-				scrolls: append([]sceneScroll(nil), r.scrolls...),
-				scrollbar: &sceneScrollbar{
-					bounds:  bounds,
-					clip:    currentClip,
-					scroll:  scroll,
-					opacity: r.opacity,
-				},
-			})
+		child := node.Children[0]
+		if isPositionedContext(child) {
+			r.deferPositionedChild(child, childBounds, plan.ContentRect, normalPlan.Viewport, ancestors, normalPlan.ContentRect, true)
+		} else {
+			r.layoutChildInScroll(child, childBounds, plan.ContentRect, normalPlan.Viewport, ancestors, normalPlan.ContentRect, true, scrollports, translation)
 		}
+		r.scrolls = r.scrolls[:len(r.scrolls)-1]
+		r.addDerivedScrollbars(node, plan, offset, currentClip.Intersect(plan.Viewport), scroll)
 		return
 	}
-	visibleClip, prepaintClip := scrollClips(currentClip.Intersect(bounds), childBounds, axis)
 	hardClip := clip.Rect(r.pxRect(visibleClip)).Push(r.gtx.Ops)
 	firstGeometry := len(r.geometryOrder)
-	r.layoutFinal(node.Children[0], childBounds, prepaintClip)
+	child := node.Children[0]
+	if isPositionedContext(child) {
+		r.deferPositionedChild(child, childBounds, visibleClip, normalPlan.Viewport, ancestors, normalPlan.ContentRect, true)
+	} else {
+		r.layoutChildInScroll(child, childBounds, visibleClip, normalPlan.Viewport, ancestors, normalPlan.ContentRect, true, scrollports, translation)
+	}
 	hardClip.Pop()
 	for _, handle := range r.geometryOrder[firstGeometry:] {
 		geometry := r.result.Geometry[handle]
 		geometry.Clip = geometry.Clip.Intersect(visibleClip)
 		r.result.Geometry[handle] = geometry
 	}
-	if boolValue(node.Props["scrollbar"], false) && contentSize > map[bool]int{true: bounds.Dy(), false: bounds.Dx()}[axis == "vertical"] {
-		r.paintScrollbarGio(bounds, currentClip, axis, contentSize, offset)
-	}
+	r.addDerivedScrollbars(node, plan, offset, currentClip.Intersect(plan.Viewport), sceneScroll{key: scrollKey(node), metrics: metrics})
 }
 
 func scrollClips(viewport, content image.Rectangle, axis string) (visible, prepaint image.Rectangle) {
 	return viewport, viewport
 }
 
-func (r *gioRenderer) paintScrollbarGio(bounds, currentClip image.Rectangle, axis string, contentSize int, offset image.Point) {
-	const thickness = 5
-	if axis == "vertical" {
-		thumbSize := max(18, bounds.Dy()*bounds.Dy()/contentSize)
-		position := offset.Y * (bounds.Dy() - thumbSize) / (contentSize - bounds.Dy())
-		r.fillRounded(image.Rect(bounds.Max.X-thickness-2, bounds.Min.Y+position, bounds.Max.X-2, bounds.Min.Y+position+thumbSize), currentClip, color.NRGBA{R: 80, G: 88, B: 104, A: 130}, thickness/2)
-		return
+func (r *gioRenderer) addDerivedScrollbars(node *project.Node, plan scrollPlan, offset image.Point, clip image.Rectangle, scroll sceneScroll) {
+	bars := planScrollbars(node, plan, offset)
+	for _, bar := range bars {
+		descriptor := semantic.DerivedDescriptor{
+			OwnerHandle: node.Handle, Axis: bar.Axis, Policy: bar.Policy,
+			Track: bar.Track, Thumb: bar.Thumb, Corner: bar.Corner,
+			Bounds: bar.Track, Clip: clip, PaintOrder: r.paintOrder,
+			Offset: bar.Offset, Maximum: bar.Maximum, Viewport: bar.Viewport, Content: bar.Content, Enabled: bar.Enabled,
+			ViewportSize: plan.Viewport.Size(), ContentSize: plan.ContentSize,
+		}
+		if r.scene != nil {
+			r.scene.items = append(r.scene.items, sceneItem{
+				scrolls:  append([]sceneScroll(nil), r.scrolls...),
+				stickies: append([]sceneSticky(nil), r.stickies...),
+				derived:  &sceneDerived{descriptor: descriptor, scroll: scroll, ancestors: append([]sceneScroll(nil), r.scrolls...), stickies: append([]sceneSticky(nil), r.stickies...)},
+			})
+		} else {
+			r.result.Derived = append(r.result.Derived, descriptor)
+			r.paintDerivedScrollbarGio(descriptor, clip)
+		}
+		if !bar.Corner.Empty() {
+			r.paintOrder++
+		}
+		r.paintOrder += 3
 	}
-	thumbSize := max(18, bounds.Dx()*bounds.Dx()/contentSize)
-	position := offset.X * (bounds.Dx() - thumbSize) / (contentSize - bounds.Dx())
-	r.fillRounded(image.Rect(bounds.Min.X+position, bounds.Max.Y-thickness-2, bounds.Min.X+position+thumbSize, bounds.Max.Y-2), currentClip, color.NRGBA{R: 80, G: 88, B: 104, A: 130}, thickness/2)
+}
+
+func (r *gioRenderer) paintDerivedScrollbarGio(descriptor semantic.DerivedDescriptor, clip image.Rectangle) {
+	r.fillRounded(descriptor.Track, clip, scrollbarTrackColor, 4)
+	r.fillRounded(descriptor.Thumb, clip, scrollbarThumbColor, 4)
+	if !descriptor.Corner.Empty() {
+		r.fillRect(descriptor.Corner, clip, scrollbarTrackColor)
+	}
 }
 
 func (r *gioRenderer) paintDividerGio(node *project.Node, bounds, currentClip image.Rectangle) {

@@ -35,6 +35,9 @@ func main() {
 		case cli.LaunchMCP:
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
+			if config.Automation {
+				return mcpserver.RunWithOptions(ctx, config.Listen, os.Stderr, mcpserver.ServiceOptions{Automation: true})
+			}
 			return mcpserver.Run(ctx, config.Listen, os.Stderr)
 		default:
 			return fmt.Errorf("unknown launch mode %q", config.Mode)

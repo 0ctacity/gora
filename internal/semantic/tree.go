@@ -17,6 +17,31 @@ type Geometry struct {
 	Props      map[string]any
 }
 
+// DerivedDescriptor describes renderer-owned semantic geometry that does not
+// exist in the authored source tree, such as a scrollbar axis and its parts.
+// The owner supplies source, breadcrumb, and lexical scope at tree-build time.
+type DerivedDescriptor struct {
+	OwnerHandle string
+	Axis        string
+	Policy      string
+	Track       image.Rectangle
+	Thumb       image.Rectangle
+	Corner      image.Rectangle
+	Bounds      image.Rectangle
+	Clip        image.Rectangle
+	PaintOrder  int
+	Offset      int
+	Maximum     int
+	Viewport    int
+	Content     int
+	// ViewportSize and ContentSize retain complete two-axis metrics. The
+	// axis-local Viewport/Content fields remain for thumb calculation and
+	// compatibility with existing descriptor callers.
+	ViewportSize image.Point
+	ContentSize  image.Point
+	Enabled      bool
+}
+
 type Rect struct {
 	X      int `json:"x"`
 	Y      int `json:"y"`
@@ -73,6 +98,8 @@ type Node struct {
 	Min                  *float64          `json:"min,omitempty"`
 	Max                  *float64          `json:"max,omitempty"`
 	Step                 *float64          `json:"step,omitempty"`
+	ViewportSize         *Rect             `json:"viewport_size,omitempty"`
+	ContentSize          *Rect             `json:"content_size,omitempty"`
 	Orientation          string            `json:"orientation,omitempty"`
 	Visible              bool              `json:"visible"`
 	InViewport           bool              `json:"in_viewport"`
@@ -131,14 +158,24 @@ type Envelope struct {
 
 // Build joins the resolved node hierarchy with final logical geometry and
 // interaction state without discarding hidden nodes.
-func Build(root *project.Node, geometry map[string]Geometry, context Context) *Node {
-	tree := build(root, geometry, context, nil, false)
+func Build(root *project.Node, geometry map[string]Geometry, context Context, derived ...[]DerivedDescriptor) *Node {
+	var descriptors []DerivedDescriptor
+	if len(derived) > 0 {
+		descriptors = derived[0]
+	}
+	byOwner := make(map[string][]DerivedDescriptor)
+	for _, descriptor := range descriptors {
+		if descriptor.OwnerHandle != "" {
+			byOwner[descriptor.OwnerHandle] = append(byOwner[descriptor.OwnerHandle], descriptor)
+		}
+	}
+	tree := build(root, geometry, context, byOwner, nil, false)
 	resolveFormIDs(tree)
 	assignFocusOrder(tree)
 	return tree
 }
 
-func build(source *project.Node, geometry map[string]Geometry, context Context, path []int, ancestorHidden bool) *Node {
+func build(source *project.Node, geometry map[string]Geometry, context Context, derived map[string][]DerivedDescriptor, path []int, ancestorHidden bool) *Node {
 	if source == nil {
 		return nil
 	}
@@ -233,10 +270,65 @@ func build(source *project.Node, geometry map[string]Geometry, context Context, 
 	applyControlSemantics(node, source)
 	for index, child := range source.Children {
 		childPath := append(append([]int(nil), path...), index)
-		node.Children = append(node.Children, build(child, geometry, context, childPath, hidden))
+		node.Children = append(node.Children, build(child, geometry, context, derived, childPath, hidden))
+	}
+	if !hidden {
+		for _, descriptor := range derived[source.Handle] {
+			node.Children = append(node.Children, buildDerived(node, descriptor))
+		}
 	}
 	annotateComposite(node)
 	return node
+}
+
+func buildDerived(owner *Node, descriptor DerivedDescriptor) *Node {
+	axisID := owner.ID + "/scrollbar/" + escape(descriptor.Axis)
+	axisHandle := owner.Handle + "/scrollbar/" + descriptor.Axis
+	minimum := float64(0)
+	maximum := float64(max(0, descriptor.Maximum))
+	axis := &Node{
+		ID: axisID, Handle: axisHandle, Type: "scrollbar", Role: "scrollbar", Name: descriptor.Axis,
+		Enabled: descriptor.Enabled, Visible: true, InViewport: !descriptor.Bounds.Intersect(descriptor.Clip).Empty(),
+		Bounds: rect(descriptor.Bounds), Clip: rect(descriptor.Clip), PaintOrder: descriptor.PaintOrder,
+		Orientation: descriptor.Axis, Value: descriptor.Offset, Min: &minimum, Max: &maximum,
+		ViewportSize: pointRect(descriptor.ViewportSize, descriptor.Viewport, descriptor.Axis),
+		ContentSize:  pointRect(descriptor.ContentSize, descriptor.Content, descriptor.Axis),
+		Props:        map[string]any{"axis": descriptor.Axis, "policy": descriptor.Policy},
+		Source:       owner.Source, Breadcrumb: append([]string(nil), owner.Breadcrumb...), Scope: owner.Scope, Group: owner.Handle,
+		FocusOrder: -1, Operations: []string{"scroll_to", "scroll_by", "page"},
+	}
+	if descriptor.Axis == "vertical" {
+		if descriptor.ViewportSize == (image.Point{}) {
+			axis.ViewportSize = &Rect{Height: descriptor.Viewport}
+		}
+		if descriptor.ContentSize == (image.Point{}) {
+			axis.ContentSize = &Rect{Height: descriptor.Content}
+		}
+	}
+	parts := []struct {
+		suffix string
+		typ    string
+		box    image.Rectangle
+	}{
+		{suffix: "track", typ: "scrollbar_track", box: descriptor.Track},
+		{suffix: "thumb", typ: "scrollbar_thumb", box: descriptor.Thumb},
+	}
+	if !descriptor.Corner.Empty() {
+		parts = append(parts, struct {
+			suffix string
+			typ    string
+			box    image.Rectangle
+		}{suffix: "corner", typ: "scrollbar_corner", box: descriptor.Corner})
+	}
+	for index, part := range parts {
+		axis.Children = append(axis.Children, &Node{
+			ID: axisID + "/" + part.suffix, Handle: axisHandle + "/" + part.suffix, Type: part.typ,
+			Enabled: descriptor.Enabled && part.typ != "scrollbar_corner", Visible: true, InViewport: !part.box.Intersect(descriptor.Clip).Empty(),
+			Bounds: rect(part.box), Clip: rect(descriptor.Clip), PaintOrder: descriptor.PaintOrder + index + 1,
+			Source: owner.Source, Breadcrumb: append([]string(nil), owner.Breadcrumb...), Scope: owner.Scope, Group: axisHandle, FocusOrder: -1,
+		})
+	}
+	return axis
 }
 
 func resolveFormIDs(root *Node) {
@@ -449,7 +541,7 @@ func assignFocusOrder(root *Node) {
 			return
 		}
 		switch node.Type {
-		case "button", "link", "text_field", "text_area", "toggle", "checkbox", "select", "slider", "stepper":
+		case "button", "link", "text_field", "text_area", "toggle", "checkbox", "select", "slider", "stepper", "scrollbar":
 			if node.Visible && node.Enabled && node.Bounds != nil {
 				candidates[node.Handle] = true
 			}
@@ -508,6 +600,31 @@ func Flatten(root *Node) []*Node {
 		result = append(result, Flatten(child)...)
 	}
 	return result
+}
+
+// TopmostAt returns the visible, clipped node with the highest final paint
+// rank containing point. Equal ranks are resolved by later expanded source
+// order, which keeps hit testing deterministic for structural ties.
+func TopmostAt(root *Node, point image.Point, predicate func(*Node) bool) *Node {
+	var best *Node
+	bestRank, bestSource := -1, -1
+	for source, node := range Flatten(root) {
+		if node == nil || !node.Visible || node.Bounds == nil || node.Clip == nil {
+			continue
+		}
+		if predicate != nil && !predicate(node) {
+			continue
+		}
+		if !point.In(node.Bounds.ImageRectangle().Intersect(node.Clip.ImageRectangle())) {
+			continue
+		}
+		if best == nil || node.PaintOrder > bestRank || node.PaintOrder == bestRank && source > bestSource {
+			best = node
+			bestRank = node.PaintOrder
+			bestSource = source
+		}
+	}
+	return best
 }
 
 func (r *Rect) ImageRectangle() image.Rectangle {
@@ -570,6 +687,16 @@ func effect(action document.Action) Effect {
 
 func escape(value string) string {
 	return url.PathEscape(value)
+}
+
+func pointRect(size image.Point, axisValue int, axis string) *Rect {
+	if size == (image.Point{}) {
+		if axis == "vertical" {
+			return &Rect{Height: axisValue}
+		}
+		return &Rect{Width: axisValue}
+	}
+	return &Rect{Width: size.X, Height: size.Y}
 }
 
 func rect(value image.Rectangle) *Rect {

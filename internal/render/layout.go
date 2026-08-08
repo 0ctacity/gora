@@ -20,8 +20,145 @@ import (
 
 type intrinsicMeasure func(*project.Node, image.Point) image.Point
 
+// paintOrderedChildren returns the immediate paint participants for one
+// stacking context in their final order. It is intentionally kept as the
+// small, direct-child primitive used by tests and by the context flattener
+// below. Flow content remains in authored order; positioned contexts are
+// grouped around it and sorted by z-index.
+func paintOrderedChildren(children []*project.Node) []*project.Node {
+	ordered := append([]*project.Node(nil), children...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		leftClass, leftZ := paintParticipantKey(ordered[i])
+		rightClass, rightZ := paintParticipantKey(ordered[j])
+		if leftClass != rightClass {
+			return leftClass < rightClass
+		}
+		if leftClass == paintPositiveContext || leftClass == paintNegativeContext {
+			return leftZ < rightZ
+		}
+		return false
+	})
+	return ordered
+}
+
+// paintContextChildren expands only through ordinary flow wrappers. Such
+// wrappers do not establish a stacking context, so a sticky/fixed descendant
+// belongs to the nearest real context owner rather than being trapped by the
+// wrapper. Once a positioned context is encountered it is emitted atomically
+// and its descendants are left for that context's own expansion.
+func paintContextChildren(children []*project.Node) []*project.Node {
+	participants := make([]*project.Node, 0, len(children))
+	var collectPositioned func([]*project.Node)
+	collectPositioned = func(nodes []*project.Node) {
+		for _, child := range nodes {
+			if child == nil || child.Hidden {
+				continue
+			}
+			if isPositionedContext(child) {
+				participants = append(participants, child)
+				continue
+			}
+			collectPositioned(child.Children)
+		}
+	}
+	for _, child := range children {
+		if child == nil || child.Hidden {
+			continue
+		}
+		if isPositionedContext(child) {
+			participants = append(participants, child)
+			continue
+		}
+		participants = append(participants, child)
+		collectPositioned(child.Children)
+	}
+	return paintOrderedChildren(participants)
+}
+
+// paintChildrenForNode preserves ordinary source-order recursion inside a
+// flow node, while expanding the nearest actual context owner (the root or a
+// sticky/fixed node) through its non-positioned wrappers.
+func paintChildrenForNode(node *project.Node, rootHandle string) []*project.Node {
+	if node == nil {
+		return nil
+	}
+	if node.Handle == rootHandle || isPositionedContext(node) {
+		return paintContextChildren(node.Children)
+	}
+	children := make([]*project.Node, 0, len(node.Children))
+	for _, child := range node.Children {
+		if child == nil || child.Hidden || isPositionedContext(child) {
+			continue
+		}
+		children = append(children, child)
+	}
+	return children
+}
+
+const (
+	paintNegativeContext = iota
+	paintFlowContent
+	paintZeroContext
+	paintPositiveContext
+)
+
+func paintParticipantKey(node *project.Node) (int, float64) {
+	if node == nil || !isPositionedContext(node) {
+		return paintFlowContent, 0
+	}
+	z := number(node.Place["z_index"], 0)
+	if z < 0 {
+		return paintNegativeContext, z
+	}
+	if z > 0 {
+		return paintPositiveContext, z
+	}
+	return paintZeroContext, z
+}
+
+func isPositionedContext(node *project.Node) bool {
+	return isStickyPositioned(node) || isFixedPositioned(node)
+}
+
+// sourceOrderRanks is independent of paint ordering. It preserves expanded
+// authored order for inspection and focus metadata while renderers traverse
+// immediate participants in final paint order.
+func sourceOrderRanks(root *project.Node) map[string]int {
+	ranks := make(map[string]int)
+	order := 0
+	var visit func(*project.Node)
+	visit = func(node *project.Node) {
+		if node == nil {
+			return
+		}
+		if node.Handle != "" {
+			ranks[node.Handle] = order
+			order++
+		}
+		for _, child := range node.Children {
+			visit(child)
+		}
+	}
+	visit(root)
+	return ranks
+}
+
+// LayoutRecord is the renderer-neutral positioning foundation. Normal is the
+// immutable flow rectangle; Final is the rectangle used for the current frame.
+// ParentInner and ScrollAncestors retain the containing context needed by
+// sticky and fixed positioning while keeping normal and final rectangles
+// separate.
+type LayoutRecord struct {
+	Normal             image.Rectangle
+	Final              image.Rectangle
+	ParentInner        image.Rectangle
+	ScrollAncestors    []string
+	SourceOrder        int
+	ContainingViewport image.Rectangle
+}
+
 func measureIntrinsic(node *project.Node, limit image.Point, leaf intrinsicMeasure) image.Point {
-	if node == nil || node.Hidden {
+	if node == nil || node.Hidden || isFixedPositioned(node) {
 		return image.Point{}
 	}
 	padding := insets(node.Props["padding"])
@@ -63,6 +200,9 @@ func measureIntrinsic(node *project.Node, limit image.Point, leaf intrinsicMeasu
 		preferred = measureTabsIntrinsic(node, innerLimit, leaf)
 	case "overlay":
 		for _, child := range node.Children {
+			if !isFlowPositioned(child) {
+				continue
+			}
 			size := measureIntrinsic(child, innerLimit, leaf)
 			x := int(number(child.Place["x"], number(child.Place["offset_x"], 0)))
 			y := int(number(child.Place["y"], number(child.Place["offset_y"], 0)))
@@ -74,14 +214,20 @@ func measureIntrinsic(node *project.Node, limit image.Point, leaf intrinsicMeasu
 	case "scroll":
 		if len(node.Children) == 1 {
 			childLimit := innerLimit
-			if stringValue(node.Props["axis"], "vertical") == "vertical" {
+			axis := stringValue(node.Props["axis"], "vertical")
+			if axis == "vertical" {
 				childLimit.Y = 1 << 20
 			} else {
 				childLimit.X = 1 << 20
+				if axis == "both" {
+					childLimit.Y = 1 << 20
+				}
 			}
 			preferred = measureIntrinsic(node.Children[0], childLimit, leaf)
 			preferred.X = minPositive(preferred.X, innerLimit.X)
 			preferred.Y = minPositive(preferred.Y, innerLimit.Y)
+			preferred.X += padding.left + padding.right
+			preferred.Y += padding.top + padding.bottom
 		}
 	case "field_box":
 		text := *node
@@ -827,11 +973,187 @@ func measureGridIntrinsic(node *project.Node, limit image.Point, leaf intrinsicM
 func visibleLayoutChildren(children []*project.Node) []*project.Node {
 	result := make([]*project.Node, 0, len(children))
 	for _, child := range children {
-		if child != nil && !child.Hidden {
+		if child != nil && !child.Hidden && isFlowPositioned(child) {
 			result = append(result, child)
 		}
 	}
 	return result
+}
+
+// isFlowPositioned is the single renderer-side classification used by
+// intrinsic measurement and flow planners. Fixed nodes remain in the source
+// hierarchy but are withheld from normal-flow contribution while their final
+// viewport geometry is laid out separately.
+func isFlowPositioned(node *project.Node) bool {
+	return node != nil && !isFixedPositioned(node)
+}
+
+func isFixedPositioned(node *project.Node) bool {
+	if node == nil {
+		return false
+	}
+	return stringValue(node.Place["position"], "flow") == "fixed"
+}
+
+func isStickyPositioned(node *project.Node) bool {
+	if node == nil {
+		return false
+	}
+	return stringValue(node.Place["position"], "flow") == "sticky"
+}
+
+type fixedInsetValue struct {
+	value int
+	set   bool
+}
+
+func resolveFixedInset(value any, basis int) fixedInsetValue {
+	if value == nil {
+		return fixedInsetValue{}
+	}
+	if raw, ok := numeric(value); ok {
+		return fixedInsetValue{value: rounded(raw), set: true}
+	}
+	if mapping, ok := value.(map[string]any); ok && len(mapping) == 1 {
+		if percent, ok := numeric(mapping["percent"]); ok {
+			return fixedInsetValue{value: rounded(float64(basis) * percent / 100), set: true}
+		}
+	}
+	return fixedInsetValue{}
+}
+
+// planFixedViewport computes a fixed node's logical viewport rectangle. It is
+// pure so CPU, Gio, and retained replay can share the same sizing decision.
+// At least one inset is required on each axis so an authored fixed node has an
+// unambiguous viewport anchor.
+func planFixedViewport(node *project.Node, viewport image.Rectangle, intrinsic image.Point) (image.Rectangle, bool) {
+	if node == nil || viewport.Empty() || !isFixedPositioned(node) {
+		return image.Rectangle{}, false
+	}
+	insetMap, ok := node.Place["inset"].(map[string]any)
+	if !ok {
+		return image.Rectangle{}, false
+	}
+	top := resolveFixedInset(insetMap["top"], viewport.Dy())
+	right := resolveFixedInset(insetMap["right"], viewport.Dx())
+	bottom := resolveFixedInset(insetMap["bottom"], viewport.Dy())
+	left := resolveFixedInset(insetMap["left"], viewport.Dx())
+	if !top.set && !bottom.set || !left.set && !right.set {
+		return image.Rectangle{}, false
+	}
+
+	width, widthDefinite := resolveDimension(node.Props["width"], viewport.Dx())
+	height, heightDefinite := resolveDimension(node.Props["height"], viewport.Dy())
+	// Opposing insets make an automatic axis definite before aspect-ratio
+	// derivation. When both axes stretch, the insets win on both axes.
+	if !widthDefinite && left.set && right.set {
+		width = max(0, viewport.Dx()-left.value-right.value)
+		widthDefinite = true
+	}
+	if !heightDefinite && top.set && bottom.set {
+		height = max(0, viewport.Dy()-top.value-bottom.value)
+		heightDefinite = true
+	}
+	if ratio, ok := aspectRatio(node.Props["aspect_ratio"]); ok {
+		if widthDefinite && !heightDefinite {
+			height, heightDefinite = rounded(float64(width)/ratio), true
+		} else if heightDefinite && !widthDefinite {
+			width, widthDefinite = rounded(float64(height)*ratio), true
+		}
+	}
+	if !widthDefinite {
+		width = max(0, intrinsic.X)
+	}
+	if !heightDefinite {
+		height = max(0, intrinsic.Y)
+	}
+	minWidth, _ := resolveDimension(node.Props["min_width"], viewport.Dx())
+	maxWidth, hasMaxWidth := resolveDimension(node.Props["max_width"], viewport.Dx())
+	minHeight, _ := resolveDimension(node.Props["min_height"], viewport.Dy())
+	maxHeight, hasMaxHeight := resolveDimension(node.Props["max_height"], viewport.Dy())
+	width = clampDimension(width, minWidth, maxWidth, hasMaxWidth)
+	height = clampDimension(height, minHeight, maxHeight, hasMaxHeight)
+
+	x := viewport.Min.X
+	if left.set {
+		x += left.value
+	} else if right.set {
+		x = viewport.Max.X - right.value - width
+	}
+	y := viewport.Min.Y
+	if top.set {
+		y += top.value
+	} else if bottom.set {
+		y = viewport.Max.Y - bottom.value - height
+	}
+	return image.Rect(x, y, x+width, y+height), true
+}
+
+// fixedIntrinsicSize measures a fixed node's authored content without letting
+// the positioning classification short-circuit the intrinsic pass.
+func fixedIntrinsicSize(node *project.Node, limit image.Point, leaf intrinsicMeasure) image.Point {
+	if node == nil || leaf == nil {
+		return image.Point{}
+	}
+	clone := *node
+	clone.Place = cloneMap(node.Place)
+	if clone.Place == nil {
+		clone.Place = make(map[string]any)
+	}
+	clone.Place["position"] = "flow"
+	return measureIntrinsic(&clone, limit, leaf)
+}
+
+func stickyAxisPosition(base, size, viewportStart, viewportEnd, parentStart, parentEnd int, startInset, endInset fixedInsetValue) int {
+	if !startInset.set && !endInset.set {
+		return base
+	}
+	minimum, maximum := base, base
+	if startInset.set {
+		minimum = viewportStart + startInset.value
+	}
+	if endInset.set {
+		maximum = viewportEnd - endInset.value - size
+	}
+	if startInset.set && endInset.set && minimum > maximum {
+		// Over-constrained opposing insets resolve deterministically from the
+		// start edge; this is the same top/left-wins rule for both axes.
+		maximum = minimum
+	}
+	position := base
+	if startInset.set {
+		position = max(position, minimum)
+	}
+	if endInset.set {
+		position = min(position, maximum)
+	}
+	if parentEnd > parentStart {
+		parentMaximum := parentEnd - size
+		if parentMaximum < parentStart {
+			position = max(position, parentStart)
+		} else {
+			position = min(max(position, parentStart), parentMaximum)
+		}
+	}
+	return position
+}
+
+// planStickyRect applies the ancestor-translated base rectangle to one
+// nearest containing scrollport (or the view viewport), then applies parent
+// containment. It never mutates the authored node or normal rectangle.
+func planStickyRect(node *project.Node, base, parentInner, viewport image.Rectangle) (image.Rectangle, image.Point) {
+	if node == nil || !isStickyPositioned(node) || base.Empty() || viewport.Empty() {
+		return base, image.Point{}
+	}
+	insetMap, _ := node.Place["inset"].(map[string]any)
+	top := resolveFixedInset(insetMap["top"], viewport.Dy())
+	right := resolveFixedInset(insetMap["right"], viewport.Dx())
+	bottom := resolveFixedInset(insetMap["bottom"], viewport.Dy())
+	left := resolveFixedInset(insetMap["left"], viewport.Dx())
+	x := stickyAxisPosition(base.Min.X, base.Dx(), viewport.Min.X, viewport.Max.X, parentInner.Min.X, parentInner.Max.X, left, right)
+	y := stickyAxisPosition(base.Min.Y, base.Dy(), viewport.Min.Y, viewport.Max.Y, parentInner.Min.Y, parentInner.Max.Y, top, bottom)
+	result := image.Rect(x, y, x+base.Dx(), y+base.Dy())
+	return result, image.Pt(x-base.Min.X, y-base.Min.Y)
 }
 
 func constrainIntrinsic(node *project.Node, preferred, limit image.Point) image.Point {
@@ -886,8 +1208,11 @@ func planStack(node *project.Node, bounds image.Rectangle, measure intrinsicMeas
 	mainGap, crossGap := stackGaps(node, vertical)
 	wrap := boolValue(node.Props["wrap"], false)
 
-	items := make([]stackItem, len(node.Children))
+	items := make([]stackItem, 0, len(node.Children))
 	for index, child := range node.Children {
+		if !isFlowPositioned(child) {
+			continue
+		}
 		intrinsic := measure(child, inner.Size())
 		intrinsicMain, intrinsicCross := intrinsic.X, intrinsic.Y
 		mainKey, crossKey := "width", "height"
@@ -937,11 +1262,11 @@ func planStack(node *project.Node, bounds image.Rectangle, measure intrinsicMeas
 			grow = 1
 		}
 		shrink, _ := numeric(child.Place["shrink"])
-		items[index] = stackItem{
+		items = append(items, stackItem{
 			index: index, base: base, main: base, cross: cross,
 			minMain: minMain, maxMain: maxMain,
 			grow: math.Max(0, grow), shrink: math.Max(0, shrink), implicitGrow: implicitGrow,
-		}
+		})
 	}
 
 	lines := packStackLines(items, mainSize, mainGap, wrap)
@@ -1202,27 +1527,274 @@ func minPositive(value, limit int) int {
 	return min(value, limit)
 }
 
+type scrollPlan struct {
+	Viewport    image.Rectangle
+	ContentSize image.Point
+	ContentRect image.Rectangle
+	Maximum     image.Point
+	Clip        image.Rectangle
+	EnabledX    bool
+	EnabledY    bool
+}
+
+// ScrollMetrics describes the final logical geometry and independent extents
+// of one rendered scrollport.
+type ScrollMetrics struct {
+	Viewport    image.Rectangle
+	ContentSize image.Point
+	Maximum     image.Point
+	EnabledX    bool
+	EnabledY    bool
+}
+
+// scrollbarPlan is the renderer-neutral geometry for one derived scrollbar
+// axis. Track, thumb, and the optional shared corner are all expressed in
+// logical coordinates; CPU, Gio, and retained replay consume this same plan.
+type scrollbarPlan struct {
+	Axis     string
+	Policy   string
+	Track    image.Rectangle
+	Thumb    image.Rectangle
+	Corner   image.Rectangle
+	Offset   int
+	Maximum  int
+	Viewport int
+	Content  int
+	Enabled  bool
+}
+
+const (
+	scrollbarThickness = 8
+	scrollbarInset     = 2
+)
+
+func planScrollbars(node *project.Node, plan scrollPlan, offset image.Point) []scrollbarPlan {
+	if node == nil || plan.Viewport.Empty() {
+		return nil
+	}
+	axisX := plan.EnabledX
+	axisY := plan.EnabledY
+	policyX := scrollbarPolicy(node, "horizontal", axisX)
+	policyY := scrollbarPolicy(node, "vertical", axisY)
+	visibleX := scrollbarVisible(policyX, plan.Maximum.X)
+	visibleY := scrollbarVisible(policyY, plan.Maximum.Y)
+	if !visibleX && !visibleY {
+		return nil
+	}
+	viewport := plan.Viewport
+	inner := image.Rect(
+		viewport.Min.X+scrollbarInset,
+		viewport.Min.Y+scrollbarInset,
+		max(viewport.Min.X+scrollbarInset, viewport.Max.X-scrollbarInset),
+		max(viewport.Min.Y+scrollbarInset, viewport.Max.Y-scrollbarInset),
+	)
+	result := make([]scrollbarPlan, 0, 2)
+	if visibleX {
+		endX := inner.Max.X
+		if visibleY {
+			endX = max(inner.Min.X, endX-scrollbarThickness)
+		}
+		track := image.Rect(inner.Min.X, inner.Max.Y-scrollbarThickness, endX, inner.Max.Y)
+		result = append(result, makeScrollbarPlan("horizontal", policyX, track, offset.X, plan.Maximum.X, plan.Viewport.Dx(), plan.ContentSize.X))
+	}
+	if visibleY {
+		endY := inner.Max.Y
+		if visibleX {
+			endY = max(inner.Min.Y, endY-scrollbarThickness)
+		}
+		track := image.Rect(inner.Max.X-scrollbarThickness, inner.Min.Y, inner.Max.X, endY)
+		result = append(result, makeScrollbarPlan("vertical", policyY, track, offset.Y, plan.Maximum.Y, plan.Viewport.Dy(), plan.ContentSize.Y))
+	}
+	if visibleX && visibleY && len(result) > 0 {
+		result[0].Corner = image.Rect(inner.Max.X-scrollbarThickness, inner.Max.Y-scrollbarThickness, inner.Max.X, inner.Max.Y)
+	}
+	return result
+}
+
+func scrollbarPolicy(node *project.Node, axis string, enabled bool) string {
+	if !enabled {
+		return "hidden"
+	}
+	if node != nil {
+		key := "scrollbar_x"
+		if axis == "vertical" {
+			key = "scrollbar_y"
+		}
+		if value, ok := node.Props[key].(string); ok {
+			return value
+		}
+		if legacy, ok := node.Props["scrollbar"].(bool); ok {
+			if legacy {
+				return "auto"
+			}
+			return "hidden"
+		}
+	}
+	// Resolved project nodes carry explicit per-axis policies. Keeping an
+	// unnormalized node hidden preserves renderer compatibility for direct
+	// reference callers that construct project trees in tests.
+	return "hidden"
+}
+
+func scrollbarVisible(policy string, maximum int) bool {
+	switch policy {
+	case "always":
+		return true
+	case "auto":
+		return maximum > 0
+	default:
+		return false
+	}
+}
+
+func makeScrollbarPlan(axis, policy string, track image.Rectangle, offset, maximum, viewport, content int) scrollbarPlan {
+	maximum = max(0, maximum)
+	offset = min(max(0, offset), maximum)
+	trackLength := track.Dx()
+	if axis == "vertical" {
+		trackLength = track.Dy()
+	}
+	thumbLength := max(0, trackLength)
+	enabled := maximum > 0
+	if enabled && content > 0 {
+		thumbLength = max(scrollbarThickness*3, rounded(float64(trackLength)*float64(viewport)/float64(content)))
+		thumbLength = min(trackLength, thumbLength)
+	}
+	travel := max(0, trackLength-thumbLength)
+	position := 0
+	if maximum > 0 {
+		position = min(travel, max(0, rounded(float64(offset)*float64(travel)/float64(maximum))))
+	}
+	thumb := track
+	if axis == "vertical" {
+		thumb = image.Rect(track.Min.X, track.Min.Y+position, track.Max.X, track.Min.Y+position+thumbLength)
+	} else {
+		thumb = image.Rect(track.Min.X+position, track.Min.Y, track.Min.X+position+thumbLength, track.Max.Y)
+	}
+	return scrollbarPlan{Axis: axis, Policy: policy, Track: track, Thumb: thumb, Offset: offset, Maximum: maximum, Viewport: viewport, Content: content, Enabled: enabled}
+}
+
+const scrollUnboundedLimit = 1 << 20
+
+func planScroll(node *project.Node, bounds image.Rectangle, measure intrinsicMeasure) scrollPlan {
+	viewport := bounds
+	if node != nil {
+		viewport = inset(bounds, insets(node.Props["padding"]))
+		if viewport.Max.X < viewport.Min.X {
+			viewport.Max.X = viewport.Min.X
+		}
+		if viewport.Max.Y < viewport.Min.Y {
+			viewport.Max.Y = viewport.Min.Y
+		}
+	}
+	axis := "vertical"
+	if node != nil {
+		axis = stringValue(node.Props["axis"], axis)
+	}
+	enabledX := axis == "horizontal" || axis == "both"
+	enabledY := axis == "vertical" || axis == "both"
+	plan := scrollPlan{
+		Viewport: viewport, ContentSize: viewport.Size(), Maximum: image.Point{},
+		EnabledX: enabledX, EnabledY: enabledY,
+	}
+	if node == nil || len(node.Children) != 1 || measure == nil || viewport.Empty() {
+		plan.ContentRect = image.Rect(viewport.Min.X, viewport.Min.Y, viewport.Max.X, viewport.Max.Y)
+		plan.Clip = viewport
+		return plan
+	}
+	basis := viewport.Size()
+	limit := basis
+	if enabledX {
+		limit.X = scrollUnboundedLimit
+	}
+	if enabledY {
+		limit.Y = scrollUnboundedLimit
+	}
+	child := materializeScrollDimensions(node.Children[0], basis)
+	preferred := measure(child, limit)
+	contentSize := image.Pt(max(basis.X, preferred.X), max(basis.Y, preferred.Y))
+	if !enabledX {
+		contentSize.X = max(basis.X, preferred.X)
+	}
+	if !enabledY {
+		contentSize.Y = max(basis.Y, preferred.Y)
+	}
+	plan.ContentSize = contentSize
+	if enabledX {
+		plan.Maximum.X = max(0, contentSize.X-basis.X)
+	}
+	if enabledY {
+		plan.Maximum.Y = max(0, contentSize.Y-basis.Y)
+	}
+	plan.ContentRect = image.Rect(viewport.Min.X, viewport.Min.Y, viewport.Min.X+contentSize.X, viewport.Min.Y+contentSize.Y)
+	plan.Clip = plan.ContentRect.Intersect(viewport)
+	return plan
+}
+
+func scrollMetrics(plan scrollPlan) ScrollMetrics {
+	return ScrollMetrics{
+		Viewport: plan.Viewport, ContentSize: plan.ContentSize, Maximum: plan.Maximum,
+		EnabledX: plan.EnabledX, EnabledY: plan.EnabledY,
+	}
+}
+
+func clampScrollOffset(offset image.Point, plan scrollPlan) image.Point {
+	if plan.EnabledX {
+		offset.X = min(max(0, offset.X), plan.Maximum.X)
+	} else {
+		offset.X = 0
+	}
+	if plan.EnabledY {
+		offset.Y = min(max(0, offset.Y), plan.Maximum.Y)
+	} else {
+		offset.Y = 0
+	}
+	return offset
+}
+
+func materializeScrollDimensions(node *project.Node, basis image.Point) *project.Node {
+	if node == nil {
+		return nil
+	}
+	clone := *node
+	clone.Props = cloneMap(node.Props)
+	for _, key := range []string{"width", "min_width", "max_width"} {
+		if value, exists := clone.Props[key]; exists {
+			clone.Props[key] = materializeScrollDimension(value, basis.X)
+		}
+	}
+	for _, key := range []string{"height", "min_height", "max_height"} {
+		if value, exists := clone.Props[key]; exists {
+			clone.Props[key] = materializeScrollDimension(value, basis.Y)
+		}
+	}
+	clone.Place = cloneMap(node.Place)
+	if value, exists := clone.Place["basis"]; exists {
+		clone.Place["basis"] = materializeScrollDimension(value, basis.X)
+	}
+	clone.Children = append([]*project.Node(nil), node.Children...)
+	return &clone
+}
+
+func materializeScrollDimension(value any, basis int) any {
+	if text, ok := value.(string); ok && text == "fill" {
+		return int64(basis)
+	}
+	percent, ok := value.(map[string]any)
+	if !ok || len(percent) != 1 {
+		return value
+	}
+	percentValue, ok := numeric(percent["percent"])
+	if !ok {
+		return value
+	}
+	return int64(rounded(float64(basis) * percentValue / 100))
+}
+
 func sumInts(values []int) int {
 	total := 0
 	for _, value := range values {
 		total += value
 	}
 	return total
-}
-
-func scrollContentSize(child *project.Node, bounds image.Rectangle, axis string, measure intrinsicMeasure) int {
-	limit := bounds.Size()
-	viewport := bounds.Dx()
-	if axis == "vertical" {
-		limit.Y = 1 << 20
-		viewport = bounds.Dy()
-	} else {
-		limit.X = 1 << 20
-	}
-	preferred := measure(child, limit)
-	size := preferred.X
-	if axis == "vertical" {
-		size = preferred.Y
-	}
-	return max(viewport, size)
 }

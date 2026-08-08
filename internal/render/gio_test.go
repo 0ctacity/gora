@@ -4,6 +4,7 @@ import (
 	"image"
 	"image/color"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -190,6 +191,15 @@ func TestOpenSelectPopupUsesViewportClampedTopLayer(t *testing.T) {
 	if cpu.Geometry["popup"].PaintOrder <= cpu.Geometry["later"].PaintOrder {
 		t.Fatalf("popup paint order=%d later=%d", cpu.Geometry["popup"].PaintOrder, cpu.Geometry["later"].PaintOrder)
 	}
+	var cache GioCache
+	theme := material.NewTheme()
+	var buildOps op.Ops
+	cache.Layout(layout.Context{Ops: &buildOps, Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}, Constraints: layout.Exact(viewport)}, theme, root, viewport, State{})
+	var replayOps op.Ops
+	cached := cache.Layout(layout.Context{Ops: &replayOps, Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}, Constraints: layout.Exact(viewport)}, theme, root, viewport, State{})
+	if cache.builds != 1 || cached.Geometry["popup"].PaintOrder <= cached.Geometry["later"].PaintOrder {
+		t.Fatalf("cached popup rank/builds = %d/%d, want popup after later with one build", cached.Geometry["popup"].PaintOrder, cache.builds)
+	}
 }
 
 func TestGioLabelLoadsDocumentLocalFontIntoNativeShaper(t *testing.T) {
@@ -241,6 +251,7 @@ func TestRoundedSurfaceBorderDoesNotSquareOffOuterCorners(t *testing.T) {
 	}
 	captured, err := captureGio(root, image.Pt(100, 40), State{}, 1)
 	if err != nil {
+		skipMetalUnavailable(t, err)
 		t.Fatal(err)
 	}
 	if corner := captured.RGBAAt(0, 0); corner.A != 0 {
@@ -305,27 +316,217 @@ func TestGioCacheBuildsImmutableSceneOnceAndRepositionsScrolledGeometry(t *testi
 	}
 }
 
+func TestGioCachePinsHorizontalAndVerticalScrollReplayInputs(t *testing.T) {
+	tests := []struct {
+		name       string
+		axis       string
+		viewport   image.Point
+		content    image.Point
+		offset     image.Point
+		wantBounds image.Rectangle
+	}{
+		{
+			name: "vertical", axis: "vertical", viewport: image.Pt(100, 80),
+			content: image.Pt(100, 240), offset: image.Pt(17, 30),
+			wantBounds: image.Rect(0, -30, 100, 210),
+		},
+		{
+			name: "horizontal clamps beyond maximum", axis: "horizontal", viewport: image.Pt(100, 80),
+			content: image.Pt(260, 80), offset: image.Pt(400, 19),
+			wantBounds: image.Rect(-160, 0, 100, 80),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := oneAxisScrollNode(test.axis, test.content)
+			theme := material.NewTheme()
+			var cache GioCache
+			layoutCached := func(state State) GioResult {
+				var operations op.Ops
+				return cache.Layout(layout.Context{
+					Ops: &operations, Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1},
+					Constraints: layout.Exact(test.viewport),
+				}, theme, root, test.viewport, state)
+			}
+			initial := layoutCached(State{})
+			shifted := layoutCached(State{Scroll: map[string]image.Point{"feed": test.offset}})
+			if cache.builds != 1 {
+				t.Fatalf("scene builds = %d, want one retained scene", cache.builds)
+			}
+			if got := initial.Bounds["content"]; got != image.Rect(0, 0, test.content.X, test.content.Y) {
+				t.Fatalf("initial content bounds = %v", got)
+			}
+			if got := shifted.Bounds["content"]; got != test.wantBounds {
+				t.Fatalf("shifted content bounds = %v, want %v", got, test.wantBounds)
+			}
+			if got := shifted.Geometry["content"].Clip; got != image.Rect(0, 0, test.viewport.X, test.viewport.Y) {
+				t.Fatalf("shifted content clip = %v", got)
+			}
+		})
+	}
+}
+
+func TestGioCacheReplaysBothAxisScrollGeometryAndMetricsWithoutRebuild(t *testing.T) {
+	root := bothAxisScrollNode(image.Pt(180, 140))
+	theme := material.NewTheme()
+	viewport := image.Pt(100, 80)
+	var cache GioCache
+	layoutCached := func(state State) GioResult {
+		var operations op.Ops
+		return cache.Layout(layout.Context{
+			Ops: &operations, Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}, Constraints: layout.Exact(viewport),
+		}, theme, root, viewport, state)
+	}
+	initial := layoutCached(State{})
+	shifted := layoutCached(State{Scroll: map[string]image.Point{"workspace": image.Pt(35, 25)}})
+	if cache.builds != 1 {
+		t.Fatalf("scene builds = %d, want 1 retained scene", cache.builds)
+	}
+	if got := initial.Bounds["both-content"]; got != image.Rect(0, 0, 180, 140) {
+		t.Fatalf("initial content bounds = %v", got)
+	}
+	if got := shifted.Bounds["both-content"]; got != image.Rect(-35, -25, 145, 115) {
+		t.Fatalf("shifted content bounds = %v", got)
+	}
+	if got := shifted.Geometry["both-content"].Clip; got != image.Rect(0, 0, 100, 80) {
+		t.Fatalf("shifted content clip = %v", got)
+	}
+	metrics, ok := shifted.Scroll["both-scroll"]
+	if !ok || metrics.ContentSize != image.Pt(180, 140) || metrics.Maximum != image.Pt(80, 60) || !metrics.EnabledX || !metrics.EnabledY {
+		t.Fatalf("shifted scroll metrics = %+v, present=%v", metrics, ok)
+	}
+}
+
+func TestGioCacheTranslatesNestedScrollMetricsByAncestorOffsets(t *testing.T) {
+	root := &project.Node{
+		Handle: "outer-both", Name: "outer", Type: "scroll", Props: map[string]any{"axis": "both"},
+		Children: []*project.Node{{
+			Handle: "inner-both", Name: "inner", Type: "scroll",
+			Props: map[string]any{"axis": "both", "width": int64(120), "height": int64(120)},
+			Children: []*project.Node{{
+				Handle: "nested-content", Type: "surface",
+				Props: map[string]any{"width": int64(180), "height": int64(160)},
+			}},
+		}},
+	}
+	viewport := image.Pt(100, 100)
+	state := State{Scroll: map[string]image.Point{
+		"outer": image.Pt(20, 10), "inner": image.Pt(30, 40),
+	}}
+	theme := material.NewTheme()
+	var cache GioCache
+	layoutCached := func(state State) GioResult {
+		var operations op.Ops
+		return cache.Layout(layout.Context{
+			Ops: &operations, Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}, Constraints: layout.Exact(viewport),
+		}, theme, root, viewport, state)
+	}
+	layoutCached(State{})
+	cached := layoutCached(state)
+	fresh := Render(root, viewport, state)
+	want := fresh.Scroll["inner-both"]
+	got, ok := cached.Scroll["inner-both"]
+	if !ok {
+		t.Fatal("cached result is missing inner scroll metrics")
+	}
+	if got != want {
+		t.Fatalf("cached inner metrics = %+v, fresh CPU = %+v", got, want)
+	}
+	if want.Viewport != image.Rect(-20, -10, 100, 110) {
+		t.Fatalf("fresh inner viewport = %v, want translated viewport", want.Viewport)
+	}
+	if cache.builds != 1 {
+		t.Fatalf("scene builds = %d, want 1 retained scene", cache.builds)
+	}
+}
+
 func TestGioCacheInvalidatesForViewportMetricAndResolvedRootChanges(t *testing.T) {
 	root := &project.Node{Handle: "root", Type: "surface", Props: map[string]any{"background": "#FFFFFF"}}
 	theme := material.NewTheme()
 	var cache GioCache
-	layoutCached := func(root *project.Node, viewport image.Point, scale float32) {
+	layoutCached := func(theme *material.Theme, root *project.Node, viewport image.Point, pixelsPerDp, pixelsPerSp float32) {
 		var operations op.Ops
 		cache.Layout(layout.Context{
 			Ops:         &operations,
-			Metric:      unit.Metric{PxPerDp: scale, PxPerSp: scale},
-			Constraints: layout.Exact(image.Pt(int(float32(viewport.X)*scale), int(float32(viewport.Y)*scale))),
+			Metric:      unit.Metric{PxPerDp: pixelsPerDp, PxPerSp: pixelsPerSp},
+			Constraints: layout.Exact(image.Pt(int(float32(viewport.X)*pixelsPerDp), int(float32(viewport.Y)*pixelsPerDp))),
 		}, theme, root, viewport, State{})
 	}
 
-	layoutCached(root, image.Pt(100, 100), 1)
-	layoutCached(root, image.Pt(100, 100), 1)
-	layoutCached(root, image.Pt(120, 100), 1)
-	layoutCached(root, image.Pt(120, 100), 2)
-	layoutCached(&project.Node{Handle: "replacement", Type: "surface"}, image.Pt(120, 100), 2)
-
+	layoutCached(theme, root, image.Pt(100, 100), 1, 1)
+	layoutCached(theme, root, image.Pt(100, 100), 1, 1)
+	if cache.builds != 1 {
+		t.Fatalf("identical inputs rebuilt scene: builds = %d, want 1", cache.builds)
+	}
+	changedTheme := material.NewTheme()
+	layoutCached(changedTheme, root, image.Pt(100, 100), 1, 1)
+	if cache.builds != 2 {
+		t.Fatalf("theme identity did not rebuild scene: builds = %d, want 2", cache.builds)
+	}
+	layoutCached(changedTheme, root, image.Pt(100, 100), 2, 1)
+	if cache.builds != 3 {
+		t.Fatalf("PxPerDp-only change did not rebuild scene: builds = %d, want 3", cache.builds)
+	}
+	layoutCached(changedTheme, root, image.Pt(100, 100), 2, 2)
 	if cache.builds != 4 {
-		t.Fatalf("scene builds = %d, want 4", cache.builds)
+		t.Fatalf("PxPerSp-only change did not rebuild scene: builds = %d, want 4", cache.builds)
+	}
+	layoutCached(changedTheme, root, image.Pt(120, 100), 2, 2)
+	if cache.builds != 5 {
+		t.Fatalf("viewport change did not rebuild scene: builds = %d, want 5", cache.builds)
+	}
+	replacement := &project.Node{Handle: "replacement", Type: "surface", Props: map[string]any{"width": int64(40), "height": int64(30)}}
+	layoutCached(changedTheme, replacement, image.Pt(120, 100), 2, 2)
+	if cache.builds != 6 {
+		t.Fatalf("resolved-root replacement did not rebuild scene: builds = %d, want 6", cache.builds)
+	}
+	cache.Invalidate()
+	if cache.scene != nil {
+		t.Fatal("explicit Invalidate retained the scene")
+	}
+	layoutCached(changedTheme, replacement, image.Pt(120, 100), 2, 2)
+	if cache.builds != 7 {
+		t.Fatalf("explicit Invalidate rebuilt %d scenes, want 7 total", cache.builds)
+	}
+}
+
+func TestGioCacheDynamicReplayInputsDoNotInvalidate(t *testing.T) {
+	sticky := stickyNode(map[string]any{"top": int64(0), "right": nil, "bottom": nil, "left": nil}, map[string]any{"height": int64(24), "background": "#444444"})
+	root := &project.Node{
+		Handle: "dynamic-scroll", Type: "scroll",
+		Props: map[string]any{"axis": "both", "scrollbar_x": "always", "scrollbar_y": "always"},
+		Children: []*project.Node{{
+			Handle: "dynamic-content", Type: "surface",
+			Props: map[string]any{"width": int64(260), "height": int64(220)},
+			Children: []*project.Node{
+				sticky,
+				{Handle: "dynamic-button", Type: "button", Props: map[string]any{"label": "Dynamic", "width": int64(80), "height": int64(28)}, Children: []*project.Node{{Handle: "dynamic-label", Type: "text", Props: map[string]any{"text": "Dynamic"}}}},
+			},
+		}},
+	}
+	theme := material.NewTheme()
+	viewport := image.Pt(100, 80)
+	var cache GioCache
+	layoutCached := func(state State) GioResult {
+		var operations op.Ops
+		return cache.Layout(layout.Context{Ops: &operations, Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}, Constraints: layout.Exact(viewport)}, theme, root, viewport, state)
+	}
+	layoutCached(State{})
+	states := []State{
+		{Hovered: "dynamic-button"},
+		{Pressed: "dynamic-button"},
+		{Focused: "dynamic-button"},
+		{Scroll: map[string]image.Point{"dynamic-scroll": image.Pt(20, 15)}},
+		{Scroll: map[string]image.Point{"dynamic-scroll": image.Pt(40, 30)}, Hovered: "dynamic-button", Pressed: "dynamic-button", Focused: "dynamic-button"},
+	}
+	for index, state := range states {
+		result := layoutCached(state)
+		if result.Tree == nil {
+			t.Fatalf("dynamic replay %d returned no tree", index)
+		}
+	}
+	if cache.builds != 1 {
+		t.Fatalf("dynamic replay rebuilt scene %d times, want one build", cache.builds)
 	}
 }
 
@@ -351,6 +552,99 @@ func TestGioCacheReplaysTransientButtonPaintWithoutGeometryRebuild(t *testing.T)
 	}
 	if hovered.Tree == nil || hovered.Tree.Props["background"] != "#FF0000" || !hovered.Tree.Hovered {
 		t.Fatalf("hovered runtime tree = %+v", hovered.Tree)
+	}
+}
+
+func TestGioCacheRetainedSceneCardinalityStaysBoundedAcrossDynamicCycles(t *testing.T) {
+	button := &project.Node{
+		Handle: "cycle-button", Type: "button",
+		Props:    map[string]any{"width": int64(80), "height": int64(32), "label": "Cycle", "background": "#222222"},
+		Children: []*project.Node{{Handle: "cycle-label", Type: "text", Props: map[string]any{"text": "Cycle"}}},
+	}
+	inner := &project.Node{
+		Handle: "cycle-inner", Type: "scroll",
+		Props: map[string]any{"axis": "both", "width": int64(140), "height": int64(110)},
+		Children: []*project.Node{{
+			Handle: "cycle-inner-content", Type: "stack",
+			Props:    map[string]any{"width": int64(260), "height": int64(220), "direction": "vertical"},
+			Children: []*project.Node{button},
+		}},
+	}
+	root := &project.Node{
+		Handle: "cycle-outer", Type: "scroll", Props: map[string]any{"axis": "both"},
+		Children: []*project.Node{{Handle: "cycle-outer-content", Type: "surface", Props: map[string]any{"width": int64(180), "height": int64(150)}, Children: []*project.Node{inner}}},
+	}
+	viewport := image.Pt(100, 80)
+	theme := material.NewTheme()
+	var cache GioCache
+	layoutCached := func(state State) GioResult {
+		var operations op.Ops
+		return cache.Layout(layout.Context{
+			Ops: &operations, Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}, Constraints: layout.Exact(viewport),
+		}, theme, root, viewport, state)
+	}
+	initial := layoutCached(State{})
+	if cache.scene == nil {
+		t.Fatal("cache did not retain a scene")
+	}
+	items, geometries, layouts, scrolls := len(cache.scene.items), len(cache.scene.geometries), len(cache.scene.layouts), len(cache.scene.scrolls)
+	if items == 0 || geometries == 0 || layouts == 0 || scrolls != 2 {
+		t.Fatalf("unexpected retained scene cardinality: items=%d geometries=%d layouts=%d scrolls=%d", items, geometries, layouts, scrolls)
+	}
+	for cycle := 0; cycle < 100; cycle++ {
+		state := State{
+			Scroll: map[string]image.Point{
+				"cycle-outer": image.Pt(cycle%80, (cycle*3)%70),
+				"cycle-inner": image.Pt((cycle*5)%120, (cycle*7)%110),
+			},
+			Hovered: func() string {
+				if cycle%2 == 0 {
+					return "cycle-button"
+				}
+				return ""
+			}(),
+			Focused: func() string {
+				if cycle%3 == 0 {
+					return "cycle-button"
+				}
+				return ""
+			}(),
+		}
+		cached := layoutCached(state)
+		var freshOps op.Ops
+		fresh := LayoutGio(layout.Context{
+			Ops: &freshOps, Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}, Constraints: layout.Exact(viewport),
+		}, theme, root, viewport, state)
+		derivedEqual := len(cached.Derived) == len(fresh.Derived) && (len(cached.Derived) == 0 || reflect.DeepEqual(cached.Derived, fresh.Derived))
+		if !reflect.DeepEqual(cached.Geometry, fresh.Geometry) || !reflect.DeepEqual(cached.Layout, fresh.Layout) || !reflect.DeepEqual(cached.Scroll, fresh.Scroll) || !derivedEqual || !reflect.DeepEqual(cached.Tree, fresh.Tree) {
+			t.Fatalf("cycle %d retained/fresh mismatch", cycle)
+		}
+		if got := len(cache.scene.items); got != items {
+			t.Fatalf("cycle %d retained item count=%d, want %d", cycle, got, items)
+		}
+		if got := len(cache.scene.geometries); got != geometries {
+			t.Fatalf("cycle %d retained geometry count=%d, want %d", cycle, got, geometries)
+		}
+		if got := len(cache.scene.layouts); got != layouts {
+			t.Fatalf("cycle %d retained layout count=%d, want %d", cycle, got, layouts)
+		}
+		if got := len(cache.scene.scrolls); got != scrolls {
+			t.Fatalf("cycle %d retained scroll count=%d, want %d", cycle, got, scrolls)
+		}
+	}
+	if cache.builds != 1 {
+		t.Fatalf("dynamic cycles rebuilt retained scene %d times", cache.builds)
+	}
+	if initial.Tree == nil {
+		t.Fatal("initial retained tree missing")
+	}
+	cache.Invalidate()
+	if cache.scene != nil {
+		t.Fatal("Invalidate retained scene")
+	}
+	layoutCached(State{})
+	if cache.builds != 2 {
+		t.Fatalf("explicit invalidation did not rebuild exactly once: builds=%d", cache.builds)
 	}
 }
 
@@ -423,6 +717,7 @@ func TestGioCacheReplaysOffscreenScrollContentAcrossNativeFrames(t *testing.T) {
 	}
 	window, err := headless.NewWindow(20, 20)
 	if err != nil {
+		skipMetalUnavailable(t, err)
 		t.Fatal(err)
 	}
 	defer window.Release()

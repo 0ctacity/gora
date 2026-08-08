@@ -2,9 +2,12 @@ package studio
 
 import (
 	"image"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"gioui.org/app"
 	"gioui.org/f32"
 	"gioui.org/io/event"
 	"gioui.org/io/input"
@@ -302,6 +305,157 @@ func TestDocumentScrollAtBottomDoesNotAccumulateHiddenOffset(t *testing.T) {
 	}
 }
 
+func TestStudioDiagonalScrollUpdatesBothAxesOnNextFrameWithoutClick(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.gora")
+	if err := os.WriteFile(path, []byte(`gora: 1
+kind: app
+viewport: { width: 100, height: 80 }
+entry: main
+screens:
+  main:
+    type: scroll
+    name: workspace
+    props: { axis: both }
+    children: [{ type: surface, props: { width: 200, height: 160 } }]
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := &uiState{zoomValue: 1, zoomInitialized: true, router: interaction.NewRouter(), runtimeTree: tree, canvasViewport: image.Pt(100, 80), canvasSize: image.Pt(100, 80)}
+	var inputOps op.Ops
+	canvasClip := clip.Rect{Max: image.Pt(100, 80)}.Push(&inputOps)
+	event.Op(&inputOps, &state.zoomInput)
+	event.Op(&inputOps, &state.interactionInput)
+	canvasClip.Pop()
+	var inputRouter input.Router
+	_, _ = inputRouter.Event(trackpadZoomFilter(state))
+	inputRouter.Frame(&inputOps)
+	inputRouter.Queue(pointer.Event{Kind: pointer.Scroll, Position: f32.Pt(40, 40), Scroll: f32.Pt(30, 20)})
+	var frameOps op.Ops
+	gtx := layout.Context{Ops: &frameOps, Source: inputRouter.Source(), Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}, Constraints: layout.Exact(image.Pt(100, 80))}
+	before := runtime.Snapshot()
+	handleActions(gtx, runtime, state, before, new(app.Window))
+	after := runtime.Snapshot()
+	if got := after.Scroll["workspace"]; got != image.Pt(30, 20) {
+		t.Fatalf("diagonal Studio scroll = %v, want (30,20)", got)
+	}
+	if after.RuntimeRevision != before.RuntimeRevision+1 {
+		t.Fatalf("diagonal Studio scroll revision = %d, want one atomic commit from %d", after.RuntimeRevision, before.RuntimeRevision)
+	}
+	next, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := namedSemanticNode(next, "")
+	for _, node := range semantic.Flatten(next) {
+		if node.Handle == tree.Children[0].Handle {
+			content = node
+			break
+		}
+	}
+	if content == nil || content.Bounds == nil || content.Bounds.X != -30 || content.Bounds.Y != -20 {
+		t.Fatalf("next-frame content bounds = %+v, want x=-30 y=-20", content)
+	}
+}
+
+func TestStudioScrollbarThumbDragUpdatesNextFrameGeometry(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.gora")
+	if err := os.WriteFile(path, []byte(`gora: 1
+kind: app
+viewport: { width: 100, height: 80 }
+entry: main
+screens:
+  main:
+    type: scroll
+    name: workspace
+    props: { axis: both, scrollbar_x: always, scrollbar_y: always }
+    children: [{ type: surface, props: { width: 240, height: 200 } }]
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := &uiState{zoomValue: 1, zoomInitialized: true, router: interaction.NewRouter()}
+	theme := material.NewTheme()
+	window := new(app.Window)
+	var inputOps op.Ops
+	event.Op(&inputOps, &state.zoomInput)
+	event.Op(&inputOps, &state.interactionInput)
+	var inputRouter input.Router
+	_, _ = inputRouter.Event(trackpadZoomFilter(state))
+	_, _ = inputRouter.Event(pointer.Filter{Target: &state.interactionInput, Kinds: pointer.Enter | pointer.Leave | pointer.Move | pointer.Drag | pointer.Press | pointer.Release | pointer.Cancel})
+	inputRouter.Frame(&inputOps)
+	frame := func() {
+		var frameOps op.Ops
+		gtx := layout.Context{Ops: &frameOps, Source: inputRouter.Source(), Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}, Constraints: layout.Exact(image.Pt(100, 80))}
+		snapshot := runtime.Snapshot()
+		handleActions(gtx, runtime, state, snapshot, window)
+		layoutStudioCanvas(gtx, theme, runtime, state, runtime.Snapshot(), window)
+		inputRouter.Frame(gtx.Ops)
+	}
+	frame()
+	findScrollbar := func(orientation string) *semantic.Node {
+		for _, node := range semantic.Flatten(state.runtimeTree) {
+			if node.Role == "scrollbar" && node.Orientation == orientation {
+				return node
+			}
+		}
+		return nil
+	}
+	vertical := findScrollbar("vertical")
+	if vertical == nil || len(vertical.Children) < 2 || vertical.Children[1].Bounds == nil {
+		t.Fatalf("initial vertical scrollbar = %+v", vertical)
+	}
+	thumb := vertical.Children[1].Bounds.ImageRectangle()
+	thumbCenter := f32.Pt(float32((thumb.Min.X+thumb.Max.X)/2), float32((thumb.Min.Y+thumb.Max.Y)/2))
+	inputRouter.Queue(pointer.Event{Source: pointer.Mouse, PointerID: 1, Kind: pointer.Press, Buttons: pointer.ButtonPrimary, Position: thumbCenter})
+	frame()
+	inputRouter.Queue(pointer.Event{Source: pointer.Mouse, PointerID: 1, Kind: pointer.Move, Buttons: pointer.ButtonPrimary, Position: f32.Pt(thumbCenter.X, float32(vertical.Bounds.ImageRectangle().Max.Y))})
+	frame()
+	if got := runtime.Snapshot().Scroll["workspace"]; got.Y <= 0 {
+		t.Fatalf("thumb drag did not update runtime offset: %v", got)
+	}
+	beforeThumb := thumb
+	frame()
+	updated := findScrollbar("vertical")
+	if updated == nil || len(updated.Children) < 2 || updated.Children[1].Bounds == nil {
+		t.Fatalf("next-frame vertical scrollbar = %+v", updated)
+	}
+	if got := updated.Children[1].Bounds.ImageRectangle(); got == beforeThumb {
+		t.Fatalf("next-frame thumb remained at %v after drag", got)
+	}
+}
+
+func TestStudioScrollbarPointerScaleConversionPreservesLogicalPosition(t *testing.T) {
+	logical := image.Pt(42, 60)
+	cases := []struct {
+		zoom float32
+		pxdp float32
+	}{
+		{zoom: .75, pxdp: 2},
+		{zoom: 1.5, pxdp: 1},
+	}
+	for _, testCase := range cases {
+		state := &uiState{zoomValue: testCase.zoom, canvasViewport: image.Pt(100, 100), canvasSize: image.Pt(100, 100)}
+		scale := testCase.zoom * testCase.pxdp
+		physical := f32.Pt(float32(logical.X)*scale, float32(logical.Y)*scale)
+		if got := documentPoint(state, unit.Metric{PxPerDp: testCase.pxdp}, physical); got != logical {
+			t.Fatalf("zoom=%v px/dp=%v converted pointer=%v, want %v", testCase.zoom, testCase.pxdp, got, logical)
+		}
+	}
+}
+
 func TestToolbarModelPresentsStateInsteadOfEditingMechanics(t *testing.T) {
 	model := makeToolbarModel(Snapshot{
 		Screen:   "overview",
@@ -444,5 +598,26 @@ func TestTextAreaScrollTargetOwnsOnlyVisibleEnabledMultilineFields(t *testing.T)
 	area.Enabled = true
 	if got := textAreaScrollTarget(root, image.Pt(150, 20)); got != nil {
 		t.Fatalf("outside point targeted text area: %+v", got)
+	}
+}
+
+func TestStudioTextHitTargetsUseFinalPaintOrder(t *testing.T) {
+	root := &semantic.Node{Children: []*semantic.Node{
+		{Handle: "front-source", Role: "textbox", Type: "text_field", Enabled: true, Visible: true, InViewport: true,
+			Bounds: &semantic.Rect{X: 0, Y: 0, Width: 100, Height: 50}, Clip: &semantic.Rect{X: 0, Y: 0, Width: 100, Height: 50}, PaintOrder: 20},
+		{Handle: "back-source", Role: "textbox", Type: "text_field", Enabled: true, Visible: true, InViewport: true,
+			Bounds: &semantic.Rect{X: 0, Y: 0, Width: 100, Height: 50}, Clip: &semantic.Rect{X: 0, Y: 0, Width: 100, Height: 50}, PaintOrder: 5},
+	}}
+	if got := hitTextField(root, image.Pt(20, 20)); got == nil || got.Handle != "front-source" {
+		t.Fatalf("text-field hit = %+v, want final rank 20 node", got)
+	}
+	areaRoot := &semantic.Node{Children: []*semantic.Node{
+		{Handle: "area-front", Type: "text_area", Role: "textbox", Enabled: true, Visible: true, InViewport: true,
+			Bounds: &semantic.Rect{X: 0, Y: 0, Width: 100, Height: 50}, Clip: &semantic.Rect{X: 0, Y: 0, Width: 100, Height: 50}, PaintOrder: 30},
+		{Handle: "area-back", Type: "text_area", Role: "textbox", Enabled: true, Visible: true, InViewport: true,
+			Bounds: &semantic.Rect{X: 0, Y: 0, Width: 100, Height: 50}, Clip: &semantic.Rect{X: 0, Y: 0, Width: 100, Height: 50}, PaintOrder: 10},
+	}}
+	if got := textAreaScrollTarget(areaRoot, image.Pt(20, 20)); got == nil || got.Handle != "area-front" {
+		t.Fatalf("text-area scroll hit = %+v, want final rank 30 node", got)
 	}
 }

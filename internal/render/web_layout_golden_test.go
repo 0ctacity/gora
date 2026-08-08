@@ -40,6 +40,7 @@ func TestWebLayoutGoldenCaptures(t *testing.T) {
 			}
 			captured, err := captureGio(root, image.Pt(test.width, loaded.Viewport.Height), State{}, 1)
 			if err != nil {
+				skipMetalUnavailable(t, err)
 				t.Fatal(err)
 			}
 			var encoded bytes.Buffer

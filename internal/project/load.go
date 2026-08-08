@@ -625,6 +625,8 @@ func (l *loader) resolveNode(source *document.Node, ctx resolveContext) *Node {
 		delete(props, "style")
 		props = mergeMaps(style, props)
 	}
+	validateResolvedScrollPolicyMix(source, props, l)
+	normalizeResolvedValues(source, props, place)
 	validateResolvedValues(source, props, place, l)
 	if source.Type == "instance" {
 		resolved := l.resolveInstance(source, props, place, ctx)
@@ -959,6 +961,100 @@ func (l *loader) validateResolvedInteraction(node *Node, ctx resolveContext) {
 	}
 }
 
+func validateResolvedScrollPolicyMix(source *document.Node, props map[string]any, l *loader) {
+	if source == nil || source.Type != "scroll" {
+		return
+	}
+	if _, legacy := props["scrollbar"]; !legacy {
+		return
+	}
+	_, hasX := props["scrollbar_x"]
+	_, hasY := props["scrollbar_y"]
+	if hasX || hasY {
+		l.add(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", "legacy scrollbar cannot be combined with scrollbar_x or scrollbar_y")
+	}
+}
+
+// normalizeResolvedValues fills the effective defaults used by renderers and
+// inspectors after references and responsive overrides have been resolved.
+// Authored legacy fields are intentionally retained in props.
+func normalizeResolvedValues(source *document.Node, props, place map[string]any) {
+	if source == nil {
+		return
+	}
+	// Instance placement is caller-authored input to component expansion. Do
+	// not materialize the flow default here, or it would overwrite a positioned
+	// component root when the instance has no placement override.
+	if source.Type == "instance" {
+		return
+	}
+	position := "flow"
+	if raw, exists := place["position"]; exists {
+		if text, ok := raw.(string); ok {
+			position = text
+		}
+	} else {
+		place["position"] = position
+	}
+	if position == "sticky" || position == "fixed" {
+		if _, exists := place["z_index"]; !exists {
+			place["z_index"] = int64(0)
+		}
+	}
+
+	if source.Type != "scroll" {
+		return
+	}
+	axis := "vertical"
+	if raw, exists := props["axis"]; exists {
+		if text, ok := raw.(string); ok {
+			axis = text
+		}
+	} else {
+		props["axis"] = axis
+	}
+	enabled := func(axisName string) bool {
+		return axis == "both" || axis == axisName
+	}
+	legacy, hasLegacy := props["scrollbar"]
+	if hasLegacy {
+		if visible, ok := legacy.(bool); ok {
+			policy := "hidden"
+			if visible {
+				policy = "auto"
+			}
+			if enabled("horizontal") {
+				props["scrollbar_x"] = policy
+			} else {
+				props["scrollbar_x"] = "hidden"
+			}
+			if enabled("vertical") {
+				props["scrollbar_y"] = policy
+			} else {
+				props["scrollbar_y"] = "hidden"
+			}
+		}
+	} else {
+		if _, exists := props["scrollbar_x"]; !exists {
+			if enabled("horizontal") {
+				props["scrollbar_x"] = "auto"
+			} else {
+				props["scrollbar_x"] = "hidden"
+			}
+		}
+		if _, exists := props["scrollbar_y"]; !exists {
+			if enabled("vertical") {
+				props["scrollbar_y"] = "auto"
+			} else {
+				props["scrollbar_y"] = "hidden"
+			}
+		}
+	}
+	if _, exists := props["scroll_chain"]; !exists {
+		props["scroll_chain"] = "auto"
+	}
+}
+
 func resolvedStateType(value any, expected string, l *loader) bool {
 	if reference, ok := value.(StateReference); ok {
 		scope, exists := l.stateScopes[reference.Scope]
@@ -1011,19 +1107,64 @@ func validateResolvedValues(source *document.Node, props, place map[string]any, 
 		enum("alignment", "start", "center", "end", "stretch")
 		enum("distribution", "start", "center", "end", "space_between", "space_around")
 	case "scroll":
-		enum("axis", "horizontal", "vertical")
+		enum("axis", "horizontal", "vertical", "both")
 	case "image":
 		enum("fit", "contain", "cover", "fill")
 	case "divider":
 		enum("orientation", "horizontal", "vertical")
 	}
-	for _, key := range []string{"clip", "italic", "wrap", "scrollbar"} {
+	for _, key := range []string{"clip", "italic", "wrap"} {
 		if value, exists := props[key]; exists {
 			if _, dynamic := value.(StateReference); dynamic {
 				continue
 			}
 			if _, ok := value.(bool); !ok {
 				l.add(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", fmt.Sprintf("prop %q requires true or false", key))
+			}
+		}
+	}
+	if source.Type == "scroll" {
+		if value, exists := props["scrollbar"]; exists {
+			if _, ok := value.(bool); !ok {
+				l.add(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", "prop \"scrollbar\" requires true or false")
+			}
+		}
+		for _, key := range []string{"scrollbar_x", "scrollbar_y"} {
+			if value, exists := props[key]; exists {
+				text, ok := value.(string)
+				if !ok {
+					l.add(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", fmt.Sprintf("prop %q requires auto, always, or hidden", key))
+					continue
+				}
+				if !containsString([]string{"auto", "always", "hidden"}, text) {
+					l.addSuggestions(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", fmt.Sprintf("invalid %s %q", key, text), []string{"auto", "always", "hidden"})
+				}
+			}
+		}
+		if value, exists := props["scroll_chain"]; exists {
+			text, ok := value.(string)
+			if !ok || !containsString([]string{"auto", "contain"}, text) {
+				l.addSuggestions(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", "scroll_chain must resolve to auto or contain", []string{"auto", "contain"})
+			}
+		}
+		axis, axisOK := props["axis"].(string)
+		if axisOK && (axis == "horizontal" || axis == "vertical") {
+			checkDisabled := func(key, axisName string) {
+				value, exists := props[key]
+				if !exists {
+					return
+				}
+				if _, dynamic := value.(StateReference); dynamic {
+					return
+				}
+				if text, ok := value.(string); ok && text != "hidden" {
+					l.add(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", fmt.Sprintf("%s must resolve to hidden when %s scroll axis is disabled", key, axisName))
+				}
+			}
+			if axis == "horizontal" {
+				checkDisabled("scrollbar_y", "horizontal")
+			} else {
+				checkDisabled("scrollbar_x", "vertical")
 			}
 		}
 	}
@@ -1112,7 +1253,51 @@ func validateResolvedValues(source *document.Node, props, place map[string]any, 
 			if !ok || !containsString(alignments, text) {
 				l.add(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", "placement \"alignment\" resolves to an unsupported value")
 			}
+		case "position":
+			text, ok := value.(string)
+			if !ok || !containsString([]string{"flow", "sticky", "fixed"}, text) {
+				l.addSuggestions(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", "placement \"position\" resolves to an unsupported value", []string{"flow", "sticky", "fixed"})
+			}
+		case "inset":
+			validateResolvedPositionInset(source, value, l)
+		case "z_index":
+			if !resolvedInteger(value) {
+				l.add(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", "placement \"z_index\" requires a signed integer")
+				continue
+			}
+			position, _ := place["position"].(string)
+			if position != "sticky" && position != "fixed" {
+				l.add(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", "placement \"z_index\" is valid only for sticky or fixed positioning")
+			}
 		}
+	}
+}
+
+func validateResolvedPositionInset(source *document.Node, value any, l *loader) {
+	if source == nil {
+		return
+	}
+	edges, ok := value.(map[string]any)
+	if !ok || len(edges) != 4 {
+		l.add(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", "placement \"inset\" requires top, right, bottom, and left")
+		return
+	}
+	for _, edge := range []string{"top", "right", "bottom", "left"} {
+		raw, exists := edges[edge]
+		if !exists {
+			l.add(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", "placement \"inset\" requires top, right, bottom, and left")
+			continue
+		}
+		if raw == nil || resolvedNumber(raw, false) {
+			continue
+		}
+		percent, percentOK := raw.(map[string]any)
+		if percentOK && len(percent) == 1 {
+			if value, exists := percent["percent"]; exists && resolvedNumber(value, false) {
+				continue
+			}
+		}
+		l.add(source.Source.File, source.Source.Line, source.Source.Column, "reference.type", fmt.Sprintf("placement inset %q requires null, a finite number, or a percentage", edge))
 	}
 }
 
@@ -1217,6 +1402,9 @@ func (l *loader) resolveInstance(source *document.Node, instanceProps, place map
 		}
 		resolved.Props[key] = value
 	}
+	resolvedSource := &document.Node{Type: resolved.Type, Source: resolved.Source}
+	normalizeResolvedValues(resolvedSource, resolved.Props, resolved.Place)
+	validateResolvedValues(resolvedSource, resolved.Props, resolved.Place, l)
 	if source.Name != "" {
 		resolved.Name = source.Name
 	}
@@ -1265,6 +1453,21 @@ func resolvedNumber(value any, nonNegative bool) bool {
 		return false
 	}
 	return !math.IsNaN(number) && !math.IsInf(number, 0) && (!nonNegative || number >= 0)
+}
+
+func resolvedInteger(value any) bool {
+	switch value := value.(type) {
+	case int64:
+		return true
+	case float64:
+		return validSignedIntegerFloat(value)
+	default:
+		return false
+	}
+}
+
+func validSignedIntegerFloat(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0) && math.Trunc(value) == value && value >= -9223372036854775808.0 && value < 9223372036854775808.0
 }
 
 func resolvedDimension(value any, allowKeywords bool) bool {

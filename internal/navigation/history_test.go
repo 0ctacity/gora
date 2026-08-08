@@ -65,6 +65,30 @@ func TestHistoryIsBoundedToOneHundredEntries(t *testing.T) {
 	}
 }
 
+func TestHistoryRepeatedNavigationKeepsEntriesAndScrollMapsBounded(t *testing.T) {
+	history := New("cycle-0")
+	for cycle := 0; cycle < 100; cycle++ {
+		for index := 0; index < 105; index++ {
+			history.Navigate(screenName(cycle*105+index+1), map[string]image.Point{"feed": image.Pt(index, cycle)})
+		}
+		for index := 0; index < 5; index++ {
+			history.Back(map[string]image.Point{"feed": image.Pt(index, cycle)})
+			history.Forward(map[string]image.Point{"feed": image.Pt(index+1, cycle)})
+		}
+		if history.Len() > Capacity {
+			t.Fatalf("cycle %d history length=%d, want <=%d", cycle, history.Len(), Capacity)
+		}
+		for entryIndex, entry := range history.entries {
+			if len(entry.Scroll) > 1 {
+				t.Fatalf("cycle %d entry %d retained %d scroll nodes", cycle, entryIndex, len(entry.Scroll))
+			}
+		}
+	}
+	if history.Len() != Capacity {
+		t.Fatalf("repeated history length=%d, want %d", history.Len(), Capacity)
+	}
+}
+
 func TestHistoryReconcilesRemovedScreensAndScrollNodes(t *testing.T) {
 	history := New("home")
 	history.Navigate("reports", map[string]image.Point{"home-feed": image.Pt(0, 40), "removed": image.Pt(0, 90)})

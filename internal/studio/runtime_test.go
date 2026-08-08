@@ -6,9 +6,12 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	"gioui.org/app"
 	"gioui.org/layout"
 	"gioui.org/op"
 	"gioui.org/unit"
@@ -146,6 +149,509 @@ screens:
 	}
 	if got := runtime.Snapshot().Scroll["feed"].Y; got != 120 {
 		t.Fatalf("clamped scroll = %d, want 120", got)
+	}
+}
+
+func TestRuntimeTreeIncludesInertDerivedScrollbarNodes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.gora")
+	source := []byte(`
+gora: 1
+kind: app
+viewport: { width: 100, height: 80 }
+entry: main
+screens:
+  main:
+    type: scroll
+    name: feed
+    props: { axis: vertical, scrollbar: true }
+    children:
+      - type: surface
+        props: { height: 200 }
+`)
+	if err := os.WriteFile(path, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bar *semantic.Node
+	for _, node := range semantic.Flatten(first) {
+		if node.Role == "scrollbar" && node.Orientation == "vertical" {
+			bar = node
+			break
+		}
+	}
+	if bar == nil {
+		t.Fatal("runtime tree omitted derived vertical scrollbar")
+	}
+	if !bar.Visible || bar.Bounds == nil || bar.Clip == nil || bar.FocusOrder < 0 || len(bar.Actions) != 0 {
+		t.Fatalf("derived scrollbar interaction metadata = %+v", bar)
+	}
+	if bar.Value == nil || bar.Max == nil || *bar.Max <= 0 || len(bar.Operations) == 0 {
+		t.Fatalf("derived scrollbar metrics = %+v", bar)
+	}
+	if bar.ViewportSize == nil || bar.ViewportSize.Width != 100 || bar.ViewportSize.Height != 80 || bar.ContentSize == nil || bar.ContentSize.Width != 100 || bar.ContentSize.Height != 200 {
+		t.Fatalf("derived scrollbar extents = viewport:%+v content:%+v", bar.ViewportSize, bar.ContentSize)
+	}
+	if len(bar.Children) != 2 || bar.Children[0].Type != "scrollbar_track" || bar.Children[1].Type != "scrollbar_thumb" {
+		t.Fatalf("derived scrollbar parts = %+v", bar.Children)
+	}
+	second, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var repeated *semantic.Node
+	for _, node := range semantic.Flatten(second) {
+		if node.Role == "scrollbar" && node.Orientation == "vertical" {
+			repeated = node
+			break
+		}
+	}
+	if repeated == nil || repeated.ID != bar.ID {
+		t.Fatalf("derived scrollbar ID is not stable: first=%q second=%q", bar.ID, nodeID(repeated))
+	}
+	if err := runtime.ActivateSemanticID(bar.ID); err == nil {
+		t.Fatal("derived scrollbar unexpectedly accepted activation")
+	}
+}
+
+func TestRuntimeScrollSemanticIDAcceptsDerivedScrollbarAxis(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.gora")
+	source := []byte(`
+gora: 1
+kind: app
+viewport: { width: 100, height: 80 }
+entry: main
+screens:
+  main:
+    type: scroll
+    name: feed
+    props: { axis: vertical, scrollbar_y: always, scrollbar_x: hidden }
+    children: [{ type: surface, props: { height: 240 } }]
+`)
+	if err := os.WriteFile(path, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var axis *semantic.Node
+	for _, node := range semantic.Flatten(tree) {
+		if node.Role == "scrollbar" && node.Orientation == "vertical" {
+			axis = node
+			break
+		}
+	}
+	if axis == nil || axis.Group == "" {
+		t.Fatalf("derived axis metadata = %+v", axis)
+	}
+	before := runtime.Snapshot()
+	if err := runtime.ScrollSemanticID(axis.ID, "to", 0, 999); err != nil {
+		t.Fatal(err)
+	}
+	after := runtime.Snapshot()
+	if got := after.Scroll["feed"]; got != image.Pt(0, 160) || after.RuntimeRevision != before.RuntimeRevision+1 {
+		t.Fatalf("derived axis scroll = %v revision=%d, want (0,160) and one revision", got, after.RuntimeRevision)
+	}
+	if err := runtime.ScrollSemanticID(axis.ID, "to", 4, 160); err == nil {
+		t.Fatal("derived vertical axis accepted cross-axis X mutation")
+	}
+	if got := runtime.Snapshot(); got.Scroll["feed"] != image.Pt(0, 160) || got.RuntimeRevision != after.RuntimeRevision {
+		t.Fatalf("cross-axis rejection mutated scroll=%v revision=%d", got.Scroll["feed"], got.RuntimeRevision)
+	}
+}
+
+func TestRuntimeDerivedScrollbarByPreservesOwnerOtherAxis(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.gora")
+	source := []byte(`
+gora: 1
+kind: app
+viewport: { width: 100, height: 80 }
+entry: main
+screens:
+  main:
+    type: scroll
+    name: workspace
+    props: { axis: both, scrollbar_x: always, scrollbar_y: always }
+    children: [{ type: surface, props: { width: 240, height: 200 } }]
+`)
+	if err := os.WriteFile(path, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := namedSemanticNode(tree, "workspace")
+	if workspace == nil {
+		t.Fatal("missing both-axis owner")
+	}
+	var horizontal, vertical *semantic.Node
+	for _, node := range semantic.Flatten(tree) {
+		if node.Role != "scrollbar" {
+			continue
+		}
+		switch node.Orientation {
+		case "horizontal":
+			horizontal = node
+		case "vertical":
+			vertical = node
+		}
+	}
+	if horizontal == nil || vertical == nil {
+		t.Fatalf("derived axes = horizontal:%v vertical:%v", horizontal != nil, vertical != nil)
+	}
+	if err := runtime.ScrollSemanticID(workspace.ID, "to", 30, 20); err != nil {
+		t.Fatal(err)
+	}
+	before := runtime.Snapshot()
+	if err := runtime.ScrollSemanticID(vertical.ID, "by", 0, 10); err != nil {
+		t.Fatal(err)
+	}
+	afterVertical := runtime.Snapshot()
+	if got := afterVertical.Scroll["workspace"]; got != image.Pt(30, 30) || afterVertical.RuntimeRevision != before.RuntimeRevision+1 {
+		t.Fatalf("vertical derived by = %v revision=%d, want (30,30) and one revision", got, afterVertical.RuntimeRevision)
+	}
+	if err := runtime.ScrollSemanticID(horizontal.ID, "by", 15, 0); err != nil {
+		t.Fatal(err)
+	}
+	afterHorizontal := runtime.Snapshot()
+	if got := afterHorizontal.Scroll["workspace"]; got != image.Pt(45, 30) || afterHorizontal.RuntimeRevision != afterVertical.RuntimeRevision+1 {
+		t.Fatalf("horizontal derived by = %v revision=%d, want (45,30) and one revision", got, afterHorizontal.RuntimeRevision)
+	}
+	if err := runtime.ScrollSemanticID(vertical.ID, "by", 1, 0); err == nil {
+		t.Fatal("vertical derived scrollbar accepted cross-axis operand")
+	}
+	if got := runtime.Snapshot(); got.Scroll["workspace"] != image.Pt(45, 30) || got.RuntimeRevision != afterHorizontal.RuntimeRevision {
+		t.Fatalf("cross-axis rejection mutated offset=%v revision=%d", got.Scroll["workspace"], got.RuntimeRevision)
+	}
+}
+
+func nodeID(node *semantic.Node) string {
+	if node == nil {
+		return ""
+	}
+	return node.ID
+}
+
+func TestRuntimeScrollSemanticIDUsesPublishedBothAxisMetricsAtomically(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.gora")
+	source := []byte(`
+gora: 1
+kind: app
+viewport: { width: 100, height: 80 }
+entry: main
+screens:
+  main:
+    type: scroll
+    name: workspace
+    props: { axis: both }
+    children:
+      - type: surface
+        props: { width: 240, height: 200 }
+`)
+	if err := os.WriteFile(path, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	scroll := namedSemanticNode(tree, "workspace")
+	if scroll == nil {
+		t.Fatal("missing both-axis scroll")
+	}
+	snapshot := runtime.Snapshot()
+	metrics, ok := render.Render(snapshot.Root, snapshot.Viewport, renderState(snapshot)).Scroll[scroll.Handle]
+	if !ok || !metrics.EnabledX || !metrics.EnabledY || metrics.Maximum.X <= 0 || metrics.Maximum.Y <= 0 {
+		t.Fatalf("published scroll metrics = %+v, present=%v", metrics, ok)
+	}
+	before := runtime.Snapshot().RuntimeRevision
+	if err := runtime.ScrollSemanticID(scroll.ID, "to", metrics.Maximum.X+500, metrics.Maximum.Y+500); err != nil {
+		t.Fatal(err)
+	}
+	after := runtime.Snapshot()
+	if got := after.Scroll["workspace"]; got != image.Pt(metrics.Maximum.X, metrics.Maximum.Y) {
+		t.Fatalf("clamped both-axis offset = %v, want %v", got, image.Pt(metrics.Maximum.X, metrics.Maximum.Y))
+	}
+	if after.RuntimeRevision != before+1 {
+		t.Fatalf("both-axis mutation revision = %d, want %d", after.RuntimeRevision, before+1)
+	}
+	if err := runtime.ScrollSemanticID(scroll.ID, "to", metrics.Maximum.X, metrics.Maximum.Y); err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.Snapshot().RuntimeRevision; got != after.RuntimeRevision {
+		t.Fatalf("clamped-to-current revision = %d, want unchanged %d", got, after.RuntimeRevision)
+	}
+	if err := runtime.ScrollSemanticID(scroll.ID, "by", -5, -7); err != nil {
+		t.Fatal(err)
+	}
+	mutated := runtime.Snapshot()
+	if got := mutated.Scroll["workspace"]; got != image.Pt(metrics.Maximum.X-5, metrics.Maximum.Y-7) {
+		t.Fatalf("diagonal by offset = %v, want %v", got, image.Pt(metrics.Maximum.X-5, metrics.Maximum.Y-7))
+	}
+	if mutated.RuntimeRevision != after.RuntimeRevision+1 {
+		t.Fatalf("diagonal by revision = %d, want %d", mutated.RuntimeRevision, after.RuntimeRevision+1)
+	}
+}
+
+func TestRuntimeScrollSemanticIDAxisValidationIsAtomic(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.gora")
+	source := []byte(`
+gora: 1
+kind: app
+viewport: { width: 100, height: 80 }
+entry: main
+screens:
+  main:
+    type: overlay
+    children:
+      - type: scroll
+        name: vertical-feed
+        props: { axis: vertical, width: 100, height: 80 }
+        children: [{ type: surface, props: { width: 100, height: 200 } }]
+      - type: scroll
+        name: horizontal-feed
+        props: { axis: horizontal, width: 100, height: 80 }
+        children: [{ type: surface, props: { width: 200, height: 80 } }]
+      - type: scroll
+        name: workspace
+        props: { axis: both, width: 100, height: 80 }
+        children: [{ type: surface, props: { width: 200, height: 160 } }]
+`)
+	if err := os.WriteFile(path, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	vertical := namedSemanticNode(tree, "vertical-feed")
+	horizontal := namedSemanticNode(tree, "horizontal-feed")
+	both := namedSemanticNode(tree, "workspace")
+	if vertical == nil || horizontal == nil || both == nil {
+		t.Fatalf("scroll nodes = vertical:%v horizontal:%v both:%v", vertical != nil, horizontal != nil, both != nil)
+	}
+	before := runtime.Snapshot()
+	if err := runtime.ScrollSemanticID(vertical.ID, "to", 1, 0); err == nil {
+		t.Fatal("vertical scroll accepted a horizontal offset")
+	}
+	if got := runtime.Snapshot(); got.RuntimeRevision != before.RuntimeRevision || len(got.Scroll) != len(before.Scroll) {
+		t.Fatalf("vertical rejection mutated runtime: before=%+v after=%+v", before, got)
+	}
+	if err := runtime.ScrollSemanticID(horizontal.ID, "to", 0, 1); err == nil {
+		t.Fatal("horizontal scroll accepted a vertical offset")
+	}
+	if got := runtime.Snapshot(); got.RuntimeRevision != before.RuntimeRevision || len(got.Scroll) != len(before.Scroll) {
+		t.Fatalf("horizontal rejection mutated runtime: before=%+v after=%+v", before, got)
+	}
+	if err := runtime.ScrollSemanticID(both.ID, "to", 20, 30); err != nil {
+		t.Fatal(err)
+	}
+	got := runtime.Snapshot()
+	if got.Scroll["workspace"] != image.Pt(20, 30) || got.RuntimeRevision != before.RuntimeRevision+1 {
+		t.Fatalf("both-axis accepted state = %+v revision=%d, want (20,30) and one revision", got.Scroll["workspace"], got.RuntimeRevision)
+	}
+}
+
+func TestRuntimeSetScrollOffsetNoOpDoesNotAdvanceRevision(t *testing.T) {
+	runtime := &Runtime{scroll: map[string]image.Point{"feed": image.Pt(10, 20)}}
+	runtime.SetScrollOffset("feed", "vertical", 20)
+	if got := runtime.Snapshot().RuntimeRevision; got != 0 {
+		t.Fatalf("same-axis compatibility write advanced revision to %d", got)
+	}
+	runtime.SetScrollOffset("feed", "vertical", 30)
+	if got := runtime.Snapshot(); got.Scroll["feed"] != image.Pt(10, 30) || got.RuntimeRevision != 1 {
+		t.Fatalf("changed compatibility write = %+v revision=%d", got.Scroll["feed"], got.RuntimeRevision)
+	}
+}
+
+func TestRuntimeSetScrollPointsCommitsMultipleAxesAtomically(t *testing.T) {
+	runtime := &Runtime{scroll: map[string]image.Point{"vertical": {}, "horizontal": {}}}
+	if !runtime.setScrollPoints(map[string]image.Point{"vertical": image.Pt(0, 20), "horizontal": image.Pt(30, 0)}) {
+		t.Fatal("multi-scroll update was not committed")
+	}
+	snapshot := runtime.Snapshot()
+	if snapshot.Scroll["vertical"] != image.Pt(0, 20) || snapshot.Scroll["horizontal"] != image.Pt(30, 0) {
+		t.Fatalf("multi-scroll points = %+v", snapshot.Scroll)
+	}
+	if snapshot.RuntimeRevision != 1 {
+		t.Fatalf("multi-scroll revision = %d, want one commit", snapshot.RuntimeRevision)
+	}
+	if runtime.setScrollPoints(map[string]image.Point{"vertical": image.Pt(0, 20), "horizontal": image.Pt(30, 0)}) {
+		t.Fatal("identical multi-scroll update reported a mutation")
+	}
+	if got := runtime.Snapshot().RuntimeRevision; got != 1 {
+		t.Fatalf("identical multi-scroll update advanced revision to %d", got)
+	}
+}
+
+func TestFocusRevealBothAxesUsesPublishedMetrics(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.gora")
+	source := []byte(`
+gora: 1
+kind: app
+viewport: { width: 100, height: 80 }
+state:
+  note: { type: text, default: Ready }
+entry: main
+screens:
+  main:
+    type: scroll
+    name: workspace
+    props: { axis: both }
+    children:
+      - type: overlay
+        props: { width: 240, height: 200 }
+        children:
+          - type: text_field
+            name: notes
+            props: { label: Notes, bind: note, width: 40, height: 30 }
+            place: { x: 180, y: 170 }
+            children: [{ type: field_box, props: { width: 40, height: 30 } }]
+`)
+	if err := os.WriteFile(path, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	field := namedSemanticNode(tree, "notes")
+	if field == nil {
+		t.Fatal("missing focus target")
+	}
+	before := runtime.Snapshot().RuntimeRevision
+	runtime.SetTransient(interaction.Transient{Focused: field.Handle})
+	after := runtime.Snapshot()
+	if after.Scroll["workspace"].X <= 0 || after.Scroll["workspace"].Y <= 0 {
+		t.Fatalf("focus reveal offset = %v, want both axes moved", after.Scroll["workspace"])
+	}
+	if after.RuntimeRevision != before+1 {
+		t.Fatalf("focus reveal revision = %d, want %d", after.RuntimeRevision, before+1)
+	}
+}
+
+func TestRuntimeNavigationPreservesBothAxisScrollAcrossHistoryAndReload(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.gora")
+	source := []byte(`
+gora: 1
+kind: app
+viewport: { width: 100, height: 80 }
+entry: home
+screens:
+  home:
+    type: overlay
+    children:
+      - type: scroll
+        name: home-feed
+        props: { axis: both, width: 100, height: 80 }
+        children: [{ type: surface, props: { width: 220, height: 180 } }]
+      - type: link
+        name: reports-link
+        props: { label: Reports, to: reports, width: 80, height: 24 }
+        children: [{ type: text, props: { text: Reports } }]
+  reports:
+    type: overlay
+    children:
+      - type: scroll
+        name: reports-feed
+        props: { axis: both, width: 100, height: 80 }
+        children: [{ type: surface, props: { width: 220, height: 180 } }]
+      - type: link
+        name: home-link
+        props: { label: Home, to: home, width: 80, height: 24 }
+        children: [{ type: text, props: { text: Home } }]
+`)
+	if err := os.WriteFile(path, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	homeFeed := namedSemanticNode(home, "home-feed")
+	reportsLink := namedSemanticNode(home, "reports-link")
+	if homeFeed == nil || reportsLink == nil {
+		t.Fatal("missing home navigation nodes")
+	}
+	if err := runtime.ScrollSemanticID(homeFeed.ID, "to", 40, 30); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.ActivateSemanticID(reportsLink.ID); err != nil {
+		t.Fatal(err)
+	}
+	reports, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reportsFeed := namedSemanticNode(reports, "reports-feed")
+	if reportsFeed == nil {
+		t.Fatal("missing reports feed")
+	}
+	if err := runtime.ScrollSemanticID(reportsFeed.ID, "to", 25, 35); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Activate(interaction.Activation{Scope: "screen:reports", Actions: []document.Action{{Action: "back"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.Snapshot(); got.Screen != "home" || got.Scroll["home-feed"] != image.Pt(40, 30) {
+		t.Fatalf("back restoration = screen:%q scroll:%v", got.Screen, got.Scroll["home-feed"])
+	}
+	if err := runtime.Activate(interaction.Activation{Scope: "screen:home", Actions: []document.Action{{Action: "forward"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.Snapshot(); got.Screen != "reports" || got.Scroll["reports-feed"] != image.Pt(25, 35) {
+		t.Fatalf("forward restoration = screen:%q scroll:%v", got.Screen, got.Scroll["reports-feed"])
+	}
+	runtime.Reload()
+	if got := runtime.Snapshot(); got.Scroll["reports-feed"] != image.Pt(25, 35) {
+		t.Fatalf("compatible reload lost both-axis scroll = %v", got.Scroll["reports-feed"])
+	}
+	rename := strings.Replace(string(source), "name: reports-feed", "name: renamed-feed", 1)
+	if err := os.WriteFile(path, []byte(rename), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime.Reload()
+	if got := runtime.Snapshot(); got.Scroll["reports-feed"] != (image.Point{}) {
+		t.Fatalf("removed scroll name was not pruned: %v", got.Scroll)
 	}
 }
 
@@ -1433,6 +1939,125 @@ screens:
 	}
 }
 
+func TestRuntimeRepeatedInvalidReloadPreservesLastGoodDynamicStateAndPrunesOnce(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.gora")
+	valid := []byte(`
+gora: 1
+kind: app
+viewport: { width: 100, height: 80 }
+state:
+  count: { type: number, default: 1 }
+entry: first
+screens:
+  first:
+    type: scroll
+    name: first-feed
+    props: { axis: both }
+    children: [{ type: surface, props: { width: 240, height: 180 } }]
+  second:
+    type: scroll
+    name: second-feed
+    props: { axis: both }
+    children: [{ type: surface, props: { width: 260, height: 200 } }]
+`)
+	if err := os.WriteFile(path, valid, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Activate(interaction.Activation{Scope: "screen:first", Actions: []document.Action{{Action: "navigate", To: "second"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Activate(interaction.Activation{Scope: "screen:second", Actions: []document.Action{{Action: "increment", State: "count", By: float64(2)}}}); err != nil {
+		t.Fatal(err)
+	}
+	runtime.SetScrollOffset("second-feed", "horizontal", 32)
+	runtime.SetScrollOffset("second-feed", "vertical", 24)
+
+	invalid := []byte("gora: 1\nkind: app\n")
+	invalidDiagnosticCount := 0
+	for cycle := 0; cycle < 100; cycle++ {
+		expected := runtime.Snapshot()
+		expectedTree, err := runtime.RuntimeTree()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, invalid, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		runtime.Reload()
+		got := runtime.Snapshot()
+		if !got.Invalid || got.Screen != expected.Screen || got.CanBack != expected.CanBack || got.CanForward != expected.CanForward {
+			t.Fatalf("cycle %d invalid snapshot lost navigation: got=%+v expected=%+v", cycle, got, expected)
+		}
+		if invalidDiagnosticCount == 0 {
+			invalidDiagnosticCount = len(got.Diagnostics)
+		}
+		if len(got.Diagnostics) == 0 || len(got.Diagnostics) != invalidDiagnosticCount || len(got.StateValues) != len(expected.StateValues) || len(got.Scroll) != len(expected.Scroll) {
+			t.Fatalf("cycle %d invalid reload retained unbounded diagnostics/state: diagnostics=%d state=%d/%d scroll=%d/%d", cycle, len(got.Diagnostics), len(got.StateValues), len(expected.StateValues), len(got.Scroll), len(expected.Scroll))
+		}
+		if !reflect.DeepEqual(got.Scroll, expected.Scroll) || !reflect.DeepEqual(got.StateValues, expected.StateValues) {
+			t.Fatalf("cycle %d invalid snapshot lost state/scroll: got scroll=%v state=%v expected scroll=%v state=%v", cycle, got.Scroll, got.StateValues, expected.Scroll, expected.StateValues)
+		}
+		gotTree, err := runtime.RuntimeTree()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(gotTree, expectedTree) {
+			t.Fatalf("cycle %d invalid reload changed last-good tree", cycle)
+		}
+
+		if err := os.WriteFile(path, valid, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		runtime.Reload()
+		current := runtime.Snapshot()
+		if current.Invalid || current.Screen != "second" {
+			t.Fatalf("cycle %d valid reload did not restore current screen: %+v", cycle, current)
+		}
+		runtime.SetScrollOffset("second-feed", "horizontal", (cycle*7)%120)
+		runtime.SetScrollOffset("second-feed", "vertical", (cycle*5)%100)
+		if err := runtime.Activate(interaction.Activation{Actions: []document.Action{{Action: "back"}}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := runtime.Activate(interaction.Activation{Actions: []document.Action{{Action: "forward"}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	final := []byte(`
+gora: 1
+kind: app
+viewport: { width: 100, height: 80 }
+state:
+  count: { type: number, default: 1 }
+entry: first
+screens:
+  first:
+    type: scroll
+    name: first-feed
+    props: { axis: both }
+    children: [{ type: surface, props: { width: 240, height: 180 } }]
+`)
+	if err := os.WriteFile(path, final, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime.Reload()
+	last := runtime.Snapshot()
+	if last.Invalid || last.Screen != "first" || last.CanBack || len(last.Screens) != 1 || last.Screens[0] != "first" {
+		t.Fatalf("final valid reload did not prune removed history screen: %+v", last)
+	}
+	if _, ok := last.Scroll["second-feed"]; ok {
+		t.Fatalf("removed scroll name survived final valid reload: %v", last.Scroll)
+	}
+	if len(last.Scroll) > 1 {
+		t.Fatalf("unexpected scroll retention after pruning: %v", last.Scroll)
+	}
+}
+
 func TestNamedScrollPersistsAndUnnamedScrollResets(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -1523,6 +2148,71 @@ screens:
 	}
 	if _, ok := scroll["feed"]; ok {
 		t.Fatal("horizontal gesture moved the vertical scroll node")
+	}
+}
+
+func TestRuntimeScrollMutationPublishesNextFrameWithoutClick(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.gora")
+	if err := os.WriteFile(path, []byte(`
+gora: 1
+kind: app
+viewport: { width: 100, height: 80 }
+entry: main
+screens:
+  main:
+    type: scroll
+    name: feed
+    props: { axis: vertical }
+    children: [{ type: spacer, props: { height: 300 } }]
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := runtime.Snapshot()
+	if initial.Root == nil || len(initial.Root.Children) != 1 {
+		t.Fatal("initial frame has no single scroll content child")
+	}
+	contentHandle := initial.Root.Children[0].Handle
+	state := &uiState{zoomValue: 1, zoomInitialized: true, router: interaction.NewRouter()}
+	theme := material.NewTheme()
+	window := new(app.Window)
+	var operations op.Ops
+	gtx := layout.Context{
+		Ops: &operations, Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1},
+		Constraints: layout.Exact(image.Pt(120, 100)), Now: time.Unix(10, 0),
+	}
+	frame := func() {
+		gtx.Reset()
+		gtx.Constraints = layout.Exact(image.Pt(120, 100))
+		gtx.Now = time.Unix(10, 0)
+		layoutStudio(gtx, theme, runtime, state, window)
+	}
+	frame()
+	initialViewport := semanticNodeByHandle(state.runtimeTree, initial.Root.Handle)
+	initialContent := semanticNodeByHandle(state.runtimeTree, contentHandle)
+	if initialViewport == nil || initialViewport.Bounds == nil || initialViewport.Bounds.ImageRectangle() != image.Rect(0, 0, 100, 80) {
+		t.Fatalf("initial Studio scroll viewport = %+v", initialViewport)
+	}
+	if initialContent == nil || initialContent.Bounds == nil || initialContent.Bounds.ImageRectangle() != image.Rect(0, 0, 100, 300) {
+		t.Fatalf("initial Studio content bounds = %+v", initialContent)
+	}
+	beforeRevision, beforeStateRevision := initial.RuntimeRevision, initial.Revision
+	runtime.Scroll(40)
+	updated := runtime.Snapshot()
+	if updated.RuntimeRevision != beforeRevision+1 {
+		t.Fatalf("scroll runtime revision = %d, want %d", updated.RuntimeRevision, beforeRevision+1)
+	}
+	if updated.Revision != beforeStateRevision || updated.Transient != initial.Transient {
+		t.Fatalf("scroll changed unrelated state: revision %d/%d transient %+v/%+v", updated.Revision, beforeStateRevision, updated.Transient, initial.Transient)
+	}
+	frame()
+	updatedContent := semanticNodeByHandle(state.runtimeTree, contentHandle)
+	if updatedContent == nil || updatedContent.Bounds == nil || updatedContent.Bounds.ImageRectangle() != image.Rect(0, -40, 100, 260) {
+		t.Fatalf("next Studio frame content bounds = %+v, want (0,-40)-(100,260)", updatedContent)
 	}
 }
 

@@ -18,12 +18,18 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"gora/internal/semantic"
+	"gora/internal/studio"
 )
 
 type Service struct {
-	registry *Registry
-	server   *mcp.Server
-	handler  http.Handler
+	registry   *Registry
+	server     *mcp.Server
+	handler    http.Handler
+	automation bool
+}
+
+type ServiceOptions struct {
+	Automation bool
 }
 
 type OpenProjectInput struct {
@@ -149,6 +155,23 @@ type CaptureOutput struct {
 	Output    string      `json:"output,omitempty"`
 }
 
+type WaitForViewInput struct {
+	ProjectID            string  `json:"project_id"`
+	ViewID               string  `json:"view_id"`
+	AfterFrameRevision   *uint64 `json:"after_frame_revision,omitempty"`
+	AfterRuntimeRevision *uint64 `json:"after_runtime_revision,omitempty"`
+	Condition            string  `json:"condition,omitempty" jsonschema:"published or idle"`
+	StableFrames         int     `json:"stable_frames,omitempty"`
+	TimeoutMS            int     `json:"timeout_ms,omitempty"`
+}
+
+type WaitForViewOutput struct {
+	ProjectID string                    `json:"project_id"`
+	ViewID    string                    `json:"view_id"`
+	Snapshot  studio.AutomationSnapshot `json:"snapshot"`
+	Resources []string                  `json:"resources"`
+}
+
 type ApplyChangesInput struct {
 	ProjectID string           `json:"project_id"`
 	Changes   []DocumentChange `json:"changes"`
@@ -162,16 +185,36 @@ type ProjectManifest struct {
 }
 
 func NewService(registry *Registry) *Service {
+	return NewServiceWithOptions(registry, ServiceOptions{})
+}
+
+func NewServiceWithOptions(registry *Registry, options ServiceOptions) *Service {
 	if registry == nil {
 		registry = NewRegistry()
 	}
+	var service *Service
 	server := mcp.NewServer(&mcp.Implementation{
 		Name: "gora", Title: "Gora", Version: "1", Description: "Project-oriented Gora design runtime",
 	}, &mcp.ServerOptions{
 		Instructions: "Open a project root, open one or more Gora views, then inspect or control them using their project_id and view_id.",
 		Capabilities: &mcp.ServerCapabilities{},
+		SubscribeHandler: func(ctx context.Context, request *mcp.SubscribeRequest) error {
+			if service == nil {
+				return fmt.Errorf("MCP service is not initialized")
+			}
+			return service.validateSubscription(ctx, request)
+		},
+		UnsubscribeHandler: func(_ context.Context, request *mcp.UnsubscribeRequest) error {
+			if request == nil || request.Params == nil || request.Params.URI == "" {
+				return fmt.Errorf("resource URI is required")
+			}
+			// The SDK owns subscription bookkeeping. Unsubscribe must remain
+			// valid even when a project/view was closed after subscribing so the
+			// SDK can release its session-side stream cleanly.
+			return nil
+		},
 	})
-	service := &Service{registry: registry, server: server}
+	service = &Service{registry: registry, server: server, automation: options.Automation}
 	registry.SetChangeHandler(func(projectID string, viewIDs []string) {
 		if sources, err := registry.KnownSources(projectID); err == nil {
 			for _, source := range sources {
@@ -190,6 +233,10 @@ func NewService(registry *Registry) *Service {
 	service.registerRuntimeTools()
 	service.registerEditingTools()
 	service.registerResources()
+	if options.Automation {
+		service.registerAutomationTools()
+		service.registerAutomationResources()
+	}
 	for _, project := range registry.ListProjects() {
 		service.addProjectResources(project.ID)
 		for _, view := range project.Views {
@@ -206,6 +253,8 @@ func NewService(registry *Registry) *Service {
 	service.handler = mux
 	return service
 }
+
+func (s *Service) AutomationEnabled() bool { return s != nil && s.automation }
 
 func (s *Service) Handler() http.Handler { return s.handler }
 
@@ -328,10 +377,14 @@ func (s *Service) registerRuntimeTools() {
 		if err != nil {
 			return nil, ControlValueOutput{}, err
 		}
+		if _, err := runtime.RuntimeTree(); err != nil {
+			return nil, ControlValueOutput{}, err
+		}
 		view, err := s.registry.ViewSummary(input.ProjectID, input.ViewID)
 		if err != nil {
 			return nil, ControlValueOutput{}, err
 		}
+		s.notifyView(input.ProjectID, input.ViewID)
 		return nil, ControlValueOutput{ProjectID: input.ProjectID, View: view, Value: value}, nil
 	})
 	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_set_field_draft", Description: "Set one visible editable field's draft; valid typed values publish immediately.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input SetFieldDraftInput) (*mcp.CallToolResult, FieldDraftOutput, error) {
@@ -402,9 +455,13 @@ func (s *Service) registerRuntimeTools() {
 		if err != nil {
 			return nil, CaptureOutput{}, err
 		}
+		before := runtime.AutomationSnapshot()
 		data, warning, err := runtime.CapturePNG(input.Scale)
 		if err != nil {
 			return nil, CaptureOutput{}, err
+		}
+		if after := runtime.AutomationSnapshot(); after.FrameRevision != before.FrameRevision {
+			s.notifyView(input.ProjectID, input.ViewID)
 		}
 		output := ""
 		if input.Output != "" {
@@ -426,6 +483,69 @@ func (s *Service) registerRuntimeTools() {
 		}
 		result := CaptureOutput{ProjectID: input.ProjectID, View: view, Width: view.Viewport.Width * input.Scale, Height: view.Viewport.Height * input.Scale, Warning: warning, Output: output}
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.ImageContent{Data: data, MIMEType: "image/png"}}}, result, nil
+	})
+}
+
+func (s *Service) registerAutomationTools() {
+	readOnly := &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true, OpenWorldHint: boolPointer(false)}
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_wait_for_view", Description: "Wait for a deterministic published or idle view frame and return its automation snapshot.", Annotations: readOnly}, func(ctx context.Context, _ *mcp.CallToolRequest, input WaitForViewInput) (*mcp.CallToolResult, WaitForViewOutput, error) {
+		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
+		if err != nil {
+			return nil, WaitForViewOutput{}, err
+		}
+		request := studio.WaitForViewRequest{Condition: input.Condition, StableFrames: input.StableFrames}
+		if input.AfterFrameRevision != nil {
+			request.AfterFrameRevision = *input.AfterFrameRevision
+			request.AfterFrameSet = true
+			request.AllowAlreadySatisfied = true
+		}
+		if input.AfterRuntimeRevision != nil {
+			request.AfterRuntimeRevision = *input.AfterRuntimeRevision
+			request.AfterRuntimeSet = true
+			request.AllowAlreadySatisfied = true
+		}
+		if input.TimeoutMS == 0 {
+			request.Timeout = 5 * time.Second
+		} else if input.TimeoutMS < 1 || input.TimeoutMS > 60000 {
+			return nil, WaitForViewOutput{}, fmt.Errorf("timeout_ms must be between 1 and 60000")
+		} else {
+			request.Timeout = time.Duration(input.TimeoutMS) * time.Millisecond
+		}
+		snapshot, waitErr := runtime.WaitForView(ctx, request)
+		output := WaitForViewOutput{
+			ProjectID: input.ProjectID,
+			ViewID:    input.ViewID,
+			Snapshot:  snapshot,
+			Resources: []string{
+				"gora://project/" + input.ProjectID + "/views/" + input.ViewID + "/tree",
+				"gora://project/" + input.ProjectID + "/views/" + input.ViewID + "/automation",
+			},
+		}
+		if waitErr == nil {
+			return nil, output, nil
+		}
+		var timeout *studio.WaitTimeoutError
+		if errors.As(waitErr, &timeout) {
+			return &mcp.CallToolResult{IsError: true, StructuredContent: output, Content: []mcp.Content{&mcp.TextContent{Text: waitErr.Error()}}}, output, nil
+		}
+		return nil, output, waitErr
+	})
+}
+
+func (s *Service) registerAutomationResources() {
+	s.server.AddResourceTemplate(&mcp.ResourceTemplate{
+		URITemplate: "gora://project/{project_id}/views/{view_id}/automation",
+		Name:        "gora-view-automation", MIMEType: "application/json",
+	}, func(_ context.Context, request *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+		projectID, viewID, ok := parseAutomationURI(request.Params.URI)
+		if !ok {
+			return nil, mcp.ResourceNotFoundError(request.Params.URI)
+		}
+		runtime, err := s.registry.Runtime(projectID, viewID)
+		if err != nil {
+			return nil, mcp.ResourceNotFoundError(request.Params.URI)
+		}
+		return jsonResource(request.Params.URI, runtime.AutomationSnapshot())
 	})
 }
 
@@ -455,6 +575,13 @@ func (s *Service) registerEditingTools() {
 }
 
 func (s *Service) runtimeMutation(projectID, viewID string) (*mcp.CallToolResult, RuntimeMutationOutput, error) {
+	runtime, err := s.registry.Runtime(projectID, viewID)
+	if err != nil {
+		return nil, RuntimeMutationOutput{}, err
+	}
+	if _, err := runtime.RuntimeTree(); err != nil {
+		return nil, RuntimeMutationOutput{}, err
+	}
 	view, err := s.registry.ViewSummary(projectID, viewID)
 	if err == nil {
 		s.notifyView(projectID, viewID)
@@ -491,6 +618,90 @@ func (s *Service) registerResources() {
 		}
 		return nil, mcp.ResourceNotFoundError(request.Params.URI)
 	})
+}
+
+// validateSubscription applies the same project/view containment and runtime
+// availability rules used by resource reads before the SDK records a
+// subscription. The SDK owns the per-session subscription set; this method
+// only validates the requested resource URI.
+func (s *Service) validateSubscription(_ context.Context, request *mcp.SubscribeRequest) error {
+	if request == nil || request.Params == nil || request.Params.URI == "" {
+		return fmt.Errorf("resource URI is required")
+	}
+	uri := request.Params.URI
+	if uri == "gora://projects" {
+		return nil
+	}
+	if projectID, viewID, ok := parseAutomationURI(uri); ok {
+		if !s.automation {
+			return fmt.Errorf("automation resources are disabled")
+		}
+		view, err := s.registry.ViewSummary(projectID, viewID)
+		if err != nil {
+			return fmt.Errorf("unknown project or view: %w", err)
+		}
+		if !view.RuntimeAvailable {
+			return fmt.Errorf("automation is unavailable for token views")
+		}
+		return nil
+	}
+	if projectID, viewID, semanticID, ok := parseNodeURI(uri); ok {
+		runtime, err := s.registry.Runtime(projectID, viewID)
+		if err != nil {
+			return fmt.Errorf("unknown project or runtime view: %w", err)
+		}
+		tree, err := runtime.RuntimeTree()
+		if err != nil {
+			return err
+		}
+		for _, node := range semantic.Flatten(tree) {
+			if node.ID == semanticID {
+				return nil
+			}
+		}
+		return fmt.Errorf("unknown runtime node %q", semanticID)
+	}
+	const prefix = "gora://project/"
+	if !strings.HasPrefix(uri, prefix) {
+		return fmt.Errorf("unknown resource URI %q", uri)
+	}
+	parts := strings.Split(strings.TrimPrefix(uri, prefix), "/")
+	if len(parts) < 2 || parts[0] == "" {
+		return fmt.Errorf("malformed project resource URI %q", uri)
+	}
+	projectID := parts[0]
+	if len(parts) == 2 && (parts[1] == "manifest" || parts[1] == "diagnostics") {
+		if _, err := s.registry.ProjectRoot(projectID); err != nil {
+			return fmt.Errorf("unknown project: %w", err)
+		}
+		return nil
+	}
+	if len(parts) == 3 && (parts[1] == "sources" || parts[1] == "documents") && parts[2] != "" {
+		if _, err := s.registry.DocumentResource(projectID, parts[2]); err != nil {
+			return fmt.Errorf("unknown project source: %w", err)
+		}
+		return nil
+	}
+	if len(parts) >= 3 && parts[1] == "views" && parts[2] != "" {
+		viewID := parts[2]
+		view, err := s.registry.ViewSummary(projectID, viewID)
+		if err != nil {
+			return fmt.Errorf("unknown project or view: %w", err)
+		}
+		if len(parts) == 3 {
+			return nil
+		}
+		if len(parts) == 4 && parts[3] == "tree" {
+			if !view.RuntimeAvailable {
+				return fmt.Errorf("runtime tree is unavailable for token views")
+			}
+			if _, err := s.registry.Runtime(projectID, viewID); err != nil {
+				return err
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("unknown resource URI %q", uri)
 }
 
 func (s *Service) addProjectResources(projectID string) {
@@ -533,6 +744,16 @@ func (s *Service) addViewResources(projectID, viewID string) {
 	view, err := s.registry.ViewSummary(projectID, viewID)
 	if err != nil || !view.RuntimeAvailable {
 		return
+	}
+	if s.automation {
+		automationURI := viewURI + "/automation"
+		s.server.AddResource(&mcp.Resource{URI: automationURI, Name: "gora-view-automation", MIMEType: "application/json"}, func(_ context.Context, request *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+			runtime, err := s.registry.Runtime(projectID, viewID)
+			if err != nil {
+				return nil, mcp.ResourceNotFoundError(request.Params.URI)
+			}
+			return jsonResource(request.Params.URI, runtime.AutomationSnapshot())
+		})
 	}
 	s.server.AddResource(&mcp.Resource{URI: treeURI, Name: "gora-runtime-tree", MIMEType: "application/json"}, func(_ context.Context, request *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
 		runtime, err := s.registry.Runtime(projectID, viewID)
@@ -579,6 +800,9 @@ func (s *Service) notifyView(projectID, viewID string) {
 	base := "gora://project/" + projectID + "/views/" + viewID
 	_ = s.server.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: base})
 	_ = s.server.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: base + "/tree"})
+	if s.automation {
+		_ = s.server.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: base + "/automation"})
+	}
 }
 
 func (s *Service) removeProjectResources(projectID string, views []ViewSummary, sources []SourceSummary) {
@@ -587,6 +811,9 @@ func (s *Service) removeProjectResources(projectID string, views []ViewSummary, 
 	for _, view := range views {
 		viewBase := base + "/views/" + view.ID
 		uris = append(uris, viewBase, viewBase+"/tree")
+		if s.automation {
+			uris = append(uris, viewBase+"/automation")
+		}
 	}
 	for _, source := range sources {
 		uris = append(uris, base+"/sources/"+source.SourceID, base+"/documents/"+source.SourceID)
@@ -622,6 +849,19 @@ func parseNodeURI(uri string) (string, string, string, bool) {
 		return "", "", "", false
 	}
 	return projectAndRest[0], viewAndNode[0], semanticID, true
+}
+
+func parseAutomationURI(uri string) (string, string, bool) {
+	const prefix = "gora://project/"
+	if !strings.HasPrefix(uri, prefix) || !strings.HasSuffix(uri, "/automation") {
+		return "", "", false
+	}
+	rest := strings.TrimSuffix(strings.TrimPrefix(uri, prefix), "/automation")
+	parts := strings.SplitN(rest, "/views/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || strings.Contains(parts[1], "/") {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
 }
 
 func containedCapturePath(root, output string) (string, error) {
@@ -666,11 +906,15 @@ func writeNewFile(path string, data []byte) error {
 }
 
 func Run(ctx context.Context, listen string, stderr io.Writer) error {
+	return RunWithOptions(ctx, listen, stderr, ServiceOptions{})
+}
+
+func RunWithOptions(ctx context.Context, listen string, stderr io.Writer, options ServiceOptions) error {
 	listener, err := net.Listen("tcp", listen)
 	if err != nil {
 		return err
 	}
-	service := NewService(nil)
+	service := NewServiceWithOptions(nil, options)
 	defer service.Close()
 	httpServer := &http.Server{Handler: service.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	serveDone := make(chan error, 1)

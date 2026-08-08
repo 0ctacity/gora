@@ -59,6 +59,20 @@ func TestMCPCommandUsesDefaultAndCustomLoopbackListener(t *testing.T) {
 	}
 }
 
+func TestMCPCommandAutomationFeatureGate(t *testing.T) {
+	var launched LaunchConfig
+	var stdout, stderr bytes.Buffer
+	if exit := Run([]string{"mcp", "--automation"}, &stdout, &stderr, func(config LaunchConfig) error {
+		launched = config
+		return nil
+	}); exit != 0 {
+		t.Fatalf("automation exit=%d stderr=%s", exit, stderr.String())
+	}
+	if launched.Mode != LaunchMCP || !launched.Automation {
+		t.Fatalf("automation launch config = %+v", launched)
+	}
+}
+
 func TestMCPCommandRejectsNonLoopbackListener(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	exit := Run([]string{"mcp", "--listen", "0.0.0.0:8787"}, &stdout, &stderr, func(LaunchConfig) error {

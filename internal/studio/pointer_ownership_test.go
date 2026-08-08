@@ -8,10 +8,12 @@ import (
 
 	"gioui.org/app"
 	"gioui.org/f32"
+	"gioui.org/io/event"
 	"gioui.org/io/input"
 	"gioui.org/io/pointer"
 	"gioui.org/layout"
 	"gioui.org/op"
+	"gioui.org/op/clip"
 	"gioui.org/unit"
 	"gioui.org/widget/material"
 
@@ -100,5 +102,63 @@ func TestStudioCanvasDeliversRepeatedDocumentClicksAfterStateRebuild(t *testing.
 	}
 	if got := runtime.Snapshot().StateValues["screen:main"]["plan"]; got != "monthly" {
 		t.Fatalf("inspect click activated plan button: %#v", got)
+	}
+}
+
+func TestStudioScrollbarTrackOwnsPointerOverUnderlyingField(t *testing.T) {
+	maximum := 100.0
+	axis := &semantic.Node{ID: "scrollbar", Handle: "scrollbar", Type: "scrollbar", Role: "scrollbar", Orientation: "vertical", Visible: true, Enabled: true,
+		Bounds: &semantic.Rect{X: 90, Y: 2, Width: 8, Height: 96}, Clip: &semantic.Rect{X: 0, Y: 0, Width: 100, Height: 100}, Max: &maximum,
+		ViewportSize: &semantic.Rect{Height: 100}, ContentSize: &semantic.Rect{Height: 300}, FocusOrder: 0, PaintOrder: 10}
+	axis.Children = []*semantic.Node{
+		{ID: "scrollbar/track", Handle: "scrollbar/track", Type: "scrollbar_track", Group: axis.Handle, Visible: true, Enabled: true,
+			Bounds: &semantic.Rect{X: 90, Y: 2, Width: 8, Height: 96}, Clip: &semantic.Rect{X: 0, Y: 0, Width: 100, Height: 100}, FocusOrder: -1, PaintOrder: 11},
+		{ID: "scrollbar/thumb", Handle: "scrollbar/thumb", Type: "scrollbar_thumb", Group: axis.Handle, Visible: true, Enabled: true,
+			Bounds: &semantic.Rect{X: 90, Y: 2, Width: 8, Height: 30}, Clip: &semantic.Rect{X: 0, Y: 0, Width: 100, Height: 100}, FocusOrder: -1, PaintOrder: 12},
+	}
+	field := &semantic.Node{ID: "field", Handle: "field", Role: "textbox", Visible: true, Enabled: true,
+		Bounds: &semantic.Rect{X: 0, Y: 0, Width: 100, Height: 100}, Clip: &semantic.Rect{X: 0, Y: 0, Width: 100, Height: 100}, FocusOrder: 1, PaintOrder: 1}
+	root := &semantic.Node{Type: "_viewport", Visible: true, Enabled: true, Bounds: &semantic.Rect{X: 0, Y: 0, Width: 100, Height: 100}, Clip: &semantic.Rect{X: 0, Y: 0, Width: 100, Height: 100}, Children: []*semantic.Node{field, axis}}
+	state := &uiState{router: interaction.NewRouter(), runtimeTree: root, zoomValue: 1, zoomInitialized: true, canvasViewport: image.Pt(100, 100), canvasSize: image.Pt(100, 100)}
+	state.router.Update(root)
+	runtime := &Runtime{}
+	var inputOps op.Ops
+	inputClip := clip.Rect{Max: image.Pt(100, 100)}.Push(&inputOps)
+	event.Op(&inputOps, &state.interactionInput)
+	inputClip.Pop()
+	var inputRouter input.Router
+	_, _ = inputRouter.Event(pointer.Filter{Target: &state.interactionInput, Kinds: pointer.Press | pointer.Release | pointer.Move | pointer.Drag | pointer.Cancel})
+	inputRouter.Frame(&inputOps)
+	window := new(app.Window)
+	frame := func() {
+		var frameOps op.Ops
+		gtx := layout.Context{Ops: &frameOps, Source: inputRouter.Source(), Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}, Constraints: layout.Exact(image.Pt(100, 100))}
+		handleDocumentInteraction(gtx, runtime, state, window)
+		inputRouter.Frame(gtx.Ops)
+	}
+	inputRouter.Queue(pointer.Event{Source: pointer.Mouse, PointerID: 1, Kind: pointer.Press, Buttons: pointer.ButtonPrimary, Position: f32.Pt(94, 50)})
+	frame()
+	if !state.router.ScrollbarPointerOwned() || state.fieldSelectionID != "" {
+		t.Fatalf("track ownership leaked to field: owned=%v selection=%q", state.router.ScrollbarPointerOwned(), state.fieldSelectionID)
+	}
+	inputRouter.Queue(pointer.Event{Source: pointer.Mouse, PointerID: 2, Kind: pointer.Press, Buttons: pointer.ButtonPrimary, Position: f32.Pt(94, 50)})
+	frame()
+	if state.fieldSelectionID != "" {
+		t.Fatalf("second pointer began field selection: %q", state.fieldSelectionID)
+	}
+	inputRouter.Queue(pointer.Event{Source: pointer.Mouse, PointerID: 1, Kind: pointer.Release, Position: f32.Pt(94, 50)})
+	frame()
+	if state.router.ScrollbarPointerOwned() || state.fieldSelectionID != "" {
+		t.Fatalf("track release left ownership/selection: owned=%v selection=%q", state.router.ScrollbarPointerOwned(), state.fieldSelectionID)
+	}
+	state.inspecting = true
+	state.router.SetInspecting(true)
+	before := runtime.Snapshot()
+	inputRouter.Queue(pointer.Event{Source: pointer.Mouse, PointerID: 4, Kind: pointer.Press, Buttons: pointer.ButtonPrimary, Position: f32.Pt(94, 50)})
+	frame()
+	inputRouter.Queue(pointer.Event{Source: pointer.Mouse, PointerID: 4, Kind: pointer.Release, Position: f32.Pt(94, 50)})
+	frame()
+	if got := runtime.Snapshot(); got.RuntimeRevision != before.RuntimeRevision || got.Scroll["scrollbar"] != before.Scroll["scrollbar"] {
+		t.Fatalf("Inspect scrollbar click mutated runtime: before=%+v after=%+v", before, got)
 	}
 }

@@ -1311,7 +1311,7 @@ func validateNodeFields(node *Node, diagnostics *[]Diagnostic) {
 		"stack":             {"direction", "padding", "gap", "row_gap", "column_gap", "wrap", "alignment", "distribution"},
 		"grid":              {"columns", "rows", "gap", "column_gap", "row_gap"},
 		"overlay":           {"alignment"},
-		"scroll":            {"axis", "scrollbar"},
+		"scroll":            {"axis", "scrollbar", "scrollbar_x", "scrollbar_y", "scroll_chain"},
 		"surface":           {"padding", "background", "border", "radius", "shadow", "clip"},
 		"form":              {},
 		"text_field":        {"label", "bind", "disabled", "read_only", "required", "min_length", "max_length", "pattern", "placeholder", "gap"},
@@ -1351,13 +1351,13 @@ func validateNodeFields(node *Node, diagnostics *[]Diagnostic) {
 	for key := range node.Props {
 		if !contains(allowed, key) {
 			d := nodeDiagnostic(node, "schema.prop", fmt.Sprintf("unknown %s prop %q", node.Type, key))
-			d.Suggestions = nearest(key, allowed)
+			d.Suggestions = propFieldSuggestions(node.Type, key, allowed)
 			*diagnostics = append(*diagnostics, d)
 		}
 	}
 	validateReferenceObjects(node, node.Props, diagnostics)
 	validateReferenceObjects(node, node.Place, diagnostics)
-	placeFields := []string{"x", "y", "offset_x", "offset_y", "alignment", "basis", "grow", "shrink", "row", "column", "row_span", "column_span"}
+	placeFields := []string{"x", "y", "offset_x", "offset_y", "alignment", "basis", "grow", "shrink", "row", "column", "row_span", "column_span", "position", "inset", "z_index"}
 	for key := range node.Place {
 		if !contains(placeFields, key) {
 			d := nodeDiagnostic(node, "schema.place", fmt.Sprintf("unknown placement field %q", key))
@@ -1371,7 +1371,7 @@ func validateNodeFields(node *Node, diagnostics *[]Diagnostic) {
 		for key := range responsive.Props {
 			if !contains(allowed, key) {
 				d := nodeDiagnostic(node, "schema.prop", fmt.Sprintf("unknown responsive %s prop %q", node.Type, key))
-				d.Suggestions = nearest(key, allowed)
+				d.Suggestions = propFieldSuggestions(node.Type, key, allowed)
 				*diagnostics = append(*diagnostics, d)
 			}
 		}
@@ -1387,6 +1387,13 @@ func validateNodeFields(node *Node, diagnostics *[]Diagnostic) {
 		responsiveNode.Place = responsive.Place
 		responsiveNode.Responsive = nil
 		validatePrimitiveValues(&responsiveNode, diagnostics)
+		effectiveNode := *node
+		effectiveNode.Props = mergeValidationMaps(node.Props, responsive.Props)
+		effectiveNode.Place = mergeValidationMaps(node.Place, responsive.Place)
+		effectiveNode.Responsive = nil
+		effectiveNode.Variants = nil
+		validateScrollPolicyCrossFields(&effectiveNode, diagnostics)
+		validatePositionZIndexPosition(&effectiveNode, diagnostics)
 	}
 	for _, variant := range node.Variants {
 		validateReferenceObjects(node, variant.Props, diagnostics)
@@ -1395,7 +1402,7 @@ func validateNodeFields(node *Node, diagnostics *[]Diagnostic) {
 		for key := range variant.Props {
 			if !contains(allowed, key) {
 				d := nodeDiagnostic(node, "schema.prop", fmt.Sprintf("unknown variant %s prop %q", node.Type, key))
-				d.Suggestions = nearest(key, allowed)
+				d.Suggestions = propFieldSuggestions(node.Type, key, allowed)
 				*diagnostics = append(*diagnostics, d)
 			}
 		}
@@ -1412,6 +1419,13 @@ func validateNodeFields(node *Node, diagnostics *[]Diagnostic) {
 		variantNode.Responsive = nil
 		variantNode.Variants = nil
 		validatePrimitiveValues(&variantNode, diagnostics)
+		effectiveNode := *node
+		effectiveNode.Props = mergeValidationMaps(node.Props, variant.Props)
+		effectiveNode.Place = mergeValidationMaps(node.Place, variant.Place)
+		effectiveNode.Responsive = nil
+		effectiveNode.Variants = nil
+		validateScrollPolicyCrossFields(&effectiveNode, diagnostics)
+		validatePositionZIndexPosition(&effectiveNode, diagnostics)
 	}
 	for _, action := range node.On.Activate {
 		validateReferenceObjects(node, action.Value, diagnostics)
@@ -1422,6 +1436,8 @@ func validateNodeFields(node *Node, diagnostics *[]Diagnostic) {
 		validateReferenceObjects(node, action.By, diagnostics)
 	}
 	validatePrimitiveValues(node, diagnostics)
+	validateScrollPolicyCrossFields(node, diagnostics)
+	validatePositionZIndexPosition(node, diagnostics)
 }
 
 func validatePrimitiveValues(node *Node, diagnostics *[]Diagnostic) {
@@ -1451,7 +1467,8 @@ func validatePrimitiveValues(node *Node, diagnostics *[]Diagnostic) {
 			}
 		}
 	case "scroll":
-		enum("axis", []string{"horizontal", "vertical"})
+		enum("axis", []string{"horizontal", "vertical", "both"})
+		validateScrollProperties(node, diagnostics)
 	case "image":
 		enum("fit", []string{"contain", "cover", "fill"})
 	case "divider":
@@ -1546,6 +1563,7 @@ func validatePrimitiveValues(node *Node, diagnostics *[]Diagnostic) {
 	if value, exists := node.Place["basis"]; exists && !isReferenceValue(value) && !validBasisValue(value) {
 		*diagnostics = append(*diagnostics, nodeDiagnostic(node, "schema.prop_value", "place.basis must be auto, a non-negative number, or a percentage"))
 	}
+	validatePositionPlace(node, diagnostics)
 	validateMinMax(node, "width", diagnostics)
 	validateMinMax(node, "height", diagnostics)
 }
@@ -1573,6 +1591,239 @@ func validDimensionValue(value any, allowSizingKeywords bool) bool {
 	}
 	number, ok := finiteNumber(percent)
 	return ok && number >= 0
+}
+
+func validateScrollProperties(node *Node, diagnostics *[]Diagnostic) {
+	if node == nil || node.Type != "scroll" {
+		return
+	}
+	props := node.Props
+	if raw, legacy := props["scrollbar"]; legacy {
+		if !isReferenceValue(raw) {
+			if _, ok := raw.(bool); !ok {
+				*diagnostics = append(*diagnostics, nodeDiagnostic(node, "schema.prop_value", "scroll.scrollbar must be true or false"))
+			}
+		}
+	}
+
+	if raw, exists := props["axis"]; exists {
+		if !isReferenceValue(raw) {
+			if _, ok := raw.(string); !ok {
+				*diagnostics = append(*diagnostics, nodeDiagnostic(node, "schema.prop_value", "scroll.axis must be horizontal, vertical, or both"))
+			}
+		}
+	}
+	validatePolicy := func(key string) {
+		raw, exists := props[key]
+		if !exists || isReferenceValue(raw) {
+			return
+		}
+		text, ok := raw.(string)
+		if !ok || !contains([]string{"auto", "always", "hidden"}, text) {
+			d := nodeDiagnostic(node, "schema.prop_value", fmt.Sprintf("scroll.%s must be auto, always, or hidden", key))
+			d.Suggestions = nearest(text, []string{"auto", "always", "hidden"})
+			*diagnostics = append(*diagnostics, d)
+		}
+	}
+	validatePolicy("scrollbar_x")
+	validatePolicy("scrollbar_y")
+	if raw, exists := props["scroll_chain"]; exists && !isReferenceValue(raw) {
+		text, ok := raw.(string)
+		if !ok || !contains([]string{"auto", "contain"}, text) {
+			d := nodeDiagnostic(node, "schema.prop_value", "scroll.scroll_chain must be auto or contain")
+			d.Suggestions = nearest(text, []string{"auto", "contain"})
+			*diagnostics = append(*diagnostics, d)
+		}
+	}
+}
+
+func validateScrollPolicyCrossFields(node *Node, diagnostics *[]Diagnostic) {
+	if node == nil || node.Type != "scroll" {
+		return
+	}
+	props := node.Props
+	if _, legacy := props["scrollbar"]; legacy {
+		if _, hasX := props["scrollbar_x"]; hasX {
+			*diagnostics = append(*diagnostics, nodeDiagnostic(node, "schema.scrollbar_policy", "scrollbar cannot be combined with scrollbar_x or scrollbar_y"))
+		}
+		if _, hasX := props["scrollbar_x"]; !hasX {
+			if _, hasY := props["scrollbar_y"]; hasY {
+				*diagnostics = append(*diagnostics, nodeDiagnostic(node, "schema.scrollbar_policy", "scrollbar cannot be combined with scrollbar_x or scrollbar_y"))
+			}
+		}
+	}
+	axis := "vertical"
+	axisKnown := true
+	if raw, exists := props["axis"]; exists {
+		if isReferenceValue(raw) {
+			axisKnown = false
+		} else if text, ok := raw.(string); ok {
+			axis = text
+		} else {
+			axisKnown = false
+		}
+	}
+	if axisKnown && axis != "horizontal" && axis != "vertical" && axis != "both" {
+		axisKnown = false
+	}
+	if !axisKnown {
+		return
+	}
+	policy := func(key string) (string, bool) {
+		raw, exists := props[key]
+		if !exists {
+			return "hidden", true
+		}
+		if isReferenceValue(raw) {
+			return "", false
+		}
+		text, ok := raw.(string)
+		return text, ok
+	}
+	x, xOK := policy("scrollbar_x")
+	y, yOK := policy("scrollbar_y")
+	if axis == "horizontal" && yOK && y != "hidden" {
+		*diagnostics = append(*diagnostics, nodeDiagnostic(node, "schema.scrollbar_policy", "scrollbar_y must be hidden when scroll axis is horizontal"))
+	}
+	if axis == "vertical" && xOK && x != "hidden" {
+		*diagnostics = append(*diagnostics, nodeDiagnostic(node, "schema.scrollbar_policy", "scrollbar_x must be hidden when scroll axis is vertical"))
+	}
+}
+
+func mergeValidationMaps(base, override map[string]any) map[string]any {
+	out := make(map[string]any, len(base)+len(override))
+	for key, value := range base {
+		out[key] = value
+	}
+	for key, value := range override {
+		out[key] = value
+	}
+	return out
+}
+
+func propFieldSuggestions(nodeType, key string, allowed []string) []string {
+	suggestions := nearest(key, allowed)
+	if nodeType != "scroll" || !strings.HasPrefix(key, "scrollbar") {
+		return suggestions
+	}
+	for _, candidate := range []string{"scrollbar_x", "scrollbar_y"} {
+		if editDistance(key, candidate) > 2 || contains(suggestions, candidate) {
+			continue
+		}
+		suggestions = append(suggestions, candidate)
+	}
+	return suggestions
+}
+
+func validatePositionPlace(node *Node, diagnostics *[]Diagnostic) {
+	if node == nil {
+		return
+	}
+	if raw, exists := node.Place["position"]; exists {
+		if isReferenceValue(raw) {
+		} else {
+			text, ok := raw.(string)
+			if !ok || !contains([]string{"flow", "sticky", "fixed"}, text) {
+				d := nodeDiagnostic(node, "schema.prop_value", "place.position must be flow, sticky, or fixed")
+				d.Suggestions = nearest(text, []string{"flow", "sticky", "fixed"})
+				*diagnostics = append(*diagnostics, d)
+			}
+		}
+	}
+	if raw, exists := node.Place["inset"]; exists {
+		validatePositionInset(node, raw, diagnostics)
+	}
+	if raw, exists := node.Place["z_index"]; exists {
+		if !isReferenceValue(raw) && !validIntegerValue(raw) {
+			*diagnostics = append(*diagnostics, nodeDiagnostic(node, "schema.z_index", "place.z_index must be a signed integer"))
+		}
+	}
+}
+
+func validatePositionZIndexPosition(node *Node, diagnostics *[]Diagnostic) {
+	if node == nil {
+		return
+	}
+	position := "flow"
+	positionKnown := true
+	if raw, exists := node.Place["position"]; exists {
+		if isReferenceValue(raw) {
+			positionKnown = false
+		} else if text, ok := raw.(string); ok {
+			position = text
+		}
+	}
+	if positionKnown && position == "flow" {
+		if raw, exists := node.Place["z_index"]; exists && !isReferenceValue(raw) {
+			*diagnostics = append(*diagnostics, nodeDiagnostic(node, "schema.z_index", "place.z_index is valid only for sticky or fixed positioning"))
+		}
+	}
+}
+
+func validatePositionInset(node *Node, raw any, diagnostics *[]Diagnostic) {
+	if isReferenceValue(raw) {
+		return
+	}
+	edges, ok := raw.(map[string]any)
+	if !ok {
+		*diagnostics = append(*diagnostics, nodeDiagnostic(node, "schema.position_inset", "place.inset must name top, right, bottom, and left"))
+		return
+	}
+	expected := []string{"top", "right", "bottom", "left"}
+	valid := true
+	for _, edge := range expected {
+		if _, exists := edges[edge]; !exists {
+			valid = false
+		}
+	}
+	for edge := range edges {
+		if !contains(expected, edge) {
+			valid = false
+		}
+	}
+	if !valid {
+		*diagnostics = append(*diagnostics, nodeDiagnostic(node, "schema.position_inset", "place.inset must contain exactly top, right, bottom, and left"))
+	}
+	for edge, value := range edges {
+		if !contains(expected, edge) || validPositionInsetValue(value) {
+			continue
+		}
+		*diagnostics = append(*diagnostics, nodeDiagnostic(node, "schema.position_inset", fmt.Sprintf("place.inset edge %q must be null, a finite number, or a percentage", edge)))
+	}
+}
+
+func validPositionInsetValue(value any) bool {
+	if value == nil || isReferenceValue(value) {
+		return true
+	}
+	if _, ok := finiteNumber(value); ok {
+		return true
+	}
+	mapping, ok := value.(map[string]any)
+	if !ok || len(mapping) != 1 {
+		return false
+	}
+	percent, exists := mapping["percent"]
+	if !exists || isReferenceValue(percent) {
+		return exists && isReferenceValue(percent)
+	}
+	_, ok = finiteNumber(percent)
+	return ok
+}
+
+func validIntegerValue(value any) bool {
+	switch value := value.(type) {
+	case int64:
+		return true
+	case float64:
+		return validSignedIntegerFloat(value)
+	default:
+		return false
+	}
+}
+
+func validSignedIntegerFloat(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0) && math.Trunc(value) == value && value >= -9223372036854775808.0 && value < 9223372036854775808.0
 }
 
 func validBasisValue(value any) bool {

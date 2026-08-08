@@ -22,29 +22,88 @@ type ControlValueChange struct {
 	Value any
 }
 
+// ScrollChange is a normalized logical scrollbar operation. Only the axis
+// matching the derived scrollbar is populated for axis-scoped changes.
+type ScrollChange struct {
+	ID   string `json:"id"`
+	Mode string `json:"mode"`
+	X    int    `json:"x,omitempty"`
+	Y    int    `json:"y,omitempty"`
+}
+
+type scrollbarCapture struct {
+	axis       *semantic.Node
+	track      image.Rectangle
+	thumb      image.Rectangle
+	grabOffset int
+	drag       bool
+}
+
+type PointerCaptureSnapshot struct {
+	OwnerID   string      `json:"owner_id"`
+	PointerID int         `json:"pointer_id"`
+	Source    string      `json:"source,omitempty"`
+	Buttons   int         `json:"buttons,omitempty"`
+	Point     image.Point `json:"point"`
+}
+
+type KeyboardPressSnapshot struct {
+	OwnerID string `json:"owner_id"`
+	Key     string `json:"key"`
+}
+
+type RouterQueueSizes struct {
+	ValueChanges  int `json:"value_changes"`
+	ScrollChanges int `json:"scroll_changes"`
+}
+
+// RouterSnapshot is an immutable, public view of transient interaction
+// metadata. It intentionally contains no handles or pointers and never drains
+// pending queues.
+type RouterSnapshot struct {
+	FocusedID             string                  `json:"focused_id,omitempty"`
+	HoveredIDs            []string                `json:"hovered_ids"`
+	PressedIDs            []string                `json:"pressed_ids"`
+	ActiveIDs             []string                `json:"active_ids"`
+	OpenSelectID          string                  `json:"open_select_id,omitempty"`
+	DisabledIDs           []string                `json:"disabled_ids"`
+	PointerCapture        *PointerCaptureSnapshot `json:"pointer_capture,omitempty"`
+	KeyboardPress         *KeyboardPressSnapshot  `json:"keyboard_press,omitempty"`
+	ScrollbarGestureOwner string                  `json:"scrollbar_gesture_owner,omitempty"`
+	SliderGestureOwner    string                  `json:"slider_gesture_owner,omitempty"`
+	QueueSizes            RouterQueueSizes        `json:"queue_sizes"`
+	Inspecting            bool                    `json:"inspecting,omitempty"`
+}
+
 // Router applies deterministic hit testing, pointer capture, focus, and keyboard activation.
 type Router struct {
-	regions       []*semantic.Node
-	transient     Transient
-	captureID     int
-	captureHandle string
-	keyboardPress string
-	valueChange   *ControlValueChange
-	inspecting    bool
+	tree            *semantic.Node
+	regions         []*semantic.Node
+	transient       Transient
+	captureID       int
+	captureHandle   string
+	keyboardPress   string
+	keyboardKey     string
+	valueChange     *ControlValueChange
+	scrollChange    *ScrollChange
+	scrollCapture   *scrollbarCapture
+	pointerSource   string
+	pointerButtons  int
+	pointerPoint    image.Point
+	pointerPointSet bool
+	inspecting      bool
 }
 
 func NewRouter() *Router { return &Router{captureID: -1} }
 
 func (r *Router) Update(tree *semantic.Node) {
+	r.tree = tree
 	r.regions = r.regions[:0]
 	for _, node := range semantic.Flatten(tree) {
-		if interactiveRole(node.Role) {
+		if interactiveRole(node.Role) || scrollbarPart(node) {
 			r.regions = append(r.regions, node)
 		}
 	}
-	sort.SliceStable(r.regions, func(i, j int) bool {
-		return r.regions[i].PaintOrder < r.regions[j].PaintOrder
-	})
 	if r.transient.Focused != "" && r.enabledRegion(r.transient.Focused) == nil {
 		r.transient.Focused = ""
 	}
@@ -52,7 +111,17 @@ func (r *Router) Update(tree *semantic.Node) {
 		r.transient.Hovered = ""
 	}
 	if r.transient.Pressed != "" && r.enabledRegion(r.transient.Pressed) == nil {
+		hadScrollbarCapture := r.scrollCapture != nil
 		r.cancelPress()
+		if hadScrollbarCapture {
+			r.scrollChange = nil
+		}
+	}
+	if r.scrollCapture != nil && (r.scrollCapture.axis == nil || r.enabledRegion(r.scrollCapture.axis.Handle) == nil) {
+		r.cancelPress()
+		// A queued drag belongs to the old frame/tree and must not be applied
+		// after a reload, selection change, or visibility update.
+		r.scrollChange = nil
 	}
 }
 
@@ -60,14 +129,34 @@ func (r *Router) SetInspecting(enabled bool) {
 	r.inspecting = enabled
 	if enabled {
 		r.transient = Transient{}
-		r.captureID = -1
-		r.captureHandle = ""
-		r.keyboardPress = ""
+		r.cancelPress()
 	}
 }
 
 func (r *Router) Move(point image.Point, touch bool) {
+	r.move(-1, point, touch)
+}
+
+// MovePointer routes a pointer move with its stable pointer ID. Hosts should
+// use this form so a second pointer cannot steer an existing scrollbar-thumb
+// capture. Move remains as a compatibility wrapper for callers that do not
+// have pointer IDs (tests and non-pointer host paths).
+func (r *Router) MovePointer(pointerID int, point image.Point, touch bool) {
+	r.move(pointerID, point, touch)
+}
+
+func (r *Router) move(pointerID int, point image.Point, touch bool) {
 	if r.inspecting {
+		return
+	}
+	if r.scrollCapture != nil {
+		if pointerID >= 0 && pointerID != r.captureID {
+			return
+		}
+		if !r.scrollCapture.drag || point == image.Pt(-1, -1) {
+			return
+		}
+		r.queueScrollbarDrag(point)
 		return
 	}
 	if region := r.enabledRegion(r.captureHandle); region != nil && region.Role == "slider" {
@@ -99,6 +188,53 @@ func (r *Router) Press(pointerID int, point image.Point) bool {
 		}
 		return false
 	}
+	if axis := r.scrollbarAxis(region); axis != nil {
+		if !axis.Enabled || region.Type == "scrollbar_corner" {
+			return false
+		}
+		if region.Type == "scrollbar_thumb" {
+			thumb := region.Bounds.ImageRectangle()
+			track := axis.Bounds.ImageRectangle()
+			grabOffset := point.X - thumb.Min.X
+			if axis.Orientation == "vertical" {
+				grabOffset = point.Y - thumb.Min.Y
+			}
+			r.scrollCapture = &scrollbarCapture{axis: axis, track: track, thumb: thumb, grabOffset: grabOffset, drag: true}
+			r.captureID = pointerID
+			r.captureHandle = axis.Handle
+			r.transient.Pressed = axis.Handle
+			r.transient.Focused = axis.Handle
+			return true
+		}
+		thumb := scrollbarThumb(axis)
+		page := scrollbarPage(axis)
+		if thumb == nil || thumb.Bounds == nil {
+			return false
+		}
+		thumbBounds := thumb.Bounds.ImageRectangle()
+		delta := 0
+		if axis.Orientation == "vertical" {
+			if point.Y < thumbBounds.Min.Y {
+				delta = -page
+			} else if point.Y >= thumbBounds.Max.Y {
+				delta = page
+			}
+		} else if point.X < thumbBounds.Min.X {
+			delta = -page
+		} else if point.X >= thumbBounds.Max.X {
+			delta = page
+		}
+		if delta != 0 {
+			r.transient.Focused = axis.Handle
+			r.queueScrollbarDelta(axis, delta)
+			r.scrollCapture = &scrollbarCapture{axis: axis, track: axis.Bounds.ImageRectangle(), thumb: thumbBounds}
+			r.captureID = pointerID
+			r.captureHandle = axis.Handle
+			r.transient.Pressed = axis.Handle
+			return true
+		}
+		return false
+	}
 	r.captureID = pointerID
 	r.captureHandle = region.Handle
 	r.transient.Pressed = region.Handle
@@ -111,6 +247,21 @@ func (r *Router) Press(pointerID int, point image.Point) bool {
 
 func (r *Router) Release(pointerID int, point image.Point) (Activation, bool) {
 	if pointerID != r.captureID || r.captureHandle == "" {
+		return Activation{}, false
+	}
+	if r.scrollCapture != nil {
+		var final *ScrollChange
+		if r.scrollCapture.drag && point != image.Pt(-1, -1) {
+			r.queueScrollbarDrag(point)
+			if r.scrollChange != nil {
+				copy := *r.scrollChange
+				final = &copy
+			}
+		}
+		r.cancelPress()
+		if final != nil {
+			r.scrollChange = final
+		}
 		return Activation{}, false
 	}
 	handle := r.captureHandle
@@ -133,7 +284,11 @@ func (r *Router) Release(pointerID int, point image.Point) (Activation, bool) {
 
 func (r *Router) Cancel(pointerID int) {
 	if pointerID == r.captureID {
+		hadScrollbarCapture := r.scrollCapture != nil
 		r.cancelPress()
+		if hadScrollbarCapture {
+			r.scrollChange = nil
+		}
 	}
 }
 
@@ -236,6 +391,10 @@ func (r *Router) KeyDown(name string) (Activation, bool) {
 			return activation, true
 		}
 	}
+	if region != nil && region.Role == "scrollbar" {
+		r.queueScrollbarKey(region, name)
+		return Activation{}, false
+	}
 	switch name {
 	case "Enter":
 		if region != nil {
@@ -254,6 +413,7 @@ func (r *Router) KeyDown(name string) (Activation, bool) {
 				return Activation{OpenSelect: region.Handle, ActiveOption: r.transient.ActiveOption}, true
 			}
 			r.keyboardPress = region.Handle
+			r.keyboardKey = name
 			r.transient.Pressed = region.Handle
 		}
 	case "Escape":
@@ -276,9 +436,18 @@ func (r *Router) TakeValueChange() (ControlValueChange, bool) {
 	return result, true
 }
 
+func (r *Router) TakeScrollChange() (ScrollChange, bool) {
+	if r.scrollChange == nil {
+		return ScrollChange{}, false
+	}
+	result := *r.scrollChange
+	r.scrollChange = nil
+	return result, true
+}
+
 func interactiveRole(role string) bool {
 	switch role {
-	case "button", "link", "textbox", "switch", "checkbox", "radio", "tab", "combobox", "option", "slider", "spinbutton":
+	case "button", "link", "textbox", "switch", "checkbox", "radio", "tab", "combobox", "option", "slider", "spinbutton", "scrollbar":
 		return true
 	default:
 		return false
@@ -300,7 +469,104 @@ func (r *Router) KeyUp(name string) (Activation, bool) {
 
 func (r *Router) Transient() Transient { return r.transient }
 
+// ScrollbarPointerOwned reports whether a primary pointer is currently owned
+// by a derived scrollbar track or thumb. Hosts use this to keep field
+// selection, slider drags, canvas panning, and wheel routing from stealing the
+// gesture.
+func (r *Router) ScrollbarPointerOwned() bool { return r != nil && r.scrollCapture != nil }
+
+// ScrollbarCaptured is the compatibility name for ScrollbarPointerOwned.
+func (r *Router) ScrollbarCaptured() bool { return r.ScrollbarPointerOwned() }
+
+// SetPointerMetadata records host-provided pointer details without dispatching
+// an event or changing routing state.
+func (r *Router) SetPointerMetadata(source string, buttons int, point image.Point) {
+	if r == nil {
+		return
+	}
+	r.pointerSource = source
+	r.pointerButtons = buttons
+	r.pointerPoint = point
+	r.pointerPointSet = true
+}
+
+// Snapshot returns a deep copy of all observable router state. Snapshot reads
+// do not consume pending value/scroll changes or alter focus/capture.
+func (r *Router) Snapshot() RouterSnapshot {
+	if r == nil {
+		return RouterSnapshot{HoveredIDs: []string{}, PressedIDs: []string{}, ActiveIDs: []string{}, DisabledIDs: []string{}}
+	}
+	result := RouterSnapshot{
+		HoveredIDs: []string{}, PressedIDs: []string{}, ActiveIDs: []string{}, DisabledIDs: []string{},
+		OpenSelectID: r.semanticID(r.transient.OpenSelect), Inspecting: r.inspecting,
+	}
+	result.FocusedID = r.semanticID(r.transient.Focused)
+	if id := r.semanticID(r.transient.Hovered); id != "" {
+		result.HoveredIDs = []string{id}
+	}
+	if id := r.semanticID(r.transient.Pressed); id != "" {
+		result.PressedIDs = []string{id}
+	}
+	if id := r.semanticID(r.transient.ActiveOption); id != "" {
+		result.ActiveIDs = []string{id}
+	}
+	for _, region := range r.regions {
+		if region == nil || region.Enabled {
+			continue
+		}
+		if id := r.semanticID(region.Handle); id != "" {
+			result.DisabledIDs = append(result.DisabledIDs, id)
+		}
+	}
+	if r.captureHandle != "" && r.captureID >= 0 {
+		if id := r.semanticID(r.captureHandle); id != "" {
+			capture := &PointerCaptureSnapshot{OwnerID: id, PointerID: r.captureID, Source: r.pointerSource, Buttons: r.pointerButtons}
+			if r.pointerPointSet {
+				capture.Point = r.pointerPoint
+			}
+			result.PointerCapture = capture
+		}
+	}
+	if r.keyboardPress != "" {
+		if id := r.semanticID(r.keyboardPress); id != "" {
+			result.KeyboardPress = &KeyboardPressSnapshot{OwnerID: id, Key: r.keyboardKey}
+		}
+	}
+	if r.scrollCapture != nil && r.scrollCapture.axis != nil {
+		result.ScrollbarGestureOwner = r.semanticID(r.scrollCapture.axis.Handle)
+	}
+	if r.captureHandle != "" {
+		if region := r.enabledRegion(r.captureHandle); region != nil && region.Role == "slider" {
+			result.SliderGestureOwner = r.semanticID(region.Handle)
+		}
+	}
+	if r.valueChange != nil {
+		result.QueueSizes.ValueChanges = 1
+	}
+	if r.scrollChange != nil {
+		result.QueueSizes.ScrollChanges = 1
+	}
+	return result
+}
+
+func (r *Router) semanticID(handle string) string {
+	if handle == "" {
+		return ""
+	}
+	for _, region := range r.regions {
+		if region != nil && region.Handle == handle {
+			return region.ID
+		}
+	}
+	return handle
+}
+
 func (r *Router) hit(point image.Point) *semantic.Node {
+	if r.tree != nil {
+		return semantic.TopmostAt(r.tree, point, func(node *semantic.Node) bool {
+			return node.Enabled && (interactiveRole(node.Role) || scrollbarPart(node))
+		})
+	}
 	for index := len(r.regions) - 1; index >= 0; index-- {
 		region := r.regions[index]
 		if !region.Visible || !region.Enabled || region.Bounds == nil || region.Clip == nil {
@@ -326,7 +592,180 @@ func (r *Router) enabledRegion(handle string) *semantic.Node {
 func (r *Router) cancelPress() {
 	r.captureID = -1
 	r.captureHandle = ""
+	r.keyboardPress = ""
+	r.keyboardKey = ""
+	r.scrollCapture = nil
+	r.valueChange = nil
+	r.scrollChange = nil
+	r.pointerSource = ""
+	r.pointerButtons = 0
+	r.pointerPoint = image.Point{}
+	r.pointerPointSet = false
 	r.transient.Pressed = ""
+}
+
+func scrollbarPart(node *semantic.Node) bool {
+	if node == nil {
+		return false
+	}
+	switch node.Type {
+	case "scrollbar_track", "scrollbar_thumb", "scrollbar_corner":
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *Router) scrollbarAxis(region *semantic.Node) *semantic.Node {
+	if region == nil {
+		return nil
+	}
+	if region.Role == "scrollbar" {
+		return region
+	}
+	if !scrollbarPart(region) || region.Group == "" {
+		return nil
+	}
+	for _, candidate := range r.regions {
+		if candidate.Role == "scrollbar" && candidate.Handle == region.Group {
+			return candidate
+		}
+	}
+	return nil
+}
+
+func scrollbarThumb(axis *semantic.Node) *semantic.Node {
+	if axis == nil {
+		return nil
+	}
+	for _, child := range axis.Children {
+		if child != nil && child.Type == "scrollbar_thumb" {
+			return child
+		}
+	}
+	return nil
+}
+
+func scrollbarPage(axis *semantic.Node) int {
+	if axis == nil {
+		return 1
+	}
+	length := 0
+	if axis.Orientation == "vertical" {
+		if axis.ViewportSize != nil {
+			length = axis.ViewportSize.Height
+		}
+	} else if axis.ViewportSize != nil {
+		length = axis.ViewportSize.Width
+	}
+	return max(1, length-16)
+}
+
+func (r *Router) queueScrollbarDelta(axis *semantic.Node, delta int) {
+	if axis == nil || delta == 0 {
+		return
+	}
+	change := ScrollChange{ID: axis.ID, Mode: "by"}
+	if axis.Orientation == "vertical" {
+		change.Y = delta
+	} else {
+		change.X = delta
+	}
+	r.scrollChange = &change
+}
+
+func (r *Router) queueScrollbarDrag(point image.Point) {
+	capture := r.scrollCapture
+	if capture == nil || capture.axis == nil || capture.axis.Max == nil {
+		return
+	}
+	trackLength := capture.track.Dx()
+	coordinate := point.X
+	trackStart := capture.track.Min.X
+	thumbLength := capture.thumb.Dx()
+	if capture.axis.Orientation == "vertical" {
+		trackLength = capture.track.Dy()
+		coordinate = point.Y
+		trackStart = capture.track.Min.Y
+		thumbLength = capture.thumb.Dy()
+	}
+	travel := max(0, trackLength-thumbLength)
+	position := coordinate - capture.grabOffset - trackStart
+	position = min(max(0, position), travel)
+	value := 0
+	if travel > 0 {
+		value = int(math.Floor(float64(position)*(*capture.axis.Max)/float64(travel) + .5))
+	}
+	change := ScrollChange{ID: capture.axis.ID, Mode: "to"}
+	if capture.axis.Orientation == "vertical" {
+		change.Y = value
+	} else {
+		change.X = value
+	}
+	r.scrollChange = &change
+}
+
+func (r *Router) queueScrollbarKey(axis *semantic.Node, name string) {
+	if axis == nil || axis.Max == nil {
+		return
+	}
+	page := scrollbarPage(axis)
+	change := ScrollChange{ID: axis.ID, Mode: "by"}
+	switch name {
+	case "ArrowUp":
+		if axis.Orientation != "vertical" {
+			return
+		}
+		change.Y = -40
+	case "ArrowDown":
+		if axis.Orientation != "vertical" {
+			return
+		}
+		change.Y = 40
+	case "ArrowLeft":
+		if axis.Orientation != "horizontal" {
+			return
+		}
+		change.X = -40
+	case "ArrowRight":
+		if axis.Orientation != "horizontal" {
+			return
+		}
+		change.X = 40
+	case "PageUp":
+		if axis.Orientation == "vertical" {
+			change.Y = -page
+		} else {
+			change.X = -page
+		}
+	case "PageDown":
+		if axis.Orientation == "vertical" {
+			change.Y = page
+		} else {
+			change.X = page
+		}
+	case "Home":
+		change.Mode = "to"
+	case "End":
+		change.Mode = "to"
+		if axis.Orientation == "vertical" {
+			change.Y = int(*axis.Max)
+		} else {
+			change.X = int(*axis.Max)
+		}
+	default:
+		return
+	}
+	r.scrollChange = &change
+}
+
+func (r *Router) enabledRegionByIdentity(identity string) *semantic.Node {
+	for _, region := range r.regions {
+		if region != nil && (region.Handle == identity || region.ID == identity) && region.Visible && region.Enabled && region.Bounds != nil {
+			return region
+		}
+	}
+	return nil
 }
 
 func (r *Router) moveComposite(current *semantic.Node, delta int, edge bool) (Activation, bool) {

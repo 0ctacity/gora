@@ -1,14 +1,22 @@
 package render
 
 import (
+	"bytes"
 	"image"
 	"image/color"
 	"image/png"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"gioui.org/layout"
+	"gioui.org/op"
+	"gioui.org/unit"
+	"gioui.org/widget/material"
+
 	"gora/internal/project"
+	"gora/internal/semantic"
 )
 
 func TestRenderStackRecordsBoundsAndPaintsSurface(t *testing.T) {
@@ -257,10 +265,274 @@ func TestScrollUsesIntrinsicContentExtentAndClampsOffset(t *testing.T) {
 	}
 }
 
+// oneAxisScrollNode keeps scroll characterization fixtures small and makes
+// the expected viewport/content rectangles explicit at each call site.
+func oneAxisScrollNode(axis string, content image.Point) *project.Node {
+	props := map[string]any{}
+	if axis != "" {
+		props["axis"] = axis
+	}
+	childProps := map[string]any{"width": int64(content.X), "height": int64(content.Y)}
+	return &project.Node{
+		Handle: "scroll", Name: "feed", Type: "scroll", Props: props,
+		Children: []*project.Node{{Handle: "content", Type: "surface", Props: childProps}},
+	}
+}
+
+func nestedVerticalScrollNode() *project.Node {
+	inner := &project.Node{
+		Handle: "inner-scroll", Name: "inner", Type: "scroll",
+		Props: map[string]any{"axis": "vertical", "height": int64(200)},
+		Children: []*project.Node{{
+			Handle: "inner-content", Type: "surface",
+			Props: map[string]any{"height": int64(300), "background": "#FFFFFF"},
+		}},
+	}
+	return &project.Node{
+		Handle: "outer-scroll", Name: "outer", Type: "scroll",
+		Props: map[string]any{"axis": "vertical"}, Children: []*project.Node{inner},
+	}
+}
+
+func TestCPUAndGioPinOneAxisScrollGeometry(t *testing.T) {
+	tests := []struct {
+		name       string
+		axis       string
+		viewport   image.Point
+		content    image.Point
+		offset     image.Point
+		wantBounds image.Rectangle
+	}{
+		{
+			name: "default vertical", axis: "", viewport: image.Pt(100, 80),
+			content: image.Pt(100, 240), offset: image.Pt(17, 30),
+			wantBounds: image.Rect(0, -30, 100, 210),
+		},
+		{
+			name: "vertical", axis: "vertical", viewport: image.Pt(100, 80),
+			content: image.Pt(100, 240), offset: image.Pt(17, 30),
+			wantBounds: image.Rect(0, -30, 100, 210),
+		},
+		{
+			name: "horizontal clamps beyond maximum", axis: "horizontal", viewport: image.Pt(100, 80),
+			content: image.Pt(260, 80), offset: image.Pt(400, 19),
+			wantBounds: image.Rect(-160, 0, 100, 80),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := oneAxisScrollNode(test.axis, test.content)
+			state := State{Scroll: map[string]image.Point{"feed": test.offset}}
+			cpu := Render(root, test.viewport, state)
+			var operations op.Ops
+			gio := LayoutGio(layout.Context{
+				Ops: &operations, Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1},
+				Constraints: layout.Exact(test.viewport),
+			}, material.NewTheme(), root, test.viewport, state)
+
+			wantViewport := image.Rect(0, 0, test.viewport.X, test.viewport.Y)
+			for _, result := range []struct {
+				name     string
+				bounds   map[string]image.Rectangle
+				geometry map[string]semantic.Geometry
+			}{
+				{name: "CPU", bounds: cpu.Bounds, geometry: cpu.Geometry},
+				{name: "Gio", bounds: gio.Bounds, geometry: gio.Geometry},
+			} {
+				t.Run(result.name, func(t *testing.T) {
+					if got := result.bounds["scroll"]; got != wantViewport {
+						t.Fatalf("scroll viewport = %v, want %v", got, wantViewport)
+					}
+					if got := result.bounds["content"]; got != test.wantBounds {
+						t.Fatalf("content bounds = %v, want %v", got, test.wantBounds)
+					}
+					if got := result.geometry["scroll"].Clip; got != wantViewport {
+						t.Fatalf("scroll clip = %v, want %v", got, wantViewport)
+					}
+					if got := result.geometry["content"].Clip; got != wantViewport {
+						t.Fatalf("content clip = %v, want %v", got, wantViewport)
+					}
+					if result.geometry["scroll"].PaintOrder != 0 || result.geometry["content"].PaintOrder != 1 {
+						t.Fatalf("paint order = scroll:%d content:%d, want 0:1", result.geometry["scroll"].PaintOrder, result.geometry["content"].PaintOrder)
+					}
+					gotOffset := result.bounds["scroll"].Min.Sub(result.bounds["content"].Min)
+					if gotOffset != image.Pt(absInt(test.wantBounds.Min.X), absInt(test.wantBounds.Min.Y)) {
+						t.Fatalf("effective offset = %v, want %v", gotOffset, image.Pt(absInt(test.wantBounds.Min.X), absInt(test.wantBounds.Min.Y)))
+					}
+				})
+			}
+			for _, handle := range []string{"scroll", "content"} {
+				cpuGeometry, gioGeometry := cpu.Geometry[handle], gio.Geometry[handle]
+				if cpu.Bounds[handle] != gio.Bounds[handle] || cpuGeometry.Bounds != gioGeometry.Bounds || cpuGeometry.Clip != gioGeometry.Clip || cpuGeometry.PaintOrder != gioGeometry.PaintOrder {
+					t.Fatalf("%s CPU/Gio geometry differs: CPU bounds=%v geometry=%+v; Gio bounds=%v geometry=%+v", handle, cpu.Bounds[handle], cpuGeometry, gio.Bounds[handle], gioGeometry)
+				}
+			}
+		})
+	}
+}
+
+func TestCPUAndGioComposeNestedOneAxisScrollClips(t *testing.T) {
+	viewport := image.Pt(100, 100)
+	state := State{Scroll: map[string]image.Point{
+		"outer": image.Pt(0, 20), "inner": image.Pt(0, 40),
+	}}
+	root := nestedVerticalScrollNode()
+	cpu := Render(root, viewport, state)
+	var operations op.Ops
+	gio := LayoutGio(layout.Context{
+		Ops: &operations, Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}, Constraints: layout.Exact(viewport),
+	}, material.NewTheme(), root, viewport, state)
+	wantOuter := image.Rect(0, 0, 100, 100)
+	wantInner := image.Rect(0, -20, 100, 180)
+	wantContent := image.Rect(0, -60, 100, 240)
+	for _, result := range []struct {
+		name     string
+		bounds   map[string]image.Rectangle
+		geometry map[string]semantic.Geometry
+	}{
+		{name: "CPU", bounds: cpu.Bounds, geometry: cpu.Geometry},
+		{name: "Gio", bounds: gio.Bounds, geometry: gio.Geometry},
+	} {
+		t.Run(result.name, func(t *testing.T) {
+			if got := result.bounds["outer-scroll"]; got != wantOuter {
+				t.Fatalf("outer viewport = %v, want %v", got, wantOuter)
+			}
+			if got := result.bounds["inner-scroll"]; got != wantInner {
+				t.Fatalf("inner viewport = %v, want %v", got, wantInner)
+			}
+			if got := result.bounds["inner-content"]; got != wantContent {
+				t.Fatalf("nested content = %v, want %v", got, wantContent)
+			}
+			for _, handle := range []string{"outer-scroll", "inner-scroll", "inner-content"} {
+				if got := result.geometry[handle].Clip; got != wantOuter {
+					t.Fatalf("%s clip = %v, want %v", handle, got, wantOuter)
+				}
+			}
+		})
+	}
+}
+
+func bothAxisScrollNode(content image.Point) *project.Node {
+	return &project.Node{
+		Handle: "both-scroll", Name: "workspace", Type: "scroll",
+		Props: map[string]any{"axis": "both"},
+		Children: []*project.Node{{
+			Handle: "both-content", Type: "surface",
+			Props: map[string]any{"width": int64(content.X), "height": int64(content.Y)},
+		}},
+	}
+}
+
+func TestCPUAndGioPinBothAxisScrollGeometryAndMetrics(t *testing.T) {
+	viewport := image.Pt(100, 80)
+	content := image.Pt(180, 140)
+	tests := []struct {
+		name       string
+		offset     image.Point
+		wantBounds image.Rectangle
+		wantOffset image.Point
+	}{
+		{name: "independent offsets", offset: image.Pt(35, 25), wantBounds: image.Rect(-35, -25, 145, 115), wantOffset: image.Pt(35, 25)},
+		{name: "horizontal clamp", offset: image.Pt(500, 25), wantBounds: image.Rect(-80, -25, 100, 115), wantOffset: image.Pt(80, 25)},
+		{name: "vertical clamp", offset: image.Pt(35, 500), wantBounds: image.Rect(-35, -60, 145, 80), wantOffset: image.Pt(35, 60)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := bothAxisScrollNode(content)
+			state := State{Scroll: map[string]image.Point{"workspace": test.offset}}
+			cpu := Render(root, viewport, state)
+			var operations op.Ops
+			gio := LayoutGio(layout.Context{
+				Ops: &operations, Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}, Constraints: layout.Exact(viewport),
+			}, material.NewTheme(), root, viewport, state)
+			wantViewport := image.Rect(0, 0, viewport.X, viewport.Y)
+			for _, result := range []struct {
+				name     string
+				bounds   map[string]image.Rectangle
+				geometry map[string]semantic.Geometry
+				scroll   map[string]ScrollMetrics
+			}{
+				{name: "CPU", bounds: cpu.Bounds, geometry: cpu.Geometry, scroll: cpu.Scroll},
+				{name: "Gio", bounds: gio.Bounds, geometry: gio.Geometry, scroll: gio.Scroll},
+			} {
+				t.Run(result.name, func(t *testing.T) {
+					if got := result.bounds["both-scroll"]; got != wantViewport {
+						t.Fatalf("scroll viewport = %v, want %v", got, wantViewport)
+					}
+					if got := result.bounds["both-content"]; got != test.wantBounds {
+						t.Fatalf("content bounds = %v, want %v", got, test.wantBounds)
+					}
+					if got := result.geometry["both-content"].Clip; got != wantViewport {
+						t.Fatalf("content clip = %v, want %v", got, wantViewport)
+					}
+					metrics, ok := result.scroll["both-scroll"]
+					if !ok {
+						t.Fatal("missing published scroll metrics")
+					}
+					if metrics.Viewport != wantViewport || metrics.ContentSize != content || metrics.Maximum != image.Pt(80, 60) || !metrics.EnabledX || !metrics.EnabledY {
+						t.Fatalf("scroll metrics = %+v", metrics)
+					}
+					if got := result.bounds["both-scroll"].Min.Sub(result.bounds["both-content"].Min); got != test.wantOffset {
+						t.Fatalf("effective offset = %v, want %v", got, test.wantOffset)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestCPUAndGioComposeNestedBothAxisScrollClips(t *testing.T) {
+	viewport := image.Pt(100, 100)
+	root := &project.Node{
+		Handle: "outer-both", Name: "outer", Type: "scroll", Props: map[string]any{"axis": "both"},
+		Children: []*project.Node{{
+			Handle: "inner-both", Name: "inner", Type: "scroll",
+			Props: map[string]any{"axis": "both", "width": int64(120), "height": int64(120)},
+			Children: []*project.Node{{
+				Handle: "nested-content", Type: "surface",
+				Props: map[string]any{"width": int64(180), "height": int64(160)},
+			}},
+		}},
+	}
+	state := State{Scroll: map[string]image.Point{
+		"outer": image.Pt(20, 10), "inner": image.Pt(30, 40),
+	}}
+	cpu := Render(root, viewport, state)
+	var operations op.Ops
+	gio := LayoutGio(layout.Context{
+		Ops: &operations, Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}, Constraints: layout.Exact(viewport),
+	}, material.NewTheme(), root, viewport, state)
+	want := map[string]image.Rectangle{
+		"outer-both":     image.Rect(0, 0, 100, 100),
+		"inner-both":     image.Rect(-20, -10, 100, 110),
+		"nested-content": image.Rect(-50, -50, 130, 110),
+	}
+	for _, result := range []struct {
+		name     string
+		bounds   map[string]image.Rectangle
+		geometry map[string]semantic.Geometry
+	}{
+		{name: "CPU", bounds: cpu.Bounds, geometry: cpu.Geometry},
+		{name: "Gio", bounds: gio.Bounds, geometry: gio.Geometry},
+	} {
+		t.Run(result.name, func(t *testing.T) {
+			for handle, wantBounds := range want {
+				if got := result.bounds[handle]; got != wantBounds {
+					t.Fatalf("%s bounds = %v, want %v", handle, got, wantBounds)
+				}
+				if got := result.geometry[handle].Clip; got != image.Rect(0, 0, 100, 100) {
+					t.Fatalf("%s clip = %v, want viewport clip", handle, got)
+				}
+			}
+		})
+	}
+}
+
 func TestCaptureScalesPixelsWithoutStudioOverlays(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "capture.png")
 	root := &project.Node{Handle: "root", Type: "surface", Props: map[string]any{"background": "#123456"}}
 	if err := Capture(path, root, image.Pt(3, 2), State{}, 2); err != nil {
+		skipMetalUnavailable(t, err)
 		t.Fatal(err)
 	}
 	file, err := os.Open(path)
@@ -277,6 +549,44 @@ func TestCaptureScalesPixelsWithoutStudioOverlays(t *testing.T) {
 	}
 	if got := color.RGBAModel.Convert(captured.At(1, 1)).(color.RGBA); got != (color.RGBA{R: 0x12, G: 0x34, B: 0x56, A: 0xff}) {
 		t.Fatalf("capture pixel = %#v", got)
+	}
+}
+
+func TestCaptureAndReferenceUseTheSameVerticalScrollOffset(t *testing.T) {
+	root := &project.Node{
+		Handle: "scroll", Name: "feed", Type: "scroll", Props: map[string]any{"axis": "vertical"},
+		Children: []*project.Node{{
+			Handle: "content", Type: "stack", Props: map[string]any{"direction": "vertical"},
+			Children: []*project.Node{
+				{Handle: "red", Type: "surface", Props: map[string]any{"height": int64(20), "background": "#FF0000"}},
+				{Handle: "blue", Type: "surface", Props: map[string]any{"height": int64(20), "background": "#0000FF"}},
+			},
+		}},
+	}
+	viewport := image.Pt(20, 20)
+	state := State{Scroll: map[string]image.Point{"feed": image.Pt(0, 20)}}
+	reference := Render(root, viewport, state)
+	if got := reference.Bounds["blue"]; got != image.Rect(0, 0, 20, 20) {
+		t.Fatalf("reference blue bounds = %v, want viewport", got)
+	}
+	encoded, err := CapturePNG(root, viewport, state, 1)
+	if err != nil {
+		skipMetalUnavailable(t, err)
+		t.Fatal(err)
+	}
+	captured, err := png.Decode(bytes.NewReader(encoded))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := color.RGBAModel.Convert(captured.At(10, 10)).(color.RGBA); got != (color.RGBA{B: 255, A: 255}) {
+		t.Fatalf("captured scrolled pixel = %#v, want blue", got)
+	}
+}
+
+func skipMetalUnavailable(t *testing.T, err error) {
+	t.Helper()
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "metal device") {
+		t.Skipf("headless capture requires Metal: %v", err)
 	}
 }
 

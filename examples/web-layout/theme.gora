@@ -12,7 +12,7 @@ tokens:
     half: { percent: 50 }
     card_basis: { percent: 30 }
   font_face:
-    studio: { src: ../dashboard/assets/StudioSans.ttf }
+    studio: { src: assets/StudioSans.ttf }
   shadow:
     panel: { x: 0, y: 12, blur: 30, color: "#17203312" }
   linear_gradient:

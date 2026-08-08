@@ -379,7 +379,15 @@ func (p *Project) reloadAffectedViewsLocked(changed map[string]bool) {
 		} else {
 			view.runtime.Reload()
 		}
-		view.diagnostics = view.runtime.Snapshot().Diagnostics
+		snapshot := view.runtime.Snapshot()
+		if !snapshot.Invalid && snapshot.Root != nil {
+			// A valid reload is not complete for automation until its fresh
+			// reference frame is installed. Invalid candidates retain the
+			// last-good publication and expose only current diagnostics.
+			_, _ = view.runtime.RuntimeTree()
+			snapshot = view.runtime.Snapshot()
+		}
+		view.diagnostics = snapshot.Diagnostics
 		for _, dependency := range view.runtime.Dependencies() {
 			if filepath.Ext(dependency) == ".gora" {
 				p.sources[filepath.Clean(dependency)] = true

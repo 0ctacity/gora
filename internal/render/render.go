@@ -48,22 +48,81 @@ type Result struct {
 	Image    *image.RGBA
 	Bounds   map[string]image.Rectangle
 	Geometry map[string]semantic.Geometry
+	Layout   map[string]LayoutRecord
+	Scroll   map[string]ScrollMetrics
+	Derived  []semantic.DerivedDescriptor
 	Tree     *semantic.Node
 }
 
 type renderer struct {
-	result     *Result
-	state      State
-	scale      int
-	opacity    float64
-	paintOrder int
-	viewport   image.Rectangle
-	topLayers  []topLayer
+	result      *Result
+	state       State
+	scale       int
+	opacity     float64
+	paintOrder  int
+	viewport    image.Rectangle
+	topLayers   []topLayer
+	layoutMeta  layoutMeta
+	sourceOrder int
+	sourceRanks map[string]int
+	rootHandle  string
+	paintOwner  string
+	deferred    map[string]map[string]positionedPlacement
+	painted     map[string]bool
+}
+
+type layoutMeta struct {
+	parentInner         image.Rectangle
+	scrollAncestors     []string
+	scrollports         []stickyScrollport
+	ancestorTranslation image.Point
+	normal              image.Rectangle
+	hasNormal           bool
+}
+
+type stickyScrollport struct {
+	NormalViewport image.Rectangle
+	Viewport       image.Rectangle
+	Translation    image.Point
+	Offset         image.Point
+}
+
+func normalLayoutBounds(meta layoutMeta, bounds image.Rectangle) image.Rectangle {
+	if meta.hasNormal {
+		return meta.normal
+	}
+	return bounds
+}
+
+func stickyViewport(meta layoutMeta, fallback image.Rectangle) image.Rectangle {
+	if len(meta.scrollports) > 0 {
+		return meta.scrollports[len(meta.scrollports)-1].Viewport
+	}
+	return fallback
+}
+
+func stickyParentInner(meta layoutMeta) image.Rectangle {
+	return meta.parentInner.Add(meta.ancestorTranslation)
 }
 
 type topLayer struct {
 	node   *project.Node
 	bounds image.Rectangle
+}
+
+type positionedPlacement struct {
+	node        *project.Node
+	bounds      image.Rectangle
+	clip        image.Rectangle
+	parentInner image.Rectangle
+	ancestors   []string
+	scrollports []stickyScrollport
+	translation image.Point
+	scrolls     []sceneScroll
+	stickies    []sceneSticky
+	normal      image.Rectangle
+	final       bool
+	owner       string
 }
 
 type cachedImage struct {
@@ -112,15 +171,18 @@ func renderScaled(root *project.Node, viewport image.Point, state State, scale i
 	canvas := image.NewRGBA(image.Rect(0, 0, viewport.X*scale, viewport.Y*scale))
 	result := Result{
 		Image: canvas, Bounds: make(map[string]image.Rectangle),
-		Geometry: make(map[string]semantic.Geometry),
+		Geometry: make(map[string]semantic.Geometry), Layout: make(map[string]LayoutRecord), Scroll: make(map[string]ScrollMetrics),
 	}
-	r := renderer{result: &result, state: state, scale: scale, opacity: 1, viewport: image.Rect(0, 0, viewport.X, viewport.Y)}
+	r := renderer{result: &result, state: state, scale: scale, opacity: 1, viewport: image.Rect(0, 0, viewport.X, viewport.Y), layoutMeta: layoutMeta{parentInner: image.Rect(0, 0, viewport.X, viewport.Y)}, sourceRanks: sourceOrderRanks(root), deferred: make(map[string]map[string]positionedPlacement), painted: make(map[string]bool)}
+	if root != nil {
+		r.rootHandle = root.Handle
+	}
 	r.layout(root, image.Rect(0, 0, viewport.X, viewport.Y), image.Rect(0, 0, viewport.X, viewport.Y))
 	for index := 0; index < len(r.topLayers); index++ {
 		layer := r.topLayers[index]
 		r.layoutFinal(layer.node, layer.bounds, r.viewport)
 	}
-	result.Tree = semantic.Build(root, result.Geometry, semanticContext(state))
+	result.Tree = semantic.Build(root, result.Geometry, semanticContext(state), result.Derived)
 	return result
 }
 
@@ -178,12 +240,174 @@ func (r *renderer) layoutFinal(node *project.Node, bounds, clip image.Rectangle)
 	r.layoutNode(node, bounds, clip, true)
 }
 
-func (r *renderer) layoutNode(node *project.Node, bounds, clip image.Rectangle, final bool) {
-	if node == nil || node.Hidden || bounds.Empty() {
+func (r *renderer) layoutChild(node *project.Node, bounds, clip, parentInner image.Rectangle, ancestors []string, normal image.Rectangle, final bool) {
+	if !final {
+		normal = applySize(node, normal)
+	}
+	previous := r.layoutMeta
+	r.layoutMeta = layoutMeta{
+		parentInner:         parentInner,
+		scrollAncestors:     append([]string(nil), ancestors...),
+		scrollports:         append([]stickyScrollport(nil), previous.scrollports...),
+		ancestorTranslation: previous.ancestorTranslation,
+		normal:              normal,
+		hasNormal:           true,
+	}
+	r.layoutNode(node, bounds, clip, final)
+	r.layoutMeta = previous
+}
+
+func (r *renderer) layoutChildInScroll(node *project.Node, bounds, clip, parentInner image.Rectangle, ancestors []string, normal image.Rectangle, final bool, scrollports []stickyScrollport, translation image.Point) {
+	previous := r.layoutMeta
+	r.layoutMeta.scrollports = append([]stickyScrollport(nil), scrollports...)
+	r.layoutMeta.ancestorTranslation = translation
+	r.layoutChild(node, bounds, clip, parentInner, ancestors, normal, final)
+	r.layoutMeta = previous
+}
+
+func (r *renderer) deferPositioned(p positionedPlacement) {
+	if p.node == nil || p.owner == "" {
 		return
+	}
+	byOwner := r.deferred[p.owner]
+	if byOwner == nil {
+		byOwner = make(map[string]positionedPlacement)
+		r.deferred[p.owner] = byOwner
+	}
+	byOwner[p.node.Handle] = p
+}
+
+func (r *renderer) positionedPlacement(node *project.Node) (positionedPlacement, bool) {
+	if node == nil {
+		return positionedPlacement{}, false
+	}
+	p, ok := r.deferred[r.paintOwner][node.Handle]
+	return p, ok
+}
+
+func (r *renderer) deferPositionedChild(node *project.Node, bounds, clip, parentInner image.Rectangle, ancestors []string, normal image.Rectangle, final bool) {
+	if node == nil || !isPositionedContext(node) {
+		return
+	}
+	r.deferPositioned(positionedPlacement{
+		node: node, bounds: bounds, clip: clip, parentInner: parentInner,
+		ancestors: append([]string(nil), ancestors...), scrollports: append([]stickyScrollport(nil), r.layoutMeta.scrollports...), translation: r.layoutMeta.ancestorTranslation,
+		normal: normal, final: final, owner: r.paintOwner,
+	})
+}
+
+func (r *renderer) paintPositionedChild(node *project.Node, bounds, clip, parentInner image.Rectangle, ancestors []string, normal image.Rectangle, final bool) {
+	if node == nil || !isPositionedContext(node) {
+		return
+	}
+	if placement, ok := r.positionedPlacement(node); ok {
+		r.paintPositioned(placement)
+		return
+	}
+	r.paintPositioned(positionedPlacement{
+		node: node, bounds: bounds, clip: clip, parentInner: parentInner,
+		ancestors: append([]string(nil), ancestors...), scrollports: append([]stickyScrollport(nil), r.layoutMeta.scrollports...), translation: r.layoutMeta.ancestorTranslation,
+		normal: normal, final: final, owner: r.paintOwner,
+	})
+}
+
+func (r *renderer) paintPositioned(p positionedPlacement) {
+	if p.node == nil || r.painted[p.node.Handle] {
+		return
+	}
+	r.painted[p.node.Handle] = true
+	if isFixedPositioned(p.node) {
+		r.layoutFixedNode(p.node)
+		return
+	}
+	previous := r.layoutMeta
+	r.layoutMeta.scrollports = append([]stickyScrollport(nil), p.scrollports...)
+	r.layoutMeta.ancestorTranslation = p.translation
+	r.layoutChild(p.node, p.bounds, p.clip, p.parentInner, p.ancestors, p.normal, p.final)
+	r.layoutMeta = previous
+}
+
+// paintPromotedPositioned drains positioned participants that were found
+// below ordinary wrappers while the flow subtree was laid out. The ordered
+// participant list is shared with both renderers, so promoted nodes retain the
+// same final rank as direct positioned children.
+func (r *renderer) paintPromotedPositioned(node *project.Node) {
+	if node == nil || node.Handle != r.paintOwner {
+		return
+	}
+	for _, child := range paintContextChildren(node.Children) {
+		if !isPositionedContext(child) {
+			continue
+		}
+		if placement, ok := r.positionedPlacement(child); ok {
+			r.paintPositioned(placement)
+		}
+	}
+}
+
+// layoutFixedNode lays out a fixed subtree against the logical view viewport.
+// Fixed descendants intentionally receive a fresh positioning context: an
+// ancestor scrollport or sticky translation cannot move or clip them.
+func (r *renderer) layoutFixedNode(node *project.Node) {
+	if node == nil || node.Hidden {
+		return
+	}
+	planned, ok := planFixedViewport(node, r.viewport, fixedIntrinsicSize(node, r.viewport.Size(), cpuIntrinsicLeaf))
+	if !ok || planned.Empty() {
+		return
+	}
+	previous := r.layoutMeta
+	previousOwner := r.paintOwner
+	r.layoutMeta = layoutMeta{
+		parentInner: r.viewport,
+		normal:      planned,
+		hasNormal:   true,
+	}
+	clone := *node
+	clone.Place = cloneMap(node.Place)
+	if clone.Place == nil {
+		clone.Place = make(map[string]any)
+	}
+	clone.Place["position"] = "flow"
+	r.paintOwner = node.Handle
+	r.layoutNode(&clone, planned, r.viewport, true)
+	r.paintOwner = previousOwner
+	r.layoutMeta = previous
+}
+
+func (r *renderer) layoutNode(node *project.Node, bounds, clip image.Rectangle, final bool) {
+	if node == nil {
+		return
+	}
+	if isFixedPositioned(node) {
+		r.layoutFixedNode(node)
+		return
+	}
+	if node.Hidden || bounds.Empty() {
+		return
+	}
+	previousOwner := r.paintOwner
+	isContext := node.Handle == r.rootHandle || node.Handle == r.paintOwner || isPositionedContext(node)
+	if isContext {
+		r.paintOwner = node.Handle
+	}
+	defer func() {
+		if isContext {
+			r.paintPromotedPositioned(node)
+		}
+		r.paintOwner = previousOwner
+	}()
+	normalBounds := bounds
+	if r.layoutMeta.hasNormal {
+		normalBounds = r.layoutMeta.normal
 	}
 	if !final {
 		bounds = applySize(node, bounds)
+	}
+	if isStickyPositioned(node) {
+		var stickyDelta image.Point
+		bounds, stickyDelta = planStickyRect(node, bounds, stickyParentInner(r.layoutMeta), stickyViewport(r.layoutMeta, r.viewport))
+		r.layoutMeta.ancestorTranslation = r.layoutMeta.ancestorTranslation.Add(stickyDelta)
 	}
 	node = interactiveNodeForState(node, r.state)
 	var fieldGeometry fieldTextGeometry
@@ -196,6 +420,21 @@ func (r *renderer) layoutNode(node *project.Node, bounds, clip image.Rectangle, 
 	r.opacity *= clamp(number(node.Props["opacity"], 1), 0, 1)
 	defer func() { r.opacity = previousOpacity }()
 	r.result.Bounds[node.Handle] = bounds
+	record := r.result.Layout[node.Handle]
+	if record.Normal.Empty() || !final {
+		record.Normal = normalBounds
+	}
+	record.Final = bounds
+	record.ParentInner = r.layoutMeta.parentInner
+	record.ScrollAncestors = append([]string(nil), r.layoutMeta.scrollAncestors...)
+	if rank, ok := r.sourceRanks[node.Handle]; ok {
+		record.SourceOrder = rank
+	} else {
+		record.SourceOrder = r.sourceOrder
+	}
+	record.ContainingViewport = r.viewport
+	r.result.Layout[node.Handle] = record
+	r.sourceOrder++
 	r.result.Geometry[node.Handle] = semantic.Geometry{
 		Bounds: bounds, Clip: clip, PaintOrder: r.paintOrder, Props: cloneMap(node.Props),
 	}
@@ -207,15 +446,50 @@ func (r *renderer) layoutNode(node *project.Node, bounds, clip image.Rectangle, 
 		} else {
 			r.paintRect(bounds, clip, colorValue(node.Props["background"], color.Transparent), 1)
 		}
-		if len(node.Children) == 1 {
-			r.layout(node.Children[0], bounds, clip)
+		children := node.Children
+		if node.Handle == r.paintOwner {
+			children = paintContextChildren(node.Children)
+		}
+		if len(children) == 1 || node.Handle == r.paintOwner {
+			parentNormal := normalLayoutBounds(r.layoutMeta, bounds)
+			for _, child := range children {
+				if isPositionedContext(child) {
+					if placement, ok := r.positionedPlacement(child); ok {
+						r.paintPositioned(placement)
+					} else if node.Handle == r.paintOwner {
+						r.paintPositionedChild(child, bounds, clip, parentNormal, r.layoutMeta.scrollAncestors, parentNormal, false)
+					} else {
+						r.deferPositionedChild(child, bounds, clip, parentNormal, r.layoutMeta.scrollAncestors, parentNormal, false)
+					}
+					continue
+				}
+				r.layoutChild(child, bounds, clip, parentNormal, r.layoutMeta.scrollAncestors, parentNormal, false)
+			}
 		}
 	case "form", "surface", "button", "link", "toggle", "checkbox", "radio", "tab", "tab_panel", "option", "select_trigger", "field_support",
 		"slider_track", "slider_fill", "slider_thumb", "stepper_decrement", "stepper_value", "stepper_increment":
 		r.paintSurface(node, bounds, incomingClip)
 		inner := inset(bounds, insets(node.Props["padding"]))
-		if len(node.Children) == 1 {
-			r.layout(node.Children[0], inner, chooseClip(node, incomingClip, bounds))
+		normalInner := inset(normalLayoutBounds(r.layoutMeta, bounds), insets(node.Props["padding"]))
+		children := node.Children
+		if node.Handle == r.paintOwner {
+			children = paintContextChildren(node.Children)
+		}
+		if len(children) == 1 || node.Handle == r.paintOwner {
+			childClip := chooseClip(node, incomingClip, bounds)
+			for _, child := range children {
+				if isPositionedContext(child) {
+					if placement, ok := r.positionedPlacement(child); ok {
+						r.paintPositioned(placement)
+					} else if node.Handle == r.paintOwner {
+						r.paintPositionedChild(child, inner, childClip, normalInner, r.layoutMeta.scrollAncestors, normalInner, false)
+					} else {
+						r.deferPositionedChild(child, inner, childClip, normalInner, r.layoutMeta.scrollAncestors, normalInner, false)
+					}
+					continue
+				}
+				r.layoutChild(child, inner, childClip, normalInner, r.layoutMeta.scrollAncestors, normalInner, false)
+			}
 		}
 	case "field_box":
 		r.paintSurface(node, bounds, incomingClip)
@@ -266,22 +540,41 @@ func (r *renderer) layoutNode(node *project.Node, bounds, clip image.Rectangle, 
 	case "slider":
 		r.paintSurface(node, bounds, incomingClip)
 		parts := sliderParts(node, inset(bounds, insets(node.Props["padding"])))
-		for _, child := range node.Children {
+		normalParts := sliderParts(node, inset(normalLayoutBounds(r.layoutMeta, bounds), insets(node.Props["padding"])))
+		for _, child := range paintChildrenForNode(node, r.paintOwner) {
+			if isPositionedContext(child) {
+				if placement, ok := r.positionedPlacement(child); ok {
+					r.paintPositioned(placement)
+				} else if childBounds, ok := parts[child.Handle]; ok {
+					r.paintPositionedChild(child, childBounds, clip, inset(normalLayoutBounds(r.layoutMeta, bounds), insets(node.Props["padding"])), r.layoutMeta.scrollAncestors, normalParts[child.Handle], true)
+				}
+				continue
+			}
 			if childBounds, ok := parts[child.Handle]; ok && !childBounds.Empty() {
-				r.layoutFinal(child, childBounds, clip)
+				r.layoutChild(child, childBounds, clip, inset(normalLayoutBounds(r.layoutMeta, bounds), insets(node.Props["padding"])), r.layoutMeta.scrollAncestors, normalParts[child.Handle], true)
 			}
 		}
 	case "tabs":
 		parts := tabsParts(node, inset(bounds, insets(node.Props["padding"])), cpuIntrinsicSize)
-		for _, child := range node.Children {
+		normalParts := tabsParts(node, inset(normalLayoutBounds(r.layoutMeta, bounds), insets(node.Props["padding"])), cpuIntrinsicSize)
+		for _, child := range paintChildrenForNode(node, r.paintOwner) {
+			if isPositionedContext(child) {
+				if placement, ok := r.positionedPlacement(child); ok {
+					r.paintPositioned(placement)
+				} else if childBounds, ok := parts[child.Handle]; ok {
+					r.paintPositionedChild(child, childBounds, clip, inset(normalLayoutBounds(r.layoutMeta, bounds), insets(node.Props["padding"])), r.layoutMeta.scrollAncestors, normalParts[child.Handle], true)
+				}
+				continue
+			}
 			if childBounds, ok := parts[child.Handle]; ok && !childBounds.Empty() {
-				r.layoutFinal(child, childBounds, clip)
+				r.layoutChild(child, childBounds, clip, inset(normalLayoutBounds(r.layoutMeta, bounds), insets(node.Props["padding"])), r.layoutMeta.scrollAncestors, normalParts[child.Handle], true)
 			}
 		}
 	case "select":
 		trigger, popup, popupBounds := selectPopupBounds(node, bounds, r.viewport, cpuIntrinsicSize)
 		if trigger != nil {
-			r.layoutFinal(trigger, bounds, clip)
+			parentNormal := normalLayoutBounds(r.layoutMeta, bounds)
+			r.layoutChild(trigger, bounds, clip, parentNormal, r.layoutMeta.scrollAncestors, parentNormal, true)
 		}
 		if popup != nil && !popupBounds.Empty() {
 			r.topLayers = append(r.topLayers, topLayer{node: popup, bounds: popupBounds})
@@ -295,35 +588,55 @@ func (r *renderer) layoutNode(node *project.Node, bounds, clip image.Rectangle, 
 	case "grid":
 		r.grid(node, bounds, clip)
 	case "overlay":
-		for _, child := range node.Children {
-			r.layout(child, overlayPlace(child, bounds), clip)
+		parentNormal := normalLayoutBounds(r.layoutMeta, bounds)
+		children := node.Children
+		if node.Handle == r.paintOwner {
+			children = paintContextChildren(node.Children)
+		}
+		for _, child := range children {
+			if child == nil || child.Hidden {
+				continue
+			}
+			if isPositionedContext(child) {
+				if placement, ok := r.positionedPlacement(child); ok {
+					r.paintPositioned(placement)
+					continue
+				}
+			}
+			childBounds := overlayPlace(child, bounds)
+			normalChildBounds := overlayPlace(child, parentNormal)
+			if isPositionedContext(child) {
+				if node.Handle == r.paintOwner {
+					r.paintPositionedChild(child, childBounds, clip, parentNormal, r.layoutMeta.scrollAncestors, normalChildBounds, false)
+				} else {
+					r.deferPositionedChild(child, childBounds, clip, parentNormal, r.layoutMeta.scrollAncestors, normalChildBounds, false)
+				}
+				continue
+			}
+			r.layoutChild(child, childBounds, clip, parentNormal, r.layoutMeta.scrollAncestors, normalChildBounds, false)
 		}
 	case "scroll":
 		if len(node.Children) == 1 {
 			offset := r.state.Scroll[scrollKey(node)]
-			axis := stringValue(node.Props["axis"], "vertical")
-			childBounds := bounds
-			contentSize := scrollContentSize(node.Children[0], bounds, axis, cpuIntrinsicSize)
-			if axis == "vertical" {
-				offset.Y = min(max(0, offset.Y), contentSize-bounds.Dy())
-				offset.X = 0
-				childBounds = bounds.Sub(offset)
-				childBounds.Max.Y = childBounds.Min.Y + contentSize
+			plan := planScroll(node, bounds, cpuIntrinsicSize)
+			normalPlan := planScroll(node, normalLayoutBounds(r.layoutMeta, bounds), cpuIntrinsicSize)
+			offset = clampScrollOffset(offset, plan)
+			r.result.Scroll[node.Handle] = scrollMetrics(plan)
+			childBounds := plan.ContentRect.Sub(offset)
+			ancestors := append(append([]string(nil), r.layoutMeta.scrollAncestors...), node.Handle)
+			translation := r.layoutMeta.ancestorTranslation.Sub(offset)
+			scrollports := append(append([]stickyScrollport(nil), r.layoutMeta.scrollports...), stickyScrollport{
+				NormalViewport: normalPlan.Viewport, Viewport: plan.Viewport,
+				Translation: r.layoutMeta.ancestorTranslation, Offset: offset,
+			})
+			child := node.Children[0]
+			childClip := clip.Intersect(plan.Viewport)
+			if isPositionedContext(child) {
+				r.deferPositionedChild(child, childBounds, childClip, normalPlan.Viewport, ancestors, normalPlan.ContentRect, true)
 			} else {
-				offset.X = min(max(0, offset.X), contentSize-bounds.Dx())
-				offset.Y = 0
-				childBounds = bounds.Sub(offset)
-				childBounds.Max.X = childBounds.Min.X + contentSize
+				r.layoutChildInScroll(child, childBounds, childClip, normalPlan.Viewport, ancestors, normalPlan.ContentRect, true, scrollports, translation)
 			}
-			r.layoutFinal(node.Children[0], childBounds, clip.Intersect(bounds))
-			if boolValue(node.Props["scrollbar"], false) && contentSize > func() int {
-				if axis == "vertical" {
-					return bounds.Dy()
-				}
-				return bounds.Dx()
-			}() {
-				r.paintScrollbar(bounds, clip, axis, contentSize, offset)
-			}
+			r.paintDerivedScrollbars(node, plan, offset, clip.Intersect(plan.Viewport))
 		}
 	case "divider":
 		thickness := max(1, int(number(node.Props["thickness"], 1)))
@@ -339,9 +652,54 @@ func (r *renderer) layoutNode(node *project.Node, bounds, clip image.Rectangle, 
 	case "image":
 		r.image(node, bounds, clip)
 	default:
-		for _, child := range node.Children {
-			r.layout(child, place(child, bounds), clip)
+		parentNormal := normalLayoutBounds(r.layoutMeta, bounds)
+		children := node.Children
+		if node.Handle == r.paintOwner {
+			children = paintContextChildren(node.Children)
 		}
+		for _, child := range children {
+			if child == nil || child.Hidden {
+				continue
+			}
+			if isPositionedContext(child) {
+				if placement, ok := r.positionedPlacement(child); ok {
+					r.paintPositioned(placement)
+					continue
+				}
+			}
+			childBounds := place(child, bounds)
+			normalChildBounds := place(child, parentNormal)
+			if isPositionedContext(child) {
+				if node.Handle == r.paintOwner {
+					r.paintPositionedChild(child, childBounds, clip, parentNormal, r.layoutMeta.scrollAncestors, normalChildBounds, false)
+				} else {
+					r.deferPositionedChild(child, childBounds, clip, parentNormal, r.layoutMeta.scrollAncestors, normalChildBounds, false)
+				}
+				continue
+			}
+			r.layoutChild(child, childBounds, clip, parentNormal, r.layoutMeta.scrollAncestors, normalChildBounds, false)
+		}
+	}
+}
+
+func (r *renderer) paintDerivedScrollbars(node *project.Node, plan scrollPlan, offset image.Point, clip image.Rectangle) {
+	bars := planScrollbars(node, plan, offset)
+	for _, bar := range bars {
+		descriptor := semantic.DerivedDescriptor{
+			OwnerHandle: node.Handle, Axis: bar.Axis, Policy: bar.Policy,
+			Track: bar.Track, Thumb: bar.Thumb, Corner: bar.Corner,
+			Bounds: bar.Track, Clip: clip, PaintOrder: r.paintOrder,
+			Offset: bar.Offset, Maximum: bar.Maximum, Viewport: bar.Viewport, Content: bar.Content, Enabled: bar.Enabled,
+			ViewportSize: plan.Viewport.Size(), ContentSize: plan.ContentSize,
+		}
+		r.result.Derived = append(r.result.Derived, descriptor)
+		r.paintRounded(bar.Track, clip, scrollbarTrackColor, 4)
+		r.paintRounded(bar.Thumb, clip, scrollbarThumbColor, 4)
+		if !bar.Corner.Empty() {
+			r.paintRect(bar.Corner, clip, scrollbarTrackColor, 1)
+			r.paintOrder++
+		}
+		r.paintOrder += 3
 	}
 }
 
@@ -400,26 +758,10 @@ func semanticContext(state State) semantic.Context {
 	}
 }
 
-func (r *renderer) paintScrollbar(bounds, clip image.Rectangle, axis string, contentSize int, offset image.Point) {
-	const thickness = 5
-	if axis == "vertical" {
-		thumbSize := max(18, bounds.Dy()*bounds.Dy()/contentSize)
-		travel := bounds.Dy() - thumbSize
-		position := 0
-		if contentSize > bounds.Dy() {
-			position = offset.Y * travel / (contentSize - bounds.Dy())
-		}
-		r.paintRounded(image.Rect(bounds.Max.X-thickness-2, bounds.Min.Y+position, bounds.Max.X-2, bounds.Min.Y+position+thumbSize), clip, color.RGBA{R: 80, G: 88, B: 104, A: 130}, thickness/2)
-		return
-	}
-	thumbSize := max(18, bounds.Dx()*bounds.Dx()/contentSize)
-	travel := bounds.Dx() - thumbSize
-	position := 0
-	if contentSize > bounds.Dx() {
-		position = offset.X * travel / (contentSize - bounds.Dx())
-	}
-	r.paintRounded(image.Rect(bounds.Min.X+position, bounds.Max.Y-thickness-2, bounds.Min.X+position+thumbSize, bounds.Max.Y-2), clip, color.RGBA{R: 80, G: 88, B: 104, A: 130}, thickness/2)
-}
+// Scrollbar colors are stored as non-premultiplied colors so CPU's RGBA
+// adapter and Gio's NRGBA adapter preserve the same authored channels.
+var scrollbarTrackColor = color.NRGBA{R: 80, G: 88, B: 104, A: 50}
+var scrollbarThumbColor = color.NRGBA{R: 80, G: 88, B: 104, A: 130}
 
 func (r *renderer) paintSurface(node *project.Node, bounds, clip image.Rectangle) {
 	if shadow, ok := node.Props["shadow"].(map[string]any); ok {
@@ -817,8 +1159,42 @@ func (r *renderer) stack(node *project.Node, bounds, clip image.Rectangle) {
 	children := visibleLayoutChildren(node.Children)
 	clone := *node
 	clone.Children = children
-	for index, childBounds := range planStack(&clone, bounds, cpuIntrinsicSize) {
-		r.layoutFinal(children[index], childBounds, clip)
+	normalBounds := normalLayoutBounds(r.layoutMeta, bounds)
+	normalInner := inset(normalBounds, insets(node.Props["padding"]))
+	normalRects := planStack(&clone, normalBounds, cpuIntrinsicSize)
+	finalRects := planStack(&clone, bounds, cpuIntrinsicSize)
+	flowRects := make(map[*project.Node][2]image.Rectangle, len(children))
+	for index, child := range children {
+		flowRects[child] = [2]image.Rectangle{finalRects[index], normalRects[index]}
+	}
+	for _, child := range node.Children {
+		if child == nil || child.Hidden || !isPositionedContext(child) {
+			continue
+		}
+		if rects, ok := flowRects[child]; ok {
+			r.deferPositionedChild(child, rects[0], clip, normalInner, r.layoutMeta.scrollAncestors, rects[1], true)
+		} else {
+			r.deferPositionedChild(child, bounds, clip, normalInner, r.layoutMeta.scrollAncestors, bounds, false)
+		}
+	}
+	for _, child := range paintChildrenForNode(node, r.paintOwner) {
+		if isPositionedContext(child) {
+			if placement, ok := r.positionedPlacement(child); ok {
+				r.paintPositioned(placement)
+				continue
+			}
+			if rects, ok := flowRects[child]; ok {
+				r.paintPositionedChild(child, rects[0], clip, normalInner, r.layoutMeta.scrollAncestors, rects[1], true)
+			} else {
+				r.paintPositionedChild(child, bounds, clip, normalInner, r.layoutMeta.scrollAncestors, bounds, false)
+			}
+			continue
+		}
+		if child == nil || child.Hidden {
+			continue
+		}
+		rects := flowRects[child]
+		r.layoutChild(child, rects[0], clip, normalInner, r.layoutMeta.scrollAncestors, rects[1], true)
 	}
 }
 
@@ -886,7 +1262,23 @@ func (r *renderer) grid(node *project.Node, bounds, clip image.Rectangle) {
 	}
 	columnSizes := tracks(columnDefs, bounds.Dx(), gap)
 	rowSizes := tracks(rowDefs, bounds.Dy(), gap)
-	for index, child := range children {
+	normalBounds := normalLayoutBounds(r.layoutMeta, bounds)
+	normalColumnSizes := tracks(columnDefs, normalBounds.Dx(), gap)
+	normalRowSizes := tracks(rowDefs, normalBounds.Dy(), gap)
+	type gridRects struct {
+		final  image.Rectangle
+		normal image.Rectangle
+	}
+	flowRects := make(map[*project.Node]gridRects, len(children))
+	flowIndex := 0
+	for _, child := range node.Children {
+		if isFixedPositioned(child) {
+			continue
+		}
+		if child == nil || child.Hidden {
+			continue
+		}
+		index := flowIndex
 		column := index % columns
 		row := index / columns
 		if value, ok := child.Place["column"]; ok {
@@ -906,7 +1298,39 @@ func (r *renderer) grid(node *project.Node, bounds, clip image.Rectangle) {
 		childBounds := image.Rect(
 			x, y, x+width, y+height,
 		)
-		r.layout(child, childBounds, clip)
+		normalX := normalBounds.Min.X + trackOffset(normalColumnSizes, column, gap)
+		normalY := normalBounds.Min.Y + trackOffset(normalRowSizes, row, gap)
+		normalChildBounds := image.Rect(normalX, normalY, normalX+trackSpan(normalColumnSizes, column, columnSpan, gap), normalY+trackSpan(normalRowSizes, row, rowSpan, gap))
+		flowRects[child] = gridRects{final: childBounds, normal: normalChildBounds}
+		flowIndex++
+	}
+	for _, child := range node.Children {
+		if child == nil || child.Hidden || !isPositionedContext(child) {
+			continue
+		}
+		if rects, ok := flowRects[child]; ok {
+			r.deferPositionedChild(child, rects.final, clip, normalBounds, r.layoutMeta.scrollAncestors, rects.normal, false)
+		} else {
+			r.deferPositionedChild(child, bounds, clip, normalBounds, r.layoutMeta.scrollAncestors, bounds, false)
+		}
+	}
+	for _, child := range paintChildrenForNode(node, r.paintOwner) {
+		if isPositionedContext(child) {
+			if placement, ok := r.positionedPlacement(child); ok {
+				r.paintPositioned(placement)
+			} else if rects, ok := flowRects[child]; ok {
+				r.paintPositionedChild(child, rects.final, clip, normalBounds, r.layoutMeta.scrollAncestors, rects.normal, false)
+			}
+			continue
+		}
+		if child == nil || child.Hidden {
+			continue
+		}
+		rects, ok := flowRects[child]
+		if !ok {
+			continue
+		}
+		r.layoutChild(child, rects.final, clip, normalBounds, r.layoutMeta.scrollAncestors, rects.normal, false)
 	}
 }
 

@@ -13,7 +13,6 @@ import (
 	"gioui.org/app"
 	"gioui.org/io/event"
 	"gioui.org/io/key"
-	"gioui.org/io/pointer"
 	"gioui.org/io/system"
 	"gioui.org/layout"
 	"gioui.org/op"
@@ -117,57 +116,32 @@ func layoutAppContent(gtx layout.Context, theme *material.Theme, runtime *Runtim
 	previewGtx := gtx
 	previewGtx.Constraints = layout.Exact(pixelSize)
 	result := state.preview.Layout(previewGtx, theme, snapshot.Root, snapshot.Viewport, liveRenderState(snapshot, gtx.Now, state.caretBlinkStart))
-	layoutPreviewScrollbar(previewGtx, theme, runtime, state, snapshot, result, window)
 	state.runtimeTree = result.Tree
-	runtime.PublishTree(result.Tree)
+	runtime.PublishFrame(result.Tree, result.Scroll)
 	state.router.Update(state.runtimeTree)
 	if state.router.Transient() != snapshot.Transient {
 		runtime.SetTransient(state.router.Transient())
 		window.Invalidate()
 	}
+	runtime.PublishRouterSnapshot(state.router.Snapshot())
 	hardClip.Pop()
 	return layout.Dimensions{Size: pixelSize}
 }
 
 func handleAppActions(gtx layout.Context, runtime *Runtime, state *uiState, snapshot Snapshot, window *app.Window) {
 	handleDocumentInteraction(gtx, runtime, state, window)
-	horizontal, vertical := appScrollEvents(gtx, state)
-	axis, delta := dominantPageScroll(horizontal, vertical)
-	if delta == 0 {
+	scrollEvents := collectCanvasScrollEvents(gtx, state)
+	// Command-modified scroll belongs to the host zoom gesture. The app host
+	// has no zoom control, so consume the event without mutating document state.
+	if scrollEvents.zoom != 0 || state.router.ScrollbarPointerOwned() || len(scrollEvents.events) == 0 {
 		return
 	}
 	scale := gtx.Metric.PxPerDp
 	if scale <= 0 {
 		scale = 1
 	}
-	logicalDelta := int(math.Round(float64(delta / scale)))
-	if logicalDelta == 0 {
-		logicalDelta = 1
-		if delta < 0 {
-			logicalDelta = -1
-		}
-	}
-	scrollDocument(runtime, state, snapshot, axis, logicalDelta)
-	window.Invalidate()
-}
-
-func appScrollEvents(gtx layout.Context, state *uiState) (horizontal, vertical float32) {
-	filter := trackpadZoomFilter(state)
-	for {
-		raw, ok := gtx.Event(filter)
-		if !ok {
-			return horizontal, vertical
-		}
-		event, ok := raw.(pointer.Event)
-		if !ok {
-			continue
-		}
-		axis, delta := canvasScrollDelta(event)
-		if axis == "horizontal" {
-			horizontal += delta
-		} else {
-			vertical += delta
-		}
+	if routeScrollEvents(runtime, state, snapshot, scrollEvents.events, scale, nil) {
+		window.Invalidate()
 	}
 }
 

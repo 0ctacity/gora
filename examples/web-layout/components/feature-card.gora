@@ -35,11 +35,11 @@ root:
       props: { direction: vertical, gap: 12, alignment: start }
       children:
         - type: text
-          props: { text: { ref: parameter.eyebrow }, size: 10, weight: 700, letter_spacing: 1.2, color: { ref: theme.color.primary }, font: ../../dashboard/assets/StudioSans.ttf }
+          props: { text: { ref: parameter.eyebrow }, size: 10, weight: 700, letter_spacing: 1.2, color: { ref: theme.color.primary }, font: ../assets/StudioSans.ttf }
         - type: text
-          props: { text: { ref: parameter.title }, size: 22, weight: 700, color: { ref: theme.color.ink }, font: ../../dashboard/assets/StudioSans.ttf }
+          props: { text: { ref: parameter.title }, size: 22, weight: 700, color: { ref: theme.color.ink }, font: ../assets/StudioSans.ttf }
         - type: text
-          props: { text: { ref: parameter.description }, size: 13, line_height: 20, wrap: true, color: { ref: theme.color.muted }, font: ../../dashboard/assets/StudioSans.ttf }
+          props: { text: { ref: parameter.description }, size: 13, line_height: 20, wrap: true, color: { ref: theme.color.muted }, font: ../assets/StudioSans.ttf }
         - type: spacer
           place: { grow: 1 }
         - type: surface

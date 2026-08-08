@@ -165,6 +165,10 @@ func (r *Registry) OpenView(projectID, file string) (ViewSummary, error) {
 				project.sources[filepath.Clean(dependency)] = true
 			}
 		}
+		// Publish the initial valid reference frame eagerly so automation clients
+		// can wait immediately after opening a view. Invalid views remain open
+		// with diagnostics and simply have no last-good frame yet.
+		_, _ = view.runtime.RuntimeTree()
 	}
 	project.revision++
 	project.refreshWatchLocked()
@@ -201,6 +205,9 @@ func (r *Registry) CloseView(projectID, viewID string) error {
 	delete(project.byEntry, view.entry)
 	project.revision++
 	project.mu.Unlock()
+	if view.runtime != nil {
+		view.runtime.Close()
+	}
 	return nil
 }
 
@@ -282,10 +289,19 @@ func (p *Project) close() {
 		p.watch.Close()
 	}
 	p.mu.Lock()
+	views := make([]*View, 0, len(p.views))
+	for _, view := range p.views {
+		views = append(views, view)
+	}
 	p.views = make(map[string]*View)
 	p.byEntry = make(map[string]string)
 	p.sources = make(map[string]bool)
 	p.mu.Unlock()
+	for _, view := range views {
+		if view.runtime != nil {
+			view.runtime.Close()
+		}
+	}
 }
 
 func (v *View) summary() ViewSummary {

@@ -84,6 +84,34 @@ type EditingStore struct {
 	revision uint64
 }
 
+// FieldSnapshot is the public immutable editing metadata exposed to automation.
+// It intentionally excludes undo/redo history and internal layout offsets.
+type FieldSnapshot struct {
+	ID               string            `json:"id"`
+	Draft            string            `json:"draft"`
+	Committed        any               `json:"committed,omitempty"`
+	SelectionStart   int               `json:"selection_start"`
+	SelectionEnd     int               `json:"selection_end"`
+	Composition      string            `json:"composition,omitempty"`
+	CompositionStart int               `json:"composition_start,omitempty"`
+	CompositionEnd   int               `json:"composition_end,omitempty"`
+	Composing        bool              `json:"composing"`
+	Focused          bool              `json:"focused"`
+	Dirty            bool              `json:"dirty"`
+	Touched          bool              `json:"touched"`
+	Valid            bool              `json:"valid"`
+	Validated        bool              `json:"validated"`
+	Issues           []ValidationIssue `json:"issues,omitempty"`
+}
+
+// EditingStoreSnapshot is an immutable read-only copy of public field
+// metadata. The fields map is keyed by semantic ID and contains no editor
+// history or implementation-only geometry state.
+type EditingStoreSnapshot struct {
+	Revision uint64                   `json:"revision"`
+	Fields   map[string]FieldSnapshot `json:"fields"`
+}
+
 func NewEditingStore() *EditingStore {
 	return &EditingStore{fields: make(map[string]*EditingState)}
 }
@@ -144,6 +172,34 @@ func (s *EditingStore) States() map[string]EditingState {
 		result[id], _ = s.State(id)
 	}
 	return result
+}
+
+// Snapshot returns a deep copy of the complete visible editing store.
+func (s *EditingStore) Snapshot() EditingStoreSnapshot {
+	if s == nil {
+		return EditingStoreSnapshot{Fields: map[string]FieldSnapshot{}}
+	}
+	fields := make(map[string]FieldSnapshot, len(s.fields))
+	for id, state := range s.fields {
+		fields[id] = FieldSnapshot{
+			ID:               id,
+			Draft:            state.Draft,
+			Committed:        state.Committed,
+			SelectionStart:   state.SelectionStart,
+			SelectionEnd:     state.SelectionEnd,
+			Composition:      state.Composition,
+			CompositionStart: state.CompositionStart,
+			CompositionEnd:   state.CompositionEnd,
+			Composing:        state.Composing,
+			Focused:          state.Focused,
+			Dirty:            state.Dirty,
+			Touched:          state.Touched,
+			Valid:            state.Valid,
+			Validated:        state.Validated,
+			Issues:           append([]ValidationIssue(nil), state.Issues...),
+		}
+	}
+	return EditingStoreSnapshot{Revision: s.revision, Fields: fields}
 }
 
 // SyncCommitted replaces drafts whose underlying lexical state changed outside

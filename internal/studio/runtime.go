@@ -3,6 +3,7 @@ package studio
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"net/url"
@@ -25,55 +26,146 @@ import (
 )
 
 type Snapshot struct {
-	Root               *project.Node
-	Viewport           image.Point
-	Screen             string
-	Screens            []string
-	Invalid            bool
-	Diagnostics        []document.Diagnostic
-	Scroll             map[string]image.Point
-	Transient          interaction.Transient
-	StateValues        map[string]map[string]any
-	Editing            map[string]interaction.EditingState
-	EditingRevision    uint64
-	Revision           uint64
-	NavigationRevision uint64
-	HasState           bool
-	CanBack            bool
-	CanForward         bool
-	Kind               document.Kind
-	Document           string
-	RuntimeRevision    uint64
+	Root                      *project.Node
+	Viewport                  image.Point
+	Screen                    string
+	Screens                   []string
+	Invalid                   bool
+	Diagnostics               []document.Diagnostic
+	Scroll                    map[string]image.Point
+	Transient                 interaction.Transient
+	StateValues               map[string]map[string]any
+	Editing                   map[string]interaction.EditingState
+	EditingRevision           uint64
+	Revision                  uint64
+	NavigationRevision        uint64
+	HasState                  bool
+	CanBack                   bool
+	CanForward                bool
+	Kind                      document.Kind
+	Document                  string
+	RuntimeRevision           uint64
+	FrameRevision             uint64
+	GeometryRevision          uint64
+	PublishedRuntimeRevision  uint64
+	PublishedGeometryRevision uint64
+	ReloadRevision            uint64
+	AutomationInputRevision   uint64
+	PublishedValid            bool
+	publicationStreak         uint64
 }
 
+// AutomationSnapshot is the immutable, JSON-ready Phase-1 synchronization and
+// transient-inspection envelope for one headless view.
+type AutomationSnapshot struct {
+	SchemaVersion             int    `json:"schema_version"`
+	RuntimeRevision           uint64 `json:"runtime_revision"`
+	GeometryRevision          uint64 `json:"geometry_revision"`
+	FrameRevision             uint64 `json:"frame_revision"`
+	PublishedRuntimeRevision  uint64 `json:"published_runtime_revision"`
+	PublishedGeometryRevision uint64 `json:"published_geometry_revision"`
+	ReloadRevision            uint64 `json:"reload_revision"`
+	AutomationInputRevision   uint64 `json:"automation_input_revision"`
+	publicationStreak         uint64
+	Agreement                 bool                             `json:"agreement"`
+	RuntimePublished          bool                             `json:"runtime_published"`
+	GeometryPublished         bool                             `json:"geometry_published"`
+	Idle                      bool                             `json:"idle"`
+	IdleReasons               []string                         `json:"idle_reasons"`
+	PendingAutomationInput    bool                             `json:"pending_automation_input"`
+	PendingCapture            bool                             `json:"pending_capture"`
+	CandidateReload           bool                             `json:"candidate_reload"`
+	UnpublishedGeometry       bool                             `json:"unpublished_geometry"`
+	Selection                 string                           `json:"selection,omitempty"`
+	Selections                []string                         `json:"selections"`
+	FocusOrder                []string                         `json:"focus_order"`
+	Viewport                  image.Point                      `json:"viewport"`
+	Diagnostics               []document.Diagnostic            `json:"diagnostics"`
+	Valid                     bool                             `json:"valid"`
+	LastGoodAvailable         bool                             `json:"last_good_available"`
+	Transient                 interaction.Transient            `json:"transient"`
+	Router                    interaction.RouterSnapshot       `json:"router"`
+	Editing                   interaction.EditingStoreSnapshot `json:"editing"`
+	CurrentFieldID            string                           `json:"current_field_id,omitempty"`
+	CurrentField              *interaction.FieldSnapshot       `json:"current_field,omitempty"`
+	StateValues               map[string]map[string]any        `json:"state_values"`
+	Scroll                    map[string]image.Point           `json:"scroll"`
+	QueueSizes                interaction.RouterQueueSizes     `json:"queue_sizes"`
+	publicationStartFrame     uint64
+}
+
+type WaitForViewRequest struct {
+	AfterFrameRevision    uint64
+	AfterFrameSet         bool
+	AfterRuntimeRevision  uint64
+	AfterRuntimeSet       bool
+	Condition             string
+	StableFrames          int
+	Timeout               time.Duration
+	AllowAlreadySatisfied bool
+}
+
+var ErrRuntimeClosed = errors.New("runtime is closed")
+
+type WaitTimeoutError struct {
+	Snapshot AutomationSnapshot
+}
+
+func (e *WaitTimeoutError) Error() string { return "timed out waiting for view publication" }
+
 type Runtime struct {
-	mu                       sync.RWMutex
-	reloadMu                 sync.Mutex
-	root                     string
-	entry                    string
-	loaded                   *project.Loaded
-	selected                 string
-	viewport                 image.Point
-	viewportExplicit         bool
-	diagnostics              []document.Diagnostic
-	invalid                  bool
-	scroll                   map[string]image.Point
-	state                    *interaction.Store
-	editing                  *interaction.EditingStore
-	navigation               *navigation.History
-	navigationRevision       uint64
-	runtimeRevision          uint64
-	effectiveRoot            *project.Node
-	effectiveSource          *project.Node
-	effectiveScreen          string
-	effectiveRevision        uint64
-	effectiveEditingRevision uint64
-	effectiveTransient       interaction.Transient
-	publishedTree            *semantic.Node
+	mu                        sync.RWMutex
+	reloadMu                  sync.Mutex
+	root                      string
+	entry                     string
+	loaded                    *project.Loaded
+	selected                  string
+	viewport                  image.Point
+	viewportExplicit          bool
+	diagnostics               []document.Diagnostic
+	invalid                   bool
+	scroll                    map[string]image.Point
+	state                     *interaction.Store
+	editing                   *interaction.EditingStore
+	navigation                *navigation.History
+	navigationRevision        uint64
+	runtimeRevision           uint64
+	effectiveRoot             *project.Node
+	effectiveSource           *project.Node
+	effectiveScreen           string
+	effectiveRevision         uint64
+	effectiveEditingRevision  uint64
+	effectiveTransient        interaction.Transient
+	publishedTree             *semantic.Node
+	publishedScroll           map[string]render.ScrollMetrics
+	router                    *interaction.Router
+	routerSnapshot            interaction.RouterSnapshot
+	routerSnapshotSet         bool
+	frameRevision             uint64
+	geometryRevision          uint64
+	publishedRuntimeRevision  uint64
+	publishedGeometryRevision uint64
+	reloadRevision            uint64
+	automationInputRevision   uint64
+	publishedValid            bool
+	publicationStreak         uint64
+	publicationStartFrame     uint64
+	syncCh                    chan struct{}
+	doneCh                    chan struct{}
+	closed                    bool
+	candidateReload           bool
+}
+
+func newRuntime(root, entry string) *Runtime {
+	return &Runtime{
+		root: root, entry: entry, scroll: make(map[string]image.Point),
+		state: interaction.NewStore(), editing: interaction.NewEditingStore(),
+		router: interaction.NewRouter(), syncCh: make(chan struct{}), doneCh: make(chan struct{}),
+	}
 }
 
 func NewRuntime(root, entry string) (*Runtime, error) {
-	runtime := &Runtime{root: root, entry: entry, scroll: make(map[string]image.Point), state: interaction.NewStore(), editing: interaction.NewEditingStore()}
+	runtime := newRuntime(root, entry)
 	runtime.Reload()
 	runtime.mu.RLock()
 	defer runtime.mu.RUnlock()
@@ -86,14 +178,57 @@ func NewRuntime(root, entry string) (*Runtime, error) {
 // NewRuntimeAllowInvalid creates a headless-compatible runtime while retaining
 // diagnostics when the initial source has no valid frame.
 func NewRuntimeAllowInvalid(root, entry string) *Runtime {
-	runtime := &Runtime{root: root, entry: entry, scroll: make(map[string]image.Point), state: interaction.NewStore(), editing: interaction.NewEditingStore()}
+	runtime := newRuntime(root, entry)
 	runtime.Reload()
 	return runtime
+}
+
+func (runtime *Runtime) ensureSyncLocked() {
+	if runtime.syncCh == nil {
+		runtime.syncCh = make(chan struct{})
+	}
+	if runtime.doneCh == nil {
+		runtime.doneCh = make(chan struct{})
+	}
+	if runtime.router == nil {
+		runtime.router = interaction.NewRouter()
+	}
+}
+
+// signalLocked wakes all current waiters and replaces the notification
+// channel, keeping waiter storage bounded regardless of publication count.
+func (runtime *Runtime) signalLocked() {
+	runtime.ensureSyncLocked()
+	previous := runtime.syncCh
+	runtime.syncCh = make(chan struct{})
+	close(previous)
+}
+
+// Close wakes every automation waiter and releases the runtime's synchronization
+// resources. It is idempotent so project/view/server teardown can compose.
+func (runtime *Runtime) Close() {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	runtime.ensureSyncLocked()
+	if runtime.closed {
+		return
+	}
+	runtime.closed = true
+	close(runtime.doneCh)
+	runtime.signalLocked()
 }
 
 func (runtime *Runtime) Reload() {
 	runtime.reloadMu.Lock()
 	defer runtime.reloadMu.Unlock()
+	runtime.mu.Lock()
+	runtime.ensureSyncLocked()
+	if runtime.closed {
+		runtime.mu.Unlock()
+		return
+	}
+	runtime.candidateReload = true
+	runtime.mu.Unlock()
 	runtime.mu.RLock()
 	width := runtime.viewport.X
 	viewportExplicit := runtime.viewportExplicit
@@ -111,10 +246,13 @@ func (runtime *Runtime) Reload() {
 
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
+	runtime.candidateReload = false
+	runtime.reloadRevision++
 	if loaded == nil || len(diagnostics) != 0 {
 		runtime.diagnostics = append([]document.Diagnostic(nil), diagnostics...)
 		runtime.invalid = true
 		runtime.runtimeRevision++
+		runtime.signalLocked()
 		return
 	}
 	previousScreen := runtime.selected
@@ -165,11 +303,13 @@ func (runtime *Runtime) Reload() {
 	runtime.effectiveRoot = nil
 	runtime.pruneScroll(loaded)
 	runtime.runtimeRevision++
+	runtime.signalLocked()
 }
 
 func (runtime *Runtime) Snapshot() Snapshot {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
+	runtime.ensureSyncLocked()
 	if runtime.state == nil {
 		runtime.state = interaction.NewStore()
 	}
@@ -182,6 +322,13 @@ func (runtime *Runtime) Snapshot() Snapshot {
 		Revision:           runtime.state.Revision(),
 		NavigationRevision: runtime.navigationRevision,
 		Document:           runtime.entry, RuntimeRevision: runtime.runtimeRevision,
+		FrameRevision: runtime.frameRevision, GeometryRevision: runtime.geometryRevision,
+		PublishedRuntimeRevision:  runtime.publishedRuntimeRevision,
+		PublishedGeometryRevision: runtime.publishedGeometryRevision,
+		ReloadRevision:            runtime.reloadRevision,
+		AutomationInputRevision:   runtime.automationInputRevision,
+		PublishedValid:            runtime.publishedValid,
+		publicationStreak:         runtime.publicationStreak,
 	}
 	if runtime.editing != nil {
 		snapshot.Editing = runtime.editing.States()
@@ -223,9 +370,291 @@ func (runtime *Runtime) Snapshot() Snapshot {
 		} else {
 			runtime.effectiveRoot = interaction.ResolvePersistentTreeWithFields(snapshot.Root, snapshot.StateValues, snapshot.Editing, snapshot.Screen)
 		}
+		runtime.geometryRevision++
 	}
 	snapshot.Root = runtime.effectiveRoot
+	snapshot.GeometryRevision = runtime.geometryRevision
 	return snapshot
+}
+
+// AutomationSnapshot returns the latest immutable synchronization and
+// transient-state view. It never consumes router or editing queues.
+func (runtime *Runtime) AutomationSnapshot() AutomationSnapshot {
+	snapshot := runtime.Snapshot()
+	runtime.mu.RLock()
+	defer runtime.mu.RUnlock()
+	routerSnapshot := runtime.routerSnapshot
+	if !runtime.routerSnapshotSet {
+		routerSnapshot = runtime.router.Snapshot()
+	}
+	editingSnapshot := interaction.EditingStoreSnapshot{Fields: map[string]interaction.FieldSnapshot{}}
+	if runtime.editing != nil {
+		editingSnapshot = runtime.editing.Snapshot()
+	}
+	result := AutomationSnapshot{
+		SchemaVersion:             1,
+		RuntimeRevision:           snapshot.RuntimeRevision,
+		GeometryRevision:          snapshot.GeometryRevision,
+		FrameRevision:             snapshot.FrameRevision,
+		PublishedRuntimeRevision:  snapshot.PublishedRuntimeRevision,
+		PublishedGeometryRevision: snapshot.PublishedGeometryRevision,
+		ReloadRevision:            snapshot.ReloadRevision,
+		AutomationInputRevision:   snapshot.AutomationInputRevision,
+		publicationStreak:         snapshot.publicationStreak,
+		Selection:                 snapshot.Screen,
+		Selections:                append([]string(nil), snapshot.Screens...),
+		FocusOrder:                focusOrderIDs(runtime.publishedTree),
+		Viewport:                  snapshot.Viewport,
+		Diagnostics:               append([]document.Diagnostic(nil), snapshot.Diagnostics...),
+		Valid:                     !snapshot.Invalid,
+		LastGoodAvailable:         snapshot.Root != nil,
+		Transient: interaction.Transient{
+			Focused: routerSnapshot.FocusedID, OpenSelect: routerSnapshot.OpenSelectID,
+		},
+		Router:                routerSnapshot,
+		Editing:               editingSnapshot,
+		StateValues:           cloneStateValues(snapshot.StateValues),
+		Scroll:                cloneScroll(snapshot.Scroll),
+		QueueSizes:            routerSnapshot.QueueSizes,
+		IdleReasons:           []string{},
+		publicationStartFrame: runtime.publicationStartFrame,
+	}
+	if len(routerSnapshot.HoveredIDs) != 0 {
+		result.Transient.Hovered = routerSnapshot.HoveredIDs[0]
+	}
+	if len(routerSnapshot.PressedIDs) != 0 {
+		result.Transient.Pressed = routerSnapshot.PressedIDs[0]
+	}
+	if len(routerSnapshot.ActiveIDs) != 0 {
+		result.Transient.ActiveOption = routerSnapshot.ActiveIDs[0]
+	}
+	result.RuntimePublished = runtime.publishedTree != nil && runtime.publishedValid && !runtime.invalid && !runtime.candidateReload && runtime.publishedRuntimeRevision == runtime.runtimeRevision
+	result.GeometryPublished = result.RuntimePublished && runtime.publishedGeometryRevision == runtime.geometryRevision
+	result.Agreement = result.RuntimePublished && result.GeometryPublished
+	if !result.Agreement {
+		// A stale or invalid candidate cannot contribute to the next stable
+		// publication streak, even though the last-good frame remains retained.
+		result.publicationStreak = 0
+		result.publicationStartFrame = 0
+	}
+	result.CandidateReload = runtime.candidateReload
+	result.UnpublishedGeometry = !result.GeometryPublished
+	result.PendingAutomationInput = routerSnapshot.QueueSizes.ValueChanges != 0 || routerSnapshot.QueueSizes.ScrollChanges != 0
+	// Capture requests are completed synchronously by the existing runtime and
+	// therefore have no pending queue in this phase. Keep the explicit field in
+	// the envelope so a future asynchronous capture path can remain compatible.
+	result.PendingCapture = false
+	if routerSnapshot.FocusedID != "" {
+		if field, ok := editingSnapshot.Fields[routerSnapshot.FocusedID]; ok {
+			result.CurrentFieldID = routerSnapshot.FocusedID
+			copy := field
+			copy.Focused = true
+			copy.Issues = append([]interaction.ValidationIssue(nil), field.Issues...)
+			result.CurrentField = &copy
+		}
+	}
+	if runtime.closed {
+		result.IdleReasons = append(result.IdleReasons, "closed")
+	}
+	if result.CandidateReload {
+		result.IdleReasons = append(result.IdleReasons, "candidate_reload")
+	}
+	if !result.Agreement {
+		result.IdleReasons = append(result.IdleReasons, "unpublished_frame")
+	}
+	if snapshot.Invalid {
+		result.IdleReasons = append(result.IdleReasons, "invalid_source")
+	}
+	if result.PendingAutomationInput {
+		result.IdleReasons = append(result.IdleReasons, "pending_automation_input")
+	}
+	if result.PendingCapture {
+		result.IdleReasons = append(result.IdleReasons, "pending_capture")
+	}
+	result.Idle = len(result.IdleReasons) == 0
+	return result
+}
+
+func cloneStateValues(values map[string]map[string]any) map[string]map[string]any {
+	if values == nil {
+		return map[string]map[string]any{}
+	}
+	result := make(map[string]map[string]any, len(values))
+	for scope, entries := range values {
+		copy := make(map[string]any, len(entries))
+		for name, value := range entries {
+			copy[name] = value
+		}
+		result[scope] = copy
+	}
+	return result
+}
+
+func focusOrderIDs(root *semantic.Node) []string {
+	if root == nil {
+		return []string{}
+	}
+	type focusNode struct {
+		id    string
+		order int
+		index int
+	}
+	items := make([]focusNode, 0)
+	for index, node := range semantic.Flatten(root) {
+		if node == nil || node.ID == "" || !node.Visible || !node.Enabled || node.Bounds == nil || node.FocusOrder < 0 {
+			continue
+		}
+		items = append(items, focusNode{id: node.ID, order: node.FocusOrder, index: index})
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].order != items[j].order {
+			return items[i].order < items[j].order
+		}
+		return items[i].index < items[j].index
+	})
+	result := make([]string, len(items))
+	for index, item := range items {
+		result[index] = item.id
+	}
+	return result
+}
+
+// WaitForView waits on publication notifications rather than polling. The
+// caller may request an immediate result for explicitly satisfied revisions;
+// omitted revisions establish a current-frame barrier.
+func (runtime *Runtime) WaitForView(ctx context.Context, request WaitForViewRequest) (AutomationSnapshot, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if request.Condition == "" {
+		request.Condition = "published"
+	}
+	if request.Condition != "published" && request.Condition != "idle" {
+		return runtime.AutomationSnapshot(), fmt.Errorf("unknown wait condition %q", request.Condition)
+	}
+	if request.StableFrames < 0 {
+		return runtime.AutomationSnapshot(), fmt.Errorf("stable_frames must be non-negative")
+	}
+	if request.StableFrames == 0 {
+		request.StableFrames = 1
+	}
+	if request.Timeout <= 0 {
+		request.Timeout = 5 * time.Second
+	}
+	if request.Timeout > 60*time.Second {
+		request.Timeout = 60 * time.Second
+	}
+	initial := runtime.AutomationSnapshot()
+	baselineFrame := initial.FrameRevision
+	if request.AfterFrameSet {
+		baselineFrame = request.AfterFrameRevision
+	}
+	baselineRuntime := initial.RuntimeRevision
+	if request.AfterRuntimeSet {
+		baselineRuntime = request.AfterRuntimeRevision
+	}
+	requireNewFrame := !request.AllowAlreadySatisfied && !request.AfterFrameSet && !request.AfterRuntimeSet
+	if request.AfterFrameSet || request.AfterRuntimeSet {
+		requireNewFrame = !request.AllowAlreadySatisfied
+	}
+	lastFrame := initial.FrameRevision
+	baselineStreak := initial.publicationStreak
+	stable := waitPublicationCount(initial, request, baselineFrame, baselineRuntime, baselineStreak, requireNewFrame)
+	if stable >= request.StableFrames && (request.AllowAlreadySatisfied || request.AfterFrameSet || request.AfterRuntimeSet) {
+		return initial, nil
+	}
+	deadline := time.NewTimer(request.Timeout)
+	defer deadline.Stop()
+	for {
+		current := runtime.AutomationSnapshot()
+		if current.FrameRevision != lastFrame {
+			lastFrame = current.FrameRevision
+			stable = waitPublicationCount(current, request, baselineFrame, baselineRuntime, baselineStreak, requireNewFrame)
+		} else if stable == 0 && !requireNewFrame {
+			stable = waitPublicationCount(current, request, baselineFrame, baselineRuntime, baselineStreak, false)
+		}
+		if stable >= request.StableFrames {
+			return current, nil
+		}
+		runtime.mu.RLock()
+		notification := runtime.syncCh
+		done := runtime.doneCh
+		closed := runtime.closed
+		frameAtChannel := runtime.frameRevision
+		runtime.mu.RUnlock()
+		if closed {
+			return current, ErrRuntimeClosed
+		}
+		// Close-over the channel and frame under the same lock. If a publication
+		// won the race between the snapshot read and this lock, loop once before
+		// blocking so no notification can be missed.
+		if frameAtChannel != current.FrameRevision {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return current, ctx.Err()
+		case <-deadline.C:
+			return current, &WaitTimeoutError{Snapshot: current}
+		case <-done:
+			return current, ErrRuntimeClosed
+		case <-notification:
+		}
+	}
+}
+
+// waitPublicationCount derives the number of consecutive matching publication
+// transitions available in the current bounded snapshot. publicationStreak is
+// reset by PublishFrame whenever the runtime/geometry revision changes or a
+// candidate is invalid, so a burst of frames remains countable even when a
+// waiter is not scheduled between notifications.
+func waitPublicationCount(snapshot AutomationSnapshot, request WaitForViewRequest, baselineFrame, baselineRuntime, baselineStreak uint64, requireNewFrame bool) int {
+	if !automationWaitMatches(snapshot, request, baselineFrame, baselineRuntime, requireNewFrame) {
+		return 0
+	}
+	if snapshot.FrameRevision <= baselineFrame {
+		return 1
+	}
+	if snapshot.publicationStreak == 0 {
+		return 0
+	}
+	if snapshot.publicationStartFrame != 0 {
+		floor := baselineFrame
+		if snapshot.publicationStartFrame > 0 && snapshot.publicationStartFrame-1 > floor {
+			floor = snapshot.publicationStartFrame - 1
+		}
+		if snapshot.FrameRevision <= floor {
+			return 1
+		}
+		count := snapshot.FrameRevision - floor
+		if count > snapshot.publicationStreak {
+			count = snapshot.publicationStreak
+		}
+		return int(count)
+	}
+	if baselineStreak > 0 && snapshot.publicationStreak > baselineStreak {
+		return int(snapshot.publicationStreak - baselineStreak)
+	}
+	return int(snapshot.publicationStreak)
+}
+
+func automationWaitMatches(snapshot AutomationSnapshot, request WaitForViewRequest, baselineFrame, baselineRuntime uint64, requireNewFrame bool) bool {
+	if requireNewFrame && snapshot.FrameRevision <= baselineFrame {
+		return false
+	}
+	if request.AfterFrameSet && snapshot.FrameRevision < request.AfterFrameRevision {
+		return false
+	}
+	if request.AfterRuntimeSet && snapshot.PublishedRuntimeRevision < request.AfterRuntimeRevision {
+		return false
+	}
+	if !request.AfterRuntimeSet && request.AfterFrameSet && snapshot.PublishedRuntimeRevision < baselineRuntime {
+		return false
+	}
+	if request.Condition == "idle" {
+		return snapshot.Idle
+	}
+	return snapshot.Agreement
 }
 
 func (runtime *Runtime) reconcileEditingLocked() {
@@ -355,6 +784,8 @@ func (runtime *Runtime) Activate(activation interaction.Activation) error {
 			transient.ActiveOption = activation.ActiveOption
 		}
 		runtime.state.SetTransient(transient)
+		runtime.ensureSyncLocked()
+		runtime.router.SyncTransient(transient)
 		runtime.effectiveRoot = nil
 		runtime.runtimeRevision++
 		return nil
@@ -469,26 +900,42 @@ func (runtime *Runtime) revealFocusedLocked(handle string) {
 			}
 			if node.Type == "scroll" && node.Bounds != nil {
 				axis, _ := node.Props["axis"].(string)
+				if axis == "" {
+					axis = "vertical"
+				}
 				key := semanticScrollKey(node)
 				offset := runtime.scroll[key]
 				previousOffset := offset
-				if axis == "horizontal" {
-					if bounds.X < node.Bounds.X {
-						offset.X = max(0, offset.X-(node.Bounds.X-bounds.X))
-					} else if bounds.X+bounds.Width > node.Bounds.X+node.Bounds.Width {
-						offset.X += bounds.X + bounds.Width - node.Bounds.X - node.Bounds.Width
-					}
-				} else {
-					if bounds.Y < node.Bounds.Y {
-						offset.Y = max(0, offset.Y-(node.Bounds.Y-bounds.Y))
-					} else if bounds.Y+bounds.Height > node.Bounds.Y+node.Bounds.Height {
-						offset.Y += bounds.Y + bounds.Height - node.Bounds.Y - node.Bounds.Height
+				viewport := node.Bounds.ImageRectangle()
+				enabledX := axis == "horizontal" || axis == "both"
+				enabledY := axis == "vertical" || axis == "both"
+				metrics, published := runtime.publishedScroll[node.Handle]
+				if published {
+					viewport = metrics.Viewport
+					enabledX = metrics.EnabledX
+					enabledY = metrics.EnabledY
+				}
+				if enabledX {
+					if bounds.X < viewport.Min.X {
+						offset.X = max(0, offset.X-(viewport.Min.X-bounds.X))
+					} else if bounds.X+bounds.Width > viewport.Max.X {
+						offset.X += bounds.X + bounds.Width - viewport.Max.X
 					}
 				}
-				if len(node.Children) == 1 && node.Children[0] != nil && node.Children[0].Bounds != nil {
-					if axis == "horizontal" {
+				if enabledY {
+					if bounds.Y < viewport.Min.Y {
+						offset.Y = max(0, offset.Y-(viewport.Min.Y-bounds.Y))
+					} else if bounds.Y+bounds.Height > viewport.Max.Y {
+						offset.Y += bounds.Y + bounds.Height - viewport.Max.Y
+					}
+				}
+				if published {
+					offset = clampScrollPoint(offset, metrics)
+				} else if len(node.Children) == 1 && node.Children[0] != nil && node.Children[0].Bounds != nil {
+					if enabledX {
 						offset.X = min(offset.X, max(0, node.Children[0].Bounds.Width-node.Bounds.Width))
-					} else {
+					}
+					if enabledY {
 						offset.Y = min(offset.Y, max(0, node.Children[0].Bounds.Height-node.Bounds.Height))
 					}
 				}
@@ -665,11 +1112,17 @@ func (runtime *Runtime) SetScrollOffset(key, axis string, value int) {
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
+	if runtime.scroll == nil {
+		runtime.scroll = make(map[string]image.Point)
+	}
 	offset := runtime.scroll[key]
 	if axis == "horizontal" {
 		offset.X = max(0, value)
 	} else {
 		offset.Y = max(0, value)
+	}
+	if offset == runtime.scroll[key] {
+		return
 	}
 	runtime.scroll[key] = offset
 	runtime.runtimeRevision++
@@ -679,6 +1132,12 @@ func (runtime *Runtime) Capture(path string, scale int) (string, error) {
 	snapshot := runtime.Snapshot()
 	if snapshot.Root == nil {
 		return "", fmt.Errorf("no valid frame is available")
+	}
+	if !snapshot.Invalid {
+		if err := runtime.ensurePublishedFrame(); err != nil {
+			return "", err
+		}
+		snapshot = runtime.Snapshot()
 	}
 	if err := render.ValidateOutput(path); err != nil {
 		return "", err
@@ -698,6 +1157,12 @@ func (runtime *Runtime) CapturePNG(scale int) ([]byte, string, error) {
 	if snapshot.Root == nil {
 		return nil, "", fmt.Errorf("no valid frame is available")
 	}
+	if !snapshot.Invalid {
+		if err := runtime.ensurePublishedFrame(); err != nil {
+			return nil, "", err
+		}
+		snapshot = runtime.Snapshot()
+	}
 	data, err := render.CapturePNG(snapshot.Root, snapshot.Viewport, renderState(snapshot), scale)
 	if err != nil {
 		return nil, "", err
@@ -708,20 +1173,72 @@ func (runtime *Runtime) CapturePNG(scale int) ([]byte, string, error) {
 	return data, "", nil
 }
 
+func (runtime *Runtime) ensurePublishedFrame() error {
+	runtime.mu.RLock()
+	current := runtime.publishedTree != nil && runtime.publishedValid && !runtime.invalid && runtime.publishedRuntimeRevision == runtime.runtimeRevision && runtime.publishedGeometryRevision == runtime.geometryRevision
+	runtime.mu.RUnlock()
+	if current {
+		return nil
+	}
+	_, err := runtime.runtimeFrame()
+	return err
+}
+
 // RuntimeTree builds the canonical headless semantic tree for the current view.
 func (runtime *Runtime) RuntimeTree() (*semantic.Node, error) {
+	result, err := runtime.runtimeFrame()
+	if err != nil {
+		return nil, err
+	}
+	return result.Tree, nil
+}
+
+func (runtime *Runtime) runtimeFrame() (render.Result, error) {
 	snapshot := runtime.Snapshot()
 	if snapshot.Root == nil {
-		return nil, fmt.Errorf("no valid runtime tree is available")
+		return render.Result{}, fmt.Errorf("no valid runtime tree is available")
 	}
-	tree := render.Render(snapshot.Root, snapshot.Viewport, renderState(snapshot)).Tree
-	runtime.PublishTree(tree)
-	return tree, nil
+	if snapshot.Invalid {
+		// An invalid candidate retains the last-good frame. Returning that
+		// immutable publication keeps RuntimeTree/inspection callers read-only
+		// while diagnostics continue to describe the current source; publishing
+		// it again would fabricate a new frame for an invalid document.
+		runtime.mu.RLock()
+		published := runtime.publishedTree
+		runtime.mu.RUnlock()
+		if published == nil {
+			return render.Result{}, fmt.Errorf("no valid runtime tree is available")
+		}
+		return render.Result{Tree: published}, nil
+	}
+	result := render.Render(snapshot.Root, snapshot.Viewport, renderState(snapshot))
+	runtime.PublishFrame(result.Tree, result.Scroll)
+	return result, nil
+}
+
+// currentRuntimeFrame returns the last published frame when it already agrees
+// with current runtime/geometry revisions. Mutation validation can therefore
+// inspect the current semantic tree without creating a pre-mutation frame;
+// stale or absent frames are rendered and published once.
+func (runtime *Runtime) currentRuntimeFrame() (render.Result, error) {
+	runtime.mu.RLock()
+	if runtime.publishedTree != nil && runtime.publishedValid && !runtime.invalid && runtime.publishedRuntimeRevision == runtime.runtimeRevision && runtime.publishedGeometryRevision == runtime.geometryRevision {
+		result := render.Result{Tree: runtime.publishedTree}
+		runtime.mu.RUnlock()
+		return result, nil
+	}
+	runtime.mu.RUnlock()
+	return runtime.runtimeFrame()
+}
+
+func (runtime *Runtime) currentRuntimeTree() (*semantic.Node, error) {
+	result, err := runtime.currentRuntimeFrame()
+	return result.Tree, err
 }
 
 // ActivateSemanticID performs the completed semantic activation represented by id.
 func (runtime *Runtime) ActivateSemanticID(id string) error {
-	tree, err := runtime.RuntimeTree()
+	tree, err := runtime.currentRuntimeTree()
 	if err != nil {
 		return err
 	}
@@ -767,7 +1284,7 @@ func semanticNodeByHandle(root *semantic.Node, handle string) *semantic.Node {
 // SetFieldDraft replaces one visible editable field's draft and publishes it
 // when the resulting typed value is valid.
 func (runtime *Runtime) SetFieldDraft(id, draft string) error {
-	tree, err := runtime.RuntimeTree()
+	tree, err := runtime.currentRuntimeTree()
 	if err != nil {
 		return err
 	}
@@ -982,7 +1499,7 @@ func (runtime *Runtime) RedoField(id string) bool {
 // SubmitForm validates all enabled descendant fields, publishes their drafts,
 // then performs the form's transactional authored submit effects.
 func (runtime *Runtime) SubmitForm(id string) error {
-	tree, err := runtime.RuntimeTree()
+	tree, err := runtime.currentRuntimeTree()
 	if err != nil {
 		return err
 	}
@@ -1053,7 +1570,7 @@ func (runtime *Runtime) SubmitForm(id string) error {
 
 // ResetForm resets only states bound to fields beneath the selected form.
 func (runtime *Runtime) ResetForm(id string) error {
-	tree, err := runtime.RuntimeTree()
+	tree, err := runtime.currentRuntimeTree()
 	if err != nil {
 		return err
 	}
@@ -1105,7 +1622,7 @@ func initialSelectOption(selectNode *semantic.Node) string {
 // SetControlValue atomically updates the lexical state bound to one visible
 // semantic control and returns its normalized value.
 func (runtime *Runtime) SetControlValue(id string, value any) (any, error) {
-	tree, err := runtime.RuntimeTree()
+	tree, err := runtime.currentRuntimeTree()
 	if err != nil {
 		return nil, err
 	}
@@ -1194,7 +1711,7 @@ func runtimeNumber(value any) (float64, bool) {
 
 // SetStateValues atomically updates one visible lexical state scope.
 func (runtime *Runtime) SetStateValues(scope string, values map[string]any) error {
-	tree, err := runtime.RuntimeTree()
+	tree, err := runtime.currentRuntimeTree()
 	if err != nil {
 		return err
 	}
@@ -1225,7 +1742,7 @@ func (runtime *Runtime) ResetStateScope(scope string) error {
 		runtime.ResetState()
 		return nil
 	}
-	tree, err := runtime.RuntimeTree()
+	tree, err := runtime.currentRuntimeTree()
 	if err != nil {
 		return err
 	}
@@ -1252,11 +1769,11 @@ func (runtime *Runtime) ResetStateScope(scope string) error {
 
 // ScrollSemanticID changes one visible scroll node and clamps it to content extents.
 func (runtime *Runtime) ScrollSemanticID(id, mode string, x, y int) error {
-	snapshot := runtime.Snapshot()
-	if snapshot.Root == nil {
-		return fmt.Errorf("no valid runtime tree is available")
+	result, err := runtime.runtimeFrame()
+	if err != nil {
+		return err
 	}
-	result := render.Render(snapshot.Root, snapshot.Viewport, renderState(snapshot))
+	snapshot := runtime.Snapshot()
 	var semanticNode *semantic.Node
 	for _, node := range semantic.Flatten(result.Tree) {
 		if node.ID == id {
@@ -1264,8 +1781,12 @@ func (runtime *Runtime) ScrollSemanticID(id, mode string, x, y int) error {
 			break
 		}
 	}
-	if semanticNode == nil || semanticNode.Type != "scroll" || !semanticNode.Visible || semanticNode.Bounds == nil || len(semanticNode.Children) != 1 || semanticNode.Children[0].Bounds == nil {
+	derivedAxis := semanticNode != nil && semanticNode.Type == "scrollbar" && semanticNode.Role == "scrollbar"
+	if semanticNode == nil || (!derivedAxis && semanticNode.Type != "scroll") || !semanticNode.Visible || semanticNode.Bounds == nil {
 		return fmt.Errorf("semantic node %q is not a visible scroll node", id)
+	}
+	if derivedAxis && !semanticNode.Enabled {
+		return fmt.Errorf("semantic scrollbar %q is disabled", id)
 	}
 	var source *project.Node
 	var find func(*project.Node)
@@ -1273,7 +1794,11 @@ func (runtime *Runtime) ScrollSemanticID(id, mode string, x, y int) error {
 		if node == nil || source != nil {
 			return
 		}
-		if node.Handle == semanticNode.Handle {
+		handle := semanticNode.Handle
+		if derivedAxis {
+			handle = semanticNode.Group
+		}
+		if node.Handle == handle {
 			source = node
 			return
 		}
@@ -1289,34 +1814,207 @@ func (runtime *Runtime) ScrollSemanticID(id, mode string, x, y int) error {
 	if axis == "" {
 		axis = "vertical"
 	}
+	if derivedAxis {
+		axis = semanticNode.Orientation
+	}
+	metrics, ok := result.Scroll[source.Handle]
+	if !ok {
+		metrics, ok = runtime.publishedScrollMetrics()[source.Handle]
+	}
+	if !ok {
+		return fmt.Errorf("scroll metrics for %q are unavailable", id)
+	}
 	key := project.ScrollKey(source)
 	current := snapshot.Scroll[key]
-	if mode == "by" {
-		x += current.X
-		y += current.Y
-	} else if mode != "to" {
+	// Validate the caller's axis-local operands before composing with the
+	// current point. A derived vertical scrollbar must be able to add Y while
+	// preserving a nonzero X owned by the same both-axis scrollport.
+	if mode != "by" && mode != "to" {
 		return fmt.Errorf("scroll mode must be by or to")
 	}
-	if axis == "horizontal" {
+	switch axis {
+	case "horizontal":
 		if y != 0 {
 			return fmt.Errorf("horizontal scroll does not accept a vertical offset")
 		}
-		maximum := max(0, semanticNode.Children[0].Bounds.Width-semanticNode.Bounds.Width)
-		runtime.SetScrollOffset(key, axis, min(max(0, x), maximum))
-	} else {
+	case "vertical":
 		if x != 0 {
 			return fmt.Errorf("vertical scroll does not accept a horizontal offset")
 		}
-		maximum := max(0, semanticNode.Children[0].Bounds.Height-semanticNode.Bounds.Height)
-		runtime.SetScrollOffset(key, axis, min(max(0, y), maximum))
+	case "both":
+	default:
+		return fmt.Errorf("scroll axis %q is unsupported", axis)
 	}
+	if derivedAxis {
+		if mode == "by" {
+			if axis == "horizontal" {
+				x += current.X
+				y = current.Y
+			} else {
+				x = current.X
+				y += current.Y
+			}
+		} else if axis == "horizontal" {
+			y = current.Y
+		} else {
+			x = current.X
+		}
+	} else if mode == "by" {
+		x += current.X
+		y += current.Y
+	}
+	runtime.setScrollPoint(key, clampScrollPoint(image.Pt(x, y), metrics))
 	return nil
 }
 
 func (runtime *Runtime) PublishTree(tree *semantic.Node) {
+	runtime.PublishFrame(tree, nil)
+}
+
+func (runtime *Runtime) PublishFrame(tree *semantic.Node, scroll ...map[string]render.ScrollMetrics) {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
+	runtime.ensureSyncLocked()
+	nextFrame := runtime.frameRevision + 1
+	validPublication := !runtime.invalid && tree != nil
+	if validPublication && runtime.publishedValid && runtime.publishedRuntimeRevision == runtime.runtimeRevision && runtime.publishedGeometryRevision == runtime.geometryRevision {
+		runtime.publicationStreak++
+	} else if validPublication {
+		runtime.publicationStreak = 1
+		runtime.publicationStartFrame = nextFrame
+	} else {
+		runtime.publicationStreak = 0
+		runtime.publicationStartFrame = 0
+	}
 	runtime.publishedTree = tree
+	var metrics map[string]render.ScrollMetrics
+	if len(scroll) > 0 {
+		metrics = scroll[0]
+	}
+	runtime.publishedScroll = cloneScrollMetrics(metrics)
+	runtime.frameRevision = nextFrame
+	runtime.publishedRuntimeRevision = runtime.runtimeRevision
+	runtime.publishedGeometryRevision = runtime.geometryRevision
+	runtime.publishedValid = validPublication
+	if runtime.state == nil {
+		runtime.state = interaction.NewStore()
+	}
+	runtime.router.SyncTransient(runtime.state.Transient())
+	runtime.router.Update(tree)
+	runtime.routerSnapshot = cloneRouterSnapshot(runtime.router.Snapshot())
+	runtime.routerSnapshotSet = true
+	runtime.signalLocked()
+}
+
+func (runtime *Runtime) publishedScrollMetrics() map[string]render.ScrollMetrics {
+	runtime.mu.RLock()
+	defer runtime.mu.RUnlock()
+	return cloneScrollMetrics(runtime.publishedScroll)
+}
+
+func cloneScrollMetrics(in map[string]render.ScrollMetrics) map[string]render.ScrollMetrics {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]render.ScrollMetrics, len(in))
+	for key, metrics := range in {
+		out[key] = metrics
+	}
+	return out
+}
+
+func clampScrollPoint(offset image.Point, metrics render.ScrollMetrics) image.Point {
+	if metrics.EnabledX {
+		offset.X = min(max(0, offset.X), metrics.Maximum.X)
+	} else {
+		offset.X = 0
+	}
+	if metrics.EnabledY {
+		offset.Y = min(max(0, offset.Y), metrics.Maximum.Y)
+	} else {
+		offset.Y = 0
+	}
+	return offset
+}
+
+// PublishRouterSnapshot stores an immutable copy of the host router's current
+// transient state. Studio and app hosts use this after dispatching native
+// events so automation inspection observes pointer/keyboard ownership without
+// sharing the mutable UI router with the runtime reader. Headless publication
+// continues to use the runtime-owned router through PublishFrame.
+func (runtime *Runtime) PublishRouterSnapshot(snapshot interaction.RouterSnapshot) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	runtime.ensureSyncLocked()
+	copy := cloneRouterSnapshot(snapshot)
+	if reflect.DeepEqual(runtime.routerSnapshot, copy) && runtime.routerSnapshotSet {
+		return
+	}
+	runtime.routerSnapshot = copy
+	runtime.routerSnapshotSet = true
+	runtime.automationInputRevision++
+	runtime.signalLocked()
+}
+
+func cloneRouterSnapshot(snapshot interaction.RouterSnapshot) interaction.RouterSnapshot {
+	copy := snapshot
+	copy.HoveredIDs = append([]string(nil), snapshot.HoveredIDs...)
+	copy.PressedIDs = append([]string(nil), snapshot.PressedIDs...)
+	copy.ActiveIDs = append([]string(nil), snapshot.ActiveIDs...)
+	copy.DisabledIDs = append([]string(nil), snapshot.DisabledIDs...)
+	if snapshot.PointerCapture != nil {
+		capture := *snapshot.PointerCapture
+		copy.PointerCapture = &capture
+	}
+	if snapshot.KeyboardPress != nil {
+		keyboard := *snapshot.KeyboardPress
+		copy.KeyboardPress = &keyboard
+	}
+	return copy
+}
+
+func (runtime *Runtime) setScrollPoint(key string, offset image.Point) bool {
+	if key == "" {
+		return false
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.scroll == nil {
+		runtime.scroll = make(map[string]image.Point)
+	}
+	if runtime.scroll[key] == offset {
+		return false
+	}
+	runtime.scroll[key] = offset
+	runtime.runtimeRevision++
+	return true
+}
+
+func (runtime *Runtime) setScrollPoints(points map[string]image.Point) bool {
+	if len(points) == 0 {
+		return false
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.scroll == nil {
+		runtime.scroll = make(map[string]image.Point)
+	}
+	changed := false
+	for key, offset := range points {
+		if key != "" && runtime.scroll[key] != offset {
+			changed = true
+		}
+	}
+	if !changed {
+		return false
+	}
+	for key, offset := range points {
+		if key != "" {
+			runtime.scroll[key] = offset
+		}
+	}
+	runtime.runtimeRevision++
+	return true
 }
 
 func (runtime *Runtime) Inspect(hostMode string) ([]byte, string, error) {

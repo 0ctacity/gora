@@ -20,11 +20,11 @@ type ScopeSpec struct {
 
 // Transient is the non-persistent interaction state of the selected context.
 type Transient struct {
-	Hovered      string
-	Pressed      string
-	Focused      string
-	OpenSelect   string
-	ActiveOption string
+	Hovered      string `json:"hovered,omitempty"`
+	Pressed      string `json:"pressed,omitempty"`
+	Focused      string `json:"focused,omitempty"`
+	OpenSelect   string `json:"open_select,omitempty"`
+	ActiveOption string `json:"active_option,omitempty"`
 }
 
 type scope struct {
