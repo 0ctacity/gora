@@ -26,6 +26,14 @@ Build the single binary:
 go build -o gora ./cmd/gora
 ```
 
+On Windows, `go build` produces `gora.exe`, and PowerShell invokes local binaries with
+`.\` rather than `./`:
+
+```powershell
+go build -o gora.exe .\cmd\gora
+.\gora.exe validate examples\dashboard\app.gora --root examples\dashboard
+```
+
 ## Try it
 
 Validate an example:
