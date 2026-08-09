@@ -6,10 +6,17 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"image"
+	"image/png"
 	"io"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+
+	"gioui.org/gpu/headless"
+	"gioui.org/op"
+	xdraw "golang.org/x/image/draw"
 
 	"gora/internal/automation"
 	"gora/internal/project"
@@ -68,6 +75,17 @@ type queuedHostCommand struct {
 	result     chan commandCompletion
 	completion commandCompletion
 	completed  bool
+	barrier    hostBarrier
+	deadline   time.Time
+	timer      *time.Timer
+}
+
+// hostBarrier records the ConfigEvent revision observed before a window
+// transition was requested. The command cannot complete until a later config
+// event and a subsequent stable frame are both published.
+type hostBarrier struct {
+	required       bool
+	configRevision uint64
 }
 
 // HostPublication is the immutable publication barrier observed by waiters.
@@ -75,30 +93,127 @@ type HostPublication struct {
 	RuntimeRevision  uint64
 	GeometryRevision uint64
 	FrameRevision    uint64
+	InputRevision    uint64
+	TraceRevision    uint64
+	Host             HostSnapshot
+	ClientFrame      *HostClientFrame
+}
+
+// HostClientFrame is the latest operation list actually submitted to a Gio
+// host window. It is retained as one bounded frame for attached client-area
+// capture; the pointer is immutable after publication and is never exposed in
+// JSON resources.
+type HostClientFrame struct {
+	Ops  *op.Ops
+	Size image.Point
 }
 
 // HostController serializes socket requests through the owning Gio event
 // loop. Queue and publication storage are bounded.
 type HostController struct {
-	mu       sync.Mutex
-	capacity int
-	queue    []queuedHostCommand
-	pending  []queuedHostCommand
-	latest   HostPublication
-	wake     chan struct{}
-	closed   chan struct{}
-	once     sync.Once
+	mu                sync.Mutex
+	capacity          int
+	queue             []queuedHostCommand
+	pending           []queuedHostCommand
+	latest            HostPublication
+	host              HostSnapshot
+	client            *HostClientFrame
+	published         bool
+	hostRevision      uint64
+	barriers          map[string]hostBarrier
+	transitionTimeout time.Duration
+	wake              chan struct{}
+	closed            chan struct{}
+	once              sync.Once
+	handler           HostCommandHandler
 }
+
+// HostCommandHandler lets a real host add finite window/Studio operations to
+// the same event-loop command queue used by runtime operations.
+type HostCommandHandler func(HostCommandPayload) (func() error, func() (json.RawMessage, error), error)
 
 func NewHostController(capacity int) *HostController {
 	if capacity <= 0 {
 		capacity = 64
 	}
-	return &HostController{capacity: capacity, wake: make(chan struct{}, 1), closed: make(chan struct{})}
+	return &HostController{capacity: capacity, wake: make(chan struct{}, 1), closed: make(chan struct{}), barriers: make(map[string]hostBarrier), transitionTimeout: 5 * time.Second}
 }
 
 func (controller *HostController) Wake() <-chan struct{} { return controller.wake }
 func (controller *HostController) Done() <-chan struct{} { return controller.closed }
+
+func (controller *HostController) SetCommandHandler(handler HostCommandHandler) {
+	controller.mu.Lock()
+	controller.handler = handler
+	controller.mu.Unlock()
+}
+
+func (controller *HostController) CommandHandler() HostCommandHandler {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	return controller.handler
+}
+
+// RequireConfigBarrier arms the next command with the supplied request ID.
+// It is called by the event-loop command handler immediately before enqueueing
+// an operation that changes native window configuration.
+func (controller *HostController) RequireConfigBarrier(requestID string) {
+	if requestID == "" {
+		return
+	}
+	controller.mu.Lock()
+	controller.barriers[requestID] = hostBarrier{required: true, configRevision: controller.host.ConfigRevision}
+	controller.mu.Unlock()
+}
+
+func (controller *HostController) queuedCommandLocked(command HostCommand) queuedHostCommand {
+	item := queuedHostCommand{command: command, result: make(chan commandCompletion, 1)}
+	if barrier, ok := controller.barriers[command.RequestID]; ok {
+		delete(controller.barriers, command.RequestID)
+		item.barrier = barrier
+		item.deadline = time.Now().Add(controller.transitionTimeout)
+		item.timer = time.AfterFunc(controller.transitionTimeout, func() {
+			controller.timeoutBarrier(command.RequestID)
+		})
+	}
+	return item
+}
+
+func (controller *HostController) timeoutBarrier(requestID string) {
+	controller.mu.Lock()
+	var expired *queuedHostCommand
+	for index := range controller.queue {
+		if controller.queue[index].command.RequestID != requestID {
+			continue
+		}
+		item := controller.queue[index]
+		controller.queue = append(controller.queue[:index], controller.queue[index+1:]...)
+		expired = &item
+		break
+	}
+	if expired == nil {
+		for index := range controller.pending {
+			if controller.pending[index].command.RequestID != requestID {
+				continue
+			}
+			item := controller.pending[index]
+			controller.pending = append(controller.pending[:index], controller.pending[index+1:]...)
+			expired = &item
+			break
+		}
+	}
+	controller.host.PendingCommands = len(controller.queue) + len(controller.pending)
+	if controller.host.PendingCommands == 0 {
+		controller.host.CommandState = "idle"
+	}
+	controller.mu.Unlock()
+	if expired != nil {
+		select {
+		case expired.result <- commandCompletion{err: errors.New("window transition timed out waiting for ConfigEvent")}:
+		default:
+		}
+	}
+}
 
 func (controller *HostController) TrySubmit(command HostCommand) error {
 	if command.Apply == nil {
@@ -114,7 +229,9 @@ func (controller *HostController) TrySubmit(command HostCommand) error {
 	if len(controller.queue)+len(controller.pending) >= controller.capacity {
 		return ErrHostCommandQueueFull
 	}
-	controller.queue = append(controller.queue, queuedHostCommand{command: command, result: make(chan commandCompletion, 1)})
+	controller.queue = append(controller.queue, controller.queuedCommandLocked(command))
+	controller.host.CommandState = "pending"
+	controller.host.PendingCommands = len(controller.queue) + len(controller.pending)
 	select {
 	case controller.wake <- struct{}{}:
 	default:
@@ -142,8 +259,10 @@ func (controller *HostController) SubmitResult(ctx context.Context, command Host
 		controller.mu.Unlock()
 		return nil, ErrHostCommandQueueFull
 	}
-	item := queuedHostCommand{command: command, result: make(chan commandCompletion, 1)}
+	item := controller.queuedCommandLocked(command)
 	controller.queue = append(controller.queue, item)
+	controller.host.CommandState = "pending"
+	controller.host.PendingCommands = len(controller.queue) + len(controller.pending)
 	select {
 	case controller.wake <- struct{}{}:
 	default:
@@ -170,6 +289,10 @@ func (controller *HostController) Drain() []HostCommand {
 		controller.pending = append(controller.pending, item)
 	}
 	controller.queue = controller.queue[:0]
+	if len(commands) != 0 {
+		controller.host.CommandState = "running"
+	}
+	controller.host.PendingCommands = len(controller.queue) + len(controller.pending)
 	return commands
 }
 
@@ -187,11 +310,45 @@ func (controller *HostController) Complete(requestID string, err error, data ...
 			controller.pending[index].completion = commandCompletion{data: result, err: err}
 			controller.pending[index].completed = true
 			if err != nil {
+				if controller.pending[index].timer != nil {
+					controller.pending[index].timer.Stop()
+				}
 				controller.pending[index].result <- controller.pending[index].completion
 				controller.pending = append(controller.pending[:index], controller.pending[index+1:]...)
+				controller.host.PendingCommands = len(controller.queue) + len(controller.pending)
+				if controller.host.PendingCommands == 0 {
+					controller.host.CommandState = "idle"
+				}
 			}
 			return
 		}
+	}
+}
+
+// CompleteNow acknowledges an event-loop command immediately. It is reserved
+// for close, where Gio may destroy the window before another frame can be
+// presented. Ordinary commands still complete through Publish.
+func (controller *HostController) CompleteNow(requestID string, data json.RawMessage, err error) {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	for index := range controller.pending {
+		if controller.pending[index].command.RequestID != requestID {
+			continue
+		}
+		item := controller.pending[index]
+		if item.timer != nil {
+			item.timer.Stop()
+		}
+		controller.pending = append(controller.pending[:index], controller.pending[index+1:]...)
+		controller.host.PendingCommands = len(controller.queue) + len(controller.pending)
+		if controller.host.PendingCommands == 0 {
+			controller.host.CommandState = "idle"
+		}
+		select {
+		case item.result <- commandCompletion{data: data, err: err}:
+		default:
+		}
+		return
 	}
 }
 
@@ -199,12 +356,56 @@ func (controller *HostController) Complete(requestID string, err error, data ...
 // canonical tree/frame publication.
 func (controller *HostController) Publish(publication HostPublication) {
 	controller.mu.Lock()
+	if publication.Host.HostInstanceID == "" {
+		publication.Host = cloneHostSnapshot(controller.host)
+	}
+	publication.Host.RuntimeRevision = publication.RuntimeRevision
+	publication.Host.GeometryRevision = publication.GeometryRevision
+	publication.Host.FrameRevision = publication.FrameRevision
+	publication.Host.InputRevision = publication.InputRevision
+	publication.Host.TraceRevision = publication.TraceRevision
+	controller.hostRevision++
+	publication.Host.HostRevision = controller.hostRevision
+	controller.host = cloneHostSnapshot(publication.Host)
 	controller.latest = publication
-	pending := controller.pending
-	controller.pending = nil
+	controller.client = publication.ClientFrame
+	controller.published = true
+	ready := make([]queuedHostCommand, 0, len(controller.pending))
+	remaining := make([]queuedHostCommand, 0, len(controller.pending))
+	now := time.Now()
+	for _, item := range controller.pending {
+		if !item.completed {
+			ready = append(ready, item)
+			continue
+		}
+		if item.completion.err != nil || !item.barrier.required || controller.host.ConfigRevision > item.barrier.configRevision {
+			ready = append(ready, item)
+			continue
+		}
+		if !item.deadline.IsZero() && !now.Before(item.deadline) {
+			item.completion.err = errors.New("window transition timed out waiting for ConfigEvent")
+			ready = append(ready, item)
+			continue
+		}
+		remaining = append(remaining, item)
+	}
+	controller.pending = remaining
+	controller.host.PendingCommands = len(controller.queue) + len(controller.pending)
+	if controller.host.PendingCommands == 0 {
+		controller.host.CommandState = "idle"
+	} else if controller.host.CommandState == "idle" {
+		controller.host.CommandState = "pending"
+	}
+	pending := ready
 	controller.mu.Unlock()
 	for _, item := range pending {
+		if item.timer != nil {
+			item.timer.Stop()
+		}
 		completion := item.completion
+		if item.completed && completion.err == nil && len(completion.data) == 0 && item.command.Result != nil {
+			completion.data, completion.err = item.command.Result()
+		}
 		if !item.completed {
 			completion = commandCompletion{err: ErrHostControllerClosed}
 		}
@@ -221,6 +422,145 @@ func (controller *HostController) Publication() HostPublication {
 	return controller.latest
 }
 
+func (controller *HostController) SetHostIdentity(instanceID, mode string, pid int, capabilities []string) {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	controller.host.SchemaVersion = 1
+	controller.host.HostProtocolVersion = session.ProtocolVersion
+	controller.host.HostInstanceID = instanceID
+	controller.host.Mode = normalizeWindowMode(mode)
+	controller.host.ConnectionState = "connected"
+	controller.host.ProcessID = pid
+	controller.host.Capabilities = sortedCapabilities(capabilities)
+	controller.host.Visible = true
+	controller.host.WindowMode = "windowed"
+}
+
+func (controller *HostController) UpdateWindowState(logical, physical image.Point, pxPerDp, pxPerSp float32, mode string, focused, visible, closing bool) {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	changed := controller.host.LogicalClientWidth != logical.X || controller.host.LogicalClientHeight != logical.Y || controller.host.PhysicalClientWidth != physical.X || controller.host.PhysicalClientHeight != physical.Y || controller.host.PxPerDp != pxPerDp || controller.host.PxPerSp != pxPerSp || (mode != "" && controller.host.WindowMode != normalizeWindowMode(mode)) || controller.host.Focused != focused || controller.host.Visible != visible || controller.host.Closing != closing
+	controller.host.LogicalClientWidth, controller.host.LogicalClientHeight = logical.X, logical.Y
+	controller.host.PhysicalClientWidth, controller.host.PhysicalClientHeight = physical.X, physical.Y
+	controller.host.PxPerDp, controller.host.PxPerSp = pxPerDp, pxPerSp
+	if mode != "" {
+		controller.host.WindowMode = normalizeWindowMode(mode)
+	}
+	controller.host.Focused, controller.host.Visible, controller.host.Closing = focused, visible, closing
+	if changed {
+		controller.host.ConfigRevision++
+	}
+}
+
+func (controller *HostController) UpdateMetrics(logical, physical image.Point, pxPerDp, pxPerSp float32) {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	changed := controller.host.LogicalClientWidth != logical.X || controller.host.LogicalClientHeight != logical.Y || controller.host.PhysicalClientWidth != physical.X || controller.host.PhysicalClientHeight != physical.Y || controller.host.PxPerDp != pxPerDp || controller.host.PxPerSp != pxPerSp
+	controller.host.LogicalClientWidth, controller.host.LogicalClientHeight = logical.X, logical.Y
+	controller.host.PhysicalClientWidth, controller.host.PhysicalClientHeight = physical.X, physical.Y
+	controller.host.PxPerDp, controller.host.PxPerSp = pxPerDp, pxPerSp
+	if changed {
+		controller.host.ConfigRevision++
+	}
+}
+
+func (controller *HostController) UpdateStudioState(state HostStudioSnapshot, revision uint64) {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	controller.host.Studio = &state
+	controller.host.StudioRevision = revision
+}
+
+func (controller *HostController) HostSnapshot() HostSnapshot {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	snapshot := controller.publishedHostLocked()
+	// Queue state is intentionally observable before the next frame, while
+	// window metrics and Studio fields remain tied to the last published frame.
+	snapshot.CommandState = controller.host.CommandState
+	snapshot.PendingCommands = controller.host.PendingCommands
+	publication := controller.latest
+	snapshot.HostRevision = publication.Host.HostRevision
+	if snapshot.HostRevision == 0 {
+		snapshot.HostRevision = publication.FrameRevision
+	}
+	snapshot.RuntimeRevision = publication.RuntimeRevision
+	snapshot.GeometryRevision = publication.GeometryRevision
+	snapshot.FrameRevision = publication.FrameRevision
+	snapshot.InputRevision = publication.InputRevision
+	snapshot.TraceRevision = publication.TraceRevision
+	return snapshot
+}
+
+func (controller *HostController) publishedHostLocked() HostSnapshot {
+	if controller.published {
+		return cloneHostSnapshot(controller.latest.Host)
+	}
+	snapshot := cloneHostSnapshot(controller.host)
+	snapshot.LogicalClientWidth, snapshot.LogicalClientHeight = 0, 0
+	snapshot.PhysicalClientWidth, snapshot.PhysicalClientHeight = 0, 0
+	snapshot.PxPerDp, snapshot.PxPerSp = 0, 0
+	snapshot.Focused, snapshot.Closing = false, false
+	snapshot.HostRevision, snapshot.RuntimeRevision = 0, 0
+	snapshot.GeometryRevision, snapshot.FrameRevision = 0, 0
+	snapshot.InputRevision, snapshot.StudioRevision, snapshot.TraceRevision = 0, 0, 0
+	snapshot.Studio = nil
+	return snapshot
+}
+
+// CaptureClientPNG renders the latest client operation list through Gio's
+// headless backend. It does not invoke layout, consume input, or mutate any
+// runtime/Studio revision. A scale other than one resamples the retained
+// physical client frame deterministically.
+func (controller *HostController) CaptureClientPNG(scale int) ([]byte, string, automation.CaptureIdentity, error) {
+	if scale <= 0 {
+		return nil, "", automation.CaptureIdentity{}, errors.New("scale must be a positive integer")
+	}
+	controller.mu.Lock()
+	frame := controller.client
+	host := controller.publishedHostLocked()
+	publication := controller.latest
+	host.HostRevision = publication.Host.HostRevision
+	host.RuntimeRevision = publication.RuntimeRevision
+	host.GeometryRevision = publication.GeometryRevision
+	host.FrameRevision = publication.FrameRevision
+	host.InputRevision = publication.InputRevision
+	host.TraceRevision = publication.TraceRevision
+	controller.mu.Unlock()
+	if frame == nil || frame.Ops == nil || frame.Size.X <= 0 || frame.Size.Y <= 0 {
+		return nil, "", automation.CaptureIdentity{}, errors.New("no published host client frame is available")
+	}
+	window, err := headless.NewWindow(frame.Size.X, frame.Size.Y)
+	if err != nil {
+		return nil, "", automation.CaptureIdentity{}, err
+	}
+	defer window.Release()
+	if err := window.Frame(frame.Ops); err != nil {
+		return nil, "", automation.CaptureIdentity{}, err
+	}
+	raw := image.NewRGBA(image.Rect(0, 0, frame.Size.X, frame.Size.Y))
+	if err := window.Screenshot(raw); err != nil {
+		return nil, "", automation.CaptureIdentity{}, err
+	}
+	if scale != 1 {
+		scaled := image.NewRGBA(image.Rect(0, 0, raw.Bounds().Dx()*scale, raw.Bounds().Dy()*scale))
+		xdraw.NearestNeighbor.Scale(scaled, scaled.Bounds(), raw, raw.Bounds(), xdraw.Src, nil)
+		raw = scaled
+	}
+	var buffer bytes.Buffer
+	if err := png.Encode(&buffer, raw); err != nil {
+		return nil, "", automation.CaptureIdentity{}, err
+	}
+	identity := automation.CaptureIdentity{
+		ViewportWidth: host.LogicalClientWidth, ViewportHeight: host.LogicalClientHeight,
+		RuntimeRevision: host.RuntimeRevision, FrameRevision: host.FrameRevision,
+		GeometryRevision: host.GeometryRevision, PublishedRuntimeRevision: host.RuntimeRevision,
+		PublishedGeometryRevision: host.GeometryRevision, Width: raw.Bounds().Dx(), Height: raw.Bounds().Dy(),
+		Valid: host.ConnectionState == "connected",
+	}
+	return buffer.Bytes(), "", identity, nil
+}
+
 func (controller *HostController) Close() {
 	controller.once.Do(func() {
 		close(controller.closed)
@@ -228,14 +568,26 @@ func (controller *HostController) Close() {
 		pending := append(controller.queue, controller.pending...)
 		controller.queue = nil
 		controller.pending = nil
+		controller.barriers = make(map[string]hostBarrier)
 		controller.mu.Unlock()
 		for _, item := range pending {
+			if item.timer != nil {
+				item.timer.Stop()
+			}
 			select {
 			case item.result <- commandCompletion{err: ErrHostControllerClosed}:
 			default:
 			}
 		}
 	})
+}
+
+func normalizeWindowMode(mode string) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		return "windowed"
+	}
+	return mode
 }
 
 // SessionHandler returns the protocol bridge for a live host. Legacy actions
@@ -283,6 +635,11 @@ func (runtime *Runtime) SessionHandlerWithController(hostMode string, identity s
 				return session.Response{Version: session.ProtocolVersion, RequestID: request.RequestID, Error: err.Error()}
 			}
 			return session.Response{Version: session.ProtocolVersion, RequestID: request.RequestID, OK: true, Data: data}
+		case session.ActionHostSnapshot:
+			if controller == nil {
+				return session.Response{Version: session.ProtocolVersion, RequestID: request.RequestID, Error: "host snapshot unavailable"}
+			}
+			return session.Response{Version: session.ProtocolVersion, RequestID: request.RequestID, OK: true, Data: mustJSON(controller.HostSnapshot())}
 		case session.ActionWait:
 			var payload struct {
 				AfterFrameRevision   uint64 `json:"after_frame_revision"`
@@ -309,12 +666,21 @@ func (runtime *Runtime) SessionHandlerWithController(hostMode string, identity s
 			if controller == nil {
 				return session.Response{Version: session.ProtocolVersion, RequestID: request.RequestID, Error: "host command controller unavailable"}
 			}
-			var command hostCommandPayload
+			var command HostCommandPayload
 			if err := decodePayload(request.Payload, &command); err != nil {
 				return session.Response{Version: session.ProtocolVersion, RequestID: request.RequestID, Error: err.Error()}
 			}
+			command.RequestID = request.RequestID
 			var dispatchResults []automation.Result
 			apply := runtime.commandApply(command)
+			var result func() (json.RawMessage, error)
+			if handler := controller.CommandHandler(); handler != nil && (command.Kind == "set_window" || command.Kind == "window_action" || command.Kind == "set_studio_state") {
+				var handlerErr error
+				apply, result, handlerErr = handler(command)
+				if handlerErr != nil {
+					return session.Response{Version: session.ProtocolVersion, RequestID: request.RequestID, Error: handlerErr.Error()}
+				}
+			}
 			if command.Kind == "dispatch" {
 				if driver == nil {
 					return session.Response{Version: session.ProtocolVersion, RequestID: request.RequestID, Error: "unsupported capability: host input driver unavailable"}
@@ -325,12 +691,18 @@ func (runtime *Runtime) SessionHandlerWithController(hostMode string, identity s
 					return dispatchErr
 				}
 			}
-			data, err := controller.SubmitResult(ctx, HostCommand{RequestID: request.RequestID, Apply: apply, Result: func() (json.RawMessage, error) {
-				if command.Kind == "dispatch" {
-					return json.Marshal(dispatchResults)
+			if result == nil {
+				result = func() (json.RawMessage, error) {
+					if command.Kind == "dispatch" {
+						return json.Marshal(dispatchResults)
+					}
+					if command.Kind == "assert" {
+						return runtime.commandResult(command, controller.HostSnapshot())
+					}
+					return runtime.commandResult(command)
 				}
-				return runtime.commandResult(command)
-			}})
+			}
+			data, err := controller.SubmitResult(ctx, HostCommand{RequestID: request.RequestID, Apply: apply, Result: result})
 			if err != nil {
 				return session.Response{Version: session.ProtocolVersion, RequestID: request.RequestID, Error: err.Error()}
 			}
@@ -355,7 +727,8 @@ func sameCanonicalSessionPath(left, right string) bool {
 	return filepath.Clean(leftResolved) == filepath.Clean(rightResolved)
 }
 
-type hostCommandPayload struct {
+type HostCommandPayload struct {
+	RequestID    string                         `json:"-"`
 	Kind         string                         `json:"kind"`
 	Width        int                            `json:"width"`
 	Height       int                            `json:"height"`
@@ -378,7 +751,19 @@ type hostCommandPayload struct {
 	Assertions   []automation.Assertion         `json:"assertions"`
 	Overlay      map[string]project.OverlayFile `json:"overlay"`
 	Faults       map[string]int                 `json:"faults"`
+	Action       string                         `json:"action"`
+	Selection    string                         `json:"selection"`
+	Zoom         float32                        `json:"zoom"`
+	Inspect      *bool                          `json:"inspect"`
+	SelectedID   string                         `json:"selected_semantic_id"`
+	PanX         *int                           `json:"pan_x"`
+	PanY         *int                           `json:"pan_y"`
+	Output       string                         `json:"output"`
+	OutputSet    bool                           `json:"output_set"`
+	ResetState   bool                           `json:"reset_state"`
 }
+
+type hostCommandPayload = HostCommandPayload
 
 func (runtime *Runtime) commandApply(command hostCommandPayload) func() error {
 	return func() error {
@@ -452,7 +837,7 @@ func (runtime *Runtime) commandApply(command hostCommandPayload) func() error {
 	}
 }
 
-func (runtime *Runtime) commandResult(command hostCommandPayload) (json.RawMessage, error) {
+func (runtime *Runtime) commandResult(command hostCommandPayload, hosts ...HostSnapshot) (json.RawMessage, error) {
 	var value any = runtime.AutomationSnapshot()
 	switch command.Kind {
 	case "set_control_value":
@@ -489,7 +874,7 @@ func (runtime *Runtime) commandResult(command hostCommandPayload) (json.RawMessa
 		value = runtime.EventTrace()
 	case "configure_trace", "clear_trace":
 		value = runtime.EventTrace()
-	case "capture":
+	case "capture", "capture_host_client":
 		if runtime.ConsumeAutomationFault("capture_failure") {
 			return nil, errors.New("injected capture failure")
 		}
@@ -505,7 +890,12 @@ func (runtime *Runtime) commandResult(command hostCommandPayload) (json.RawMessa
 		}
 		snapshot := runtime.AutomationSnapshot()
 		view := automation.ViewSnapshot{Valid: snapshot.Valid, LastGoodAvailable: snapshot.LastGoodAvailable, Agreement: snapshot.Agreement, RuntimePublished: snapshot.RuntimePublished, GeometryPublished: snapshot.GeometryPublished, Idle: snapshot.Idle, IdleReasons: snapshot.IdleReasons, Selection: snapshot.Selection, Selections: snapshot.Selections, Viewport: snapshot.Viewport, CanBack: snapshot.CanBack, CanForward: snapshot.CanForward, RuntimeRevision: snapshot.RuntimeRevision, FrameRevision: snapshot.FrameRevision, GeometryRevision: snapshot.GeometryRevision, PublishedRuntimeRevision: snapshot.PublishedRuntimeRevision, PublishedGeometryRevision: snapshot.PublishedGeometryRevision, ReloadRevision: snapshot.ReloadRevision, AutomationInputRevision: snapshot.AutomationInputRevision, Diagnostics: snapshot.Diagnostics, Transient: snapshot.Transient, Router: snapshot.Router, Editing: snapshot.Editing, StateValues: snapshot.StateValues, Tree: tree}
-		report, err := automation.EvaluateAssertions(automation.AssertionSnapshot{Tree: tree, View: view, Router: snapshot.Router, Editing: snapshot.Editing, StateValues: snapshot.StateValues, ScrollOffsets: snapshot.Scroll}, command.Assertions)
+		var hostValues map[string]any
+		if len(hosts) != 0 {
+			encoded, _ := json.Marshal(hosts[0])
+			_ = json.Unmarshal(encoded, &hostValues)
+		}
+		report, err := automation.EvaluateAssertions(automation.AssertionSnapshot{Tree: tree, View: view, Router: snapshot.Router, Editing: snapshot.Editing, StateValues: snapshot.StateValues, ScrollOffsets: snapshot.Scroll, HostValues: hostValues}, command.Assertions)
 		if err != nil {
 			return nil, err
 		}

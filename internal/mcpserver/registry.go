@@ -88,6 +88,7 @@ type hostBackend struct {
 	identity   session.HostIdentity
 	protocol   int
 	last       studio.AutomationSnapshot
+	lastHost   studio.HostSnapshot
 	connected  bool
 	reason     string
 	stop       chan struct{}
@@ -423,6 +424,17 @@ func (r *Registry) AutomationSnapshot(projectID, viewID string) (studio.Automati
 	return view.host.last, nil
 }
 
+func (r *Registry) HostSnapshot(projectID, viewID string) (studio.HostSnapshot, error) {
+	backend, err := r.Backend(projectID, viewID)
+	if err != nil {
+		return studio.HostSnapshot{}, err
+	}
+	if backend.Mode() == session.HostModeHeadless {
+		return studio.HostSnapshot{}, fmt.Errorf("host resource is unavailable for headless views")
+	}
+	return backend.HostSnapshot(context.Background())
+}
+
 func (r *Registry) AutomationTrace(ctx context.Context, projectID, viewID string) (automation.TraceSnapshot, error) {
 	backend, err := r.Backend(projectID, viewID)
 	if err != nil {
@@ -550,7 +562,7 @@ func (r *Registry) HostCommandResult(ctx context.Context, projectID, viewID, kin
 	}
 	host := view.host
 	host.mu.Lock()
-	capability := map[string]string{"set_viewport": "viewport", "select": "selection", "activate": "activation", "scroll": "scroll", "set_state": "state", "reset_state": "reset", "set_control_value": "state", "set_field_draft": "editing", "submit_form": "editing", "reset_form": "editing", "set_clock": "clock", "advance_clock": "clock", "run_until_idle": "clock", "set_clipboard": "editing", "get_clipboard": "editing", "dispatch": "input", "configure_trace": "trace", "clear_trace": "trace", "get_trace": "trace", "capture": "capture", "assert": "snapshot", "reload_overlay": "overlay", "configure_faults": "faults", "clear_faults": "faults"}[kind]
+	capability := map[string]string{"set_viewport": "viewport", "select": "selection", "activate": "activation", "scroll": "scroll", "set_state": "state", "reset_state": "reset", "set_control_value": "state", "set_field_draft": "editing", "submit_form": "editing", "reset_form": "editing", "set_clock": "clock", "advance_clock": "clock", "run_until_idle": "clock", "set_clipboard": "editing", "get_clipboard": "editing", "dispatch": "input", "configure_trace": "trace", "clear_trace": "trace", "get_trace": "trace", "capture": "capture", "capture_host_client": "capture", "assert": "snapshot", "reload_overlay": "overlay", "configure_faults": "faults", "clear_faults": "faults", "set_window": "window", "window_action": "window", "set_studio_state": "studio"}[kind]
 	if capability != "" {
 		advertised := false
 		for _, value := range host.identity.Capabilities {
@@ -581,6 +593,12 @@ func (r *Registry) HostCommandResult(ctx context.Context, projectID, viewID, kin
 	}
 	response, err := session.Send(socketPath, session.Request{Version: session.ProtocolVersion, RequestID: opaqueID(), Action: session.ActionCommand, Payload: data}, 5*time.Second)
 	if err != nil {
+		// A decoded, correlated host response can reject a command without the
+		// transport being unhealthy. Only I/O/protocol failures disconnect the
+		// attached view.
+		if response.Version == session.ProtocolVersion && response.RequestID != "" && response.Error != "" {
+			return nil, err
+		}
 		host.mu.Lock()
 		host.connected = false
 		host.reason = err.Error()
@@ -800,7 +818,7 @@ func attachHost(root, entry string, mode session.HostMode) (*hostBackend, error)
 	if err := session.ValidateHandshake(session.HostIdentity{Root: root, Document: entry}, result.Host, result.Protocol, mode); err != nil {
 		return nil, err
 	}
-	return &hostBackend{socketPath: socketPath, identity: result.Host, protocol: result.Protocol, connected: true}, nil
+	return &hostBackend{socketPath: socketPath, identity: result.Host, protocol: result.Protocol, connected: true, lastHost: studio.HostSnapshot{SchemaVersion: 1, HostProtocolVersion: result.Protocol, HostInstanceID: result.Host.InstanceID, Mode: string(result.Host.Mode), ConnectionState: "connected", ProcessID: result.Host.PID, Capabilities: append([]string(nil), result.Host.Capabilities...), Visible: true, WindowMode: "windowed"}}, nil
 }
 
 func canonicalDirectory(root string) (string, error) {

@@ -152,6 +152,7 @@ type CaptureInput struct {
 	ViewID    string `json:"view_id"`
 	Scale     int    `json:"scale"`
 	Output    string `json:"output,omitempty"`
+	Target    string `json:"target,omitempty" jsonschema:"document or host_client; defaults to document"`
 }
 
 type CaptureOutput struct {
@@ -201,6 +202,42 @@ type CompareCaptureInput struct {
 	MaxChangedPixels int           `json:"max_changed_pixels,omitempty"`
 	Masks            []CaptureMask `json:"masks,omitempty"`
 	SaveDiff         string        `json:"save_diff,omitempty"`
+	Target           string        `json:"target,omitempty" jsonschema:"document or host_client; defaults to document"`
+}
+
+type SetWindowInput struct {
+	ProjectID string `json:"project_id"`
+	ViewID    string `json:"view_id"`
+	Width     int    `json:"width,omitempty"`
+	Height    int    `json:"height,omitempty"`
+	Mode      string `json:"mode,omitempty" jsonschema:"windowed, minimized, maximized, or fullscreen"`
+}
+
+type WindowActionInput struct {
+	ProjectID string `json:"project_id"`
+	ViewID    string `json:"view_id"`
+	Action    string `json:"action" jsonschema:"raise, center, or close"`
+}
+
+type StudioStateInput struct {
+	ProjectID          string  `json:"project_id"`
+	ViewID             string  `json:"view_id"`
+	Selection          string  `json:"selection,omitempty"`
+	Width              int     `json:"width,omitempty"`
+	Height             int     `json:"height,omitempty"`
+	Zoom               float32 `json:"zoom,omitempty"`
+	Inspect            *bool   `json:"inspect,omitempty"`
+	SelectedSemanticID string  `json:"selected_semantic_id,omitempty"`
+	PanX               *int    `json:"pan_x,omitempty"`
+	PanY               *int    `json:"pan_y,omitempty"`
+	ResetState         bool    `json:"reset_state,omitempty"`
+	Output             *string `json:"output,omitempty"`
+}
+
+type HostSnapshotOutput struct {
+	ProjectID string              `json:"project_id"`
+	ViewID    string              `json:"view_id"`
+	Host      studio.HostSnapshot `json:"host"`
 }
 
 type CompareCaptureOutput struct {
@@ -455,10 +492,14 @@ func (s *Service) registerLifecycleTools() {
 		return nil, ViewsOutput{ProjectID: input.ProjectID, Views: s.registry.ListViews(input.ProjectID)}, nil
 	})
 	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_close_view", Description: "Close one project view while retaining shared project resources.", Annotations: destructive}, func(_ context.Context, _ *mcp.CallToolRequest, input ViewInput) (*mcp.CallToolResult, ClosedOutput, error) {
+		closedView, summaryErr := s.registry.ViewSummary(input.ProjectID, input.ViewID)
 		err := s.registry.CloseView(input.ProjectID, input.ViewID)
 		if err == nil {
 			base := "gora://project/" + input.ProjectID + "/views/" + input.ViewID
 			resources := []string{base, base + "/tree"}
+			if summaryErr == nil && closedView.HostMode != session.HostModeHeadless {
+				resources = append(resources, base+"/host")
+			}
 			if s.automation {
 				resources = append(resources, base+"/automation", base+"/automation/trace", base+"/automation/overlay")
 			}
@@ -691,14 +732,28 @@ func (s *Service) registerRuntimeTools() {
 		if err != nil {
 			return nil, CaptureOutput{}, err
 		}
+		if input.Target == "" {
+			input.Target = "document"
+		}
+		if input.Target != "document" && input.Target != "host_client" {
+			return nil, CaptureOutput{}, fmt.Errorf("target must be document or host_client")
+		}
+		if input.Target == "host_client" && backend.Mode() == session.HostModeHeadless {
+			return nil, CaptureOutput{}, fmt.Errorf("host_client capture requires an attached app or Studio view")
+		}
 		if backend.Mode() != session.HostModeHeadless {
-			data, commandErr := s.registry.HostCommandResult(ctx, input.ProjectID, input.ViewID, "capture", map[string]any{"scale": input.Scale})
+			kind := "capture"
+			if input.Target == "host_client" {
+				kind = "capture_host_client"
+			}
+			data, commandErr := s.registry.HostCommandResult(ctx, input.ProjectID, input.ViewID, kind, map[string]any{"scale": input.Scale})
 			if commandErr != nil {
 				return nil, CaptureOutput{}, commandErr
 			}
 			var result struct {
-				PNGBase64 string `json:"png_base64"`
-				Warning   string `json:"warning"`
+				PNGBase64 string                     `json:"png_base64"`
+				Warning   string                     `json:"warning"`
+				Identity  automation.CaptureIdentity `json:"identity"`
 			}
 			if unmarshalErr := json.Unmarshal(data, &result); unmarshalErr != nil {
 				return nil, CaptureOutput{}, unmarshalErr
@@ -725,7 +780,11 @@ func (s *Service) registerRuntimeTools() {
 			if summaryErr != nil {
 				return nil, CaptureOutput{}, summaryErr
 			}
-			resultOutput := CaptureOutput{ProjectID: input.ProjectID, View: view, Width: view.Viewport.Width * input.Scale, Height: view.Viewport.Height * input.Scale, Warning: result.Warning, Output: output}
+			width, height := result.Identity.Width, result.Identity.Height
+			if width == 0 || height == 0 {
+				width, height = view.Viewport.Width*input.Scale, view.Viewport.Height*input.Scale
+			}
+			resultOutput := CaptureOutput{ProjectID: input.ProjectID, View: view, Width: width, Height: height, Warning: result.Warning, Output: output}
 			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.ImageContent{Data: png, MIMEType: "image/png"}}}, resultOutput, nil
 		}
 		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
@@ -773,6 +832,87 @@ func (s *Service) registerRuntimeTools() {
 
 func (s *Service) registerAutomationTools() {
 	readOnly := &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true, OpenWorldHint: boolPointer(false)}
+	windowMutation := &mcp.ToolAnnotations{ReadOnlyHint: false, IdempotentHint: true, OpenWorldHint: boolPointer(false), DestructiveHint: boolPointer(false)}
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_set_window", Description: "Set the observed logical size or finite mode of an attached app or Studio window.", Annotations: windowMutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input SetWindowInput) (*mcp.CallToolResult, HostSnapshotOutput, error) {
+		if (input.Width == 0) != (input.Height == 0) || (input.Width < 0 || input.Height < 0) {
+			return nil, HostSnapshotOutput{}, fmt.Errorf("window width and height must be supplied together and positive")
+		}
+		if input.Width == 0 && input.Height == 0 && input.Mode == "" {
+			return nil, HostSnapshotOutput{}, fmt.Errorf("window change is empty")
+		}
+		if input.Mode != "" && input.Mode != "windowed" && input.Mode != "minimized" && input.Mode != "maximized" && input.Mode != "fullscreen" {
+			return nil, HostSnapshotOutput{}, fmt.Errorf("unsupported window mode %q", input.Mode)
+		}
+		backend, err := s.registry.Backend(input.ProjectID, input.ViewID)
+		if err != nil {
+			return nil, HostSnapshotOutput{}, err
+		}
+		if backend.Mode() == session.HostModeHeadless {
+			return nil, HostSnapshotOutput{}, fmt.Errorf("window tools require an attached host view")
+		}
+		data, err := s.registry.HostCommandResult(ctx, input.ProjectID, input.ViewID, "set_window", map[string]any{"width": input.Width, "height": input.Height, "mode": input.Mode})
+		if err != nil {
+			return nil, HostSnapshotOutput{}, err
+		}
+		var host studio.HostSnapshot
+		if len(data) != 0 {
+			_ = json.Unmarshal(data, &host)
+		}
+		return nil, HostSnapshotOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Host: host}, nil
+	})
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_perform_window_action", Description: "Raise, center, or close an attached app or Studio window.", Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, IdempotentHint: false, OpenWorldHint: boolPointer(false), DestructiveHint: boolPointer(true)}}, func(ctx context.Context, _ *mcp.CallToolRequest, input WindowActionInput) (*mcp.CallToolResult, HostSnapshotOutput, error) {
+		if input.Action != "raise" && input.Action != "center" && input.Action != "close" {
+			return nil, HostSnapshotOutput{}, fmt.Errorf("unsupported window action %q", input.Action)
+		}
+		backend, err := s.registry.Backend(input.ProjectID, input.ViewID)
+		if err != nil {
+			return nil, HostSnapshotOutput{}, err
+		}
+		if backend.Mode() == session.HostModeHeadless {
+			return nil, HostSnapshotOutput{}, fmt.Errorf("window tools require an attached host view")
+		}
+		data, err := s.registry.HostCommandResult(ctx, input.ProjectID, input.ViewID, "window_action", map[string]any{"action": input.Action})
+		if err != nil {
+			return nil, HostSnapshotOutput{}, err
+		}
+		var host studio.HostSnapshot
+		if len(data) != 0 {
+			_ = json.Unmarshal(data, &host)
+		}
+		return nil, HostSnapshotOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Host: host}, nil
+	})
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_set_studio_state", Description: "Atomically update finite state of an attached Studio host.", Annotations: windowMutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input StudioStateInput) (*mcp.CallToolResult, HostSnapshotOutput, error) {
+		if (input.Width == 0) != (input.Height == 0) || input.Width < 0 || input.Height < 0 {
+			return nil, HostSnapshotOutput{}, fmt.Errorf("studio viewport width and height must be supplied together")
+		}
+		if input.Width != 0 && (input.Width <= 0 || input.Height <= 0) {
+			return nil, HostSnapshotOutput{}, fmt.Errorf("studio viewport dimensions must be positive")
+		}
+		if input.Zoom != 0 && (input.Zoom < 0.25 || input.Zoom > 4) {
+			return nil, HostSnapshotOutput{}, fmt.Errorf("studio zoom must be between 0.25 and 4")
+		}
+		backend, err := s.registry.Backend(input.ProjectID, input.ViewID)
+		if err != nil {
+			return nil, HostSnapshotOutput{}, err
+		}
+		if backend.Mode() != session.HostModeStudio {
+			return nil, HostSnapshotOutput{}, fmt.Errorf("Studio state requires an attached Studio view")
+		}
+		payload := map[string]any{"selection": input.Selection, "width": input.Width, "height": input.Height, "zoom": input.Zoom, "inspect": input.Inspect, "selected_semantic_id": input.SelectedSemanticID, "pan_x": input.PanX, "pan_y": input.PanY, "reset_state": input.ResetState}
+		if input.Output != nil {
+			payload["output"] = *input.Output
+			payload["output_set"] = true
+		}
+		data, err := s.registry.HostCommandResult(ctx, input.ProjectID, input.ViewID, "set_studio_state", payload)
+		if err != nil {
+			return nil, HostSnapshotOutput{}, err
+		}
+		var host studio.HostSnapshot
+		if len(data) != 0 {
+			_ = json.Unmarshal(data, &host)
+		}
+		return nil, HostSnapshotOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Host: host}, nil
+	})
 	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_assert_view", Description: "Evaluate finite deterministic assertions against one immutable published view snapshot.", Annotations: readOnly}, func(ctx context.Context, _ *mcp.CallToolRequest, input AssertViewInput) (*mcp.CallToolResult, AssertViewOutput, error) {
 		backend, backendErr := s.registry.Backend(input.ProjectID, input.ViewID)
 		if backendErr != nil {
@@ -835,6 +975,12 @@ func (s *Service) registerAutomationTools() {
 		if input.MaxChangedPixels < 0 {
 			return nil, CompareCaptureOutput{}, fmt.Errorf("max_changed_pixels must be non-negative")
 		}
+		if input.Target == "" {
+			input.Target = "document"
+		}
+		if input.Target != "document" && input.Target != "host_client" {
+			return nil, CompareCaptureOutput{}, fmt.Errorf("target must be document or host_client")
+		}
 		for _, mask := range input.Masks {
 			if mask.X < 0 || mask.Y < 0 || mask.Width < 0 || mask.Height < 0 {
 				return nil, CompareCaptureOutput{}, fmt.Errorf("mask coordinates and dimensions must be non-negative")
@@ -843,6 +989,9 @@ func (s *Service) registerAutomationTools() {
 		backend, err := s.registry.Backend(input.ProjectID, input.ViewID)
 		if err != nil {
 			return nil, CompareCaptureOutput{}, err
+		}
+		if input.Target == "host_client" && backend.Mode() == session.HostModeHeadless {
+			return nil, CompareCaptureOutput{}, fmt.Errorf("host_client comparison requires an attached app or Studio view")
 		}
 		var runtime *studio.Runtime
 		if backend.Mode() == session.HostModeHeadless {
@@ -886,7 +1035,24 @@ func (s *Service) registerAutomationTools() {
 			if backendErr != nil {
 				return nil, CompareCaptureOutput{}, backendErr
 			}
-			current, warning, captureIdentity, err = backend.Capture(ctx, input.Scale)
+			if input.Target == "host_client" {
+				data, commandErr := s.registry.HostCommandResult(ctx, input.ProjectID, input.ViewID, "capture_host_client", map[string]any{"scale": input.Scale})
+				if commandErr != nil {
+					return nil, CompareCaptureOutput{}, commandErr
+				}
+				var result struct {
+					PNGBase64 string                     `json:"png_base64"`
+					Warning   string                     `json:"warning"`
+					Identity  automation.CaptureIdentity `json:"identity"`
+				}
+				if err := json.Unmarshal(data, &result); err != nil {
+					return nil, CompareCaptureOutput{}, err
+				}
+				current, err = base64.StdEncoding.DecodeString(result.PNGBase64)
+				warning, captureIdentity = result.Warning, result.Identity
+			} else {
+				current, warning, captureIdentity, err = backend.Capture(ctx, input.Scale)
+			}
 		} else {
 			capture := s.capturePNG
 			if capture == nil {
@@ -1363,6 +1529,19 @@ func (s *Service) validateSubscription(_ context.Context, request *mcp.Subscribe
 		}
 		return nil
 	}
+	if projectID, viewID, ok := parseHostURI(uri); ok {
+		if !s.automation {
+			return fmt.Errorf("automation resources are disabled")
+		}
+		view, err := s.registry.ViewSummary(projectID, viewID)
+		if err != nil {
+			return fmt.Errorf("unknown project or view: %w", err)
+		}
+		if view.HostMode == session.HostModeHeadless {
+			return fmt.Errorf("host resource is unavailable for headless views")
+		}
+		return nil
+	}
 	if projectID, viewID, semanticID, ok := parseNodeURI(uri); ok {
 		runtime, err := s.registry.Runtime(projectID, viewID)
 		if err != nil {
@@ -1418,6 +1597,15 @@ func (s *Service) validateSubscription(_ context.Context, request *mcp.Subscribe
 			}
 			return nil
 		}
+		if len(parts) == 4 && parts[3] == "host" {
+			if view.HostMode == session.HostModeHeadless {
+				return fmt.Errorf("host resource is unavailable for headless views")
+			}
+			if _, err := s.registry.HostSnapshot(projectID, viewID); err != nil {
+				return err
+			}
+			return nil
+		}
 	}
 	return fmt.Errorf("unknown resource URI %q", uri)
 }
@@ -1462,6 +1650,16 @@ func (s *Service) addViewResources(projectID, viewID string) {
 	view, err := s.registry.ViewSummary(projectID, viewID)
 	if err != nil || !view.RuntimeAvailable {
 		return
+	}
+	if view.HostMode != session.HostModeHeadless {
+		hostURI := viewURI + "/host"
+		s.server.AddResource(&mcp.Resource{URI: hostURI, Name: "gora-host", MIMEType: "application/json"}, func(ctx context.Context, request *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+			host, hostErr := s.registry.HostSnapshot(projectID, viewID)
+			if hostErr != nil && host.SchemaVersion == 0 {
+				return nil, mcp.ResourceNotFoundError(request.Params.URI)
+			}
+			return jsonResource(request.Params.URI, host)
+		})
 	}
 	if s.automation {
 		automationURI := viewURI + "/automation"
@@ -1533,6 +1731,9 @@ func (s *Service) notifyView(projectID, viewID string) {
 	if s.automation {
 		_ = s.server.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: base + "/automation"})
 		_ = s.server.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: base + "/automation/overlay"})
+		if view, err := s.registry.ViewSummary(projectID, viewID); err == nil && view.HostMode != session.HostModeHeadless {
+			_ = s.server.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: base + "/host"})
+		}
 		runtime, err := s.registry.Runtime(projectID, viewID)
 		if err == nil && runtime.EventTrace().Enabled {
 			_ = s.server.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: base + "/automation/trace"})
@@ -1555,7 +1756,7 @@ func (s *Service) removeProjectResources(projectID string, views []ViewSummary, 
 		viewBase := base + "/views/" + view.ID
 		uris = append(uris, viewBase, viewBase+"/tree")
 		if s.automation {
-			uris = append(uris, viewBase+"/automation", viewBase+"/automation/trace", viewBase+"/automation/overlay")
+			uris = append(uris, viewBase+"/automation", viewBase+"/automation/trace", viewBase+"/automation/overlay", viewBase+"/host")
 		}
 	}
 	for _, source := range sources {
@@ -1600,6 +1801,20 @@ func parseAutomationURI(uri string) (string, string, bool) {
 		return "", "", false
 	}
 	rest := strings.TrimSuffix(strings.TrimPrefix(uri, prefix), "/automation")
+	parts := strings.SplitN(rest, "/views/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || strings.Contains(parts[1], "/") {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
+func parseHostURI(uri string) (string, string, bool) {
+	const prefix = "gora://project/"
+	const suffix = "/host"
+	if !strings.HasPrefix(uri, prefix) || !strings.HasSuffix(uri, suffix) {
+		return "", "", false
+	}
+	rest := strings.TrimSuffix(strings.TrimPrefix(uri, prefix), suffix)
 	parts := strings.SplitN(rest, "/views/", 2)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || strings.Contains(parts[1], "/") {
 		return "", "", false

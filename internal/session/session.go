@@ -45,11 +45,12 @@ type Response struct {
 const ProtocolVersion = 1
 
 const (
-	ActionHandshake = "handshake"
-	ActionSnapshot  = "snapshot"
-	ActionWait      = "wait"
-	ActionCommand   = "command"
-	ActionDetach    = "detach"
+	ActionHandshake    = "handshake"
+	ActionSnapshot     = "snapshot"
+	ActionWait         = "wait"
+	ActionCommand      = "command"
+	ActionHostSnapshot = "host_snapshot"
+	ActionDetach       = "detach"
 )
 
 // HostMode identifies the owner of a live runtime.
@@ -95,6 +96,7 @@ func ValidateCapabilities(capabilities []string) error {
 		"viewport": true, "selection": true, "activation": true, "scroll": true,
 		"state": true, "reset": true, "input": true, "editing": true,
 		"clock": true, "trace": true, "capture": true, "overlay": true, "faults": true,
+		"window": true, "studio": true,
 	}
 	if len(capabilities) > 256 {
 		return errors.New("host capabilities exceed limit")

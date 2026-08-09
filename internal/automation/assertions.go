@@ -211,11 +211,12 @@ type AssertionSnapshot struct {
 	Scroll        map[string]render.ScrollMetrics
 	ScrollOffsets map[string]image.Point
 	Trace         TraceSnapshot
+	HostValues    map[string]any
 }
 
 func validateAssertion(assertion Assertion) error {
 	switch assertion.Kind {
-	case "view", "trace":
+	case "view", "host", "studio", "trace":
 	case "node_exists", "node_absent", "node_state", "node_geometry", "node_relation", "scroll", "transient":
 		if assertion.SemanticID == "" && assertion.ID == "" && assertion.Kind != "transient" {
 			return fmt.Errorf("semantic_id is required")
@@ -271,6 +272,25 @@ func evaluateAssertion(snapshot AssertionSnapshot, assertion Assertion) Assertio
 		result.Actual, result.Passed = actual, ok && expectedEqual(expected, actual, assertion.Tolerance)
 		if !ok {
 			result.Reason = "unknown view field"
+		}
+	case "host", "studio":
+		values := snapshot.HostValues
+		// Studio fields are published under the host snapshot's studio member,
+		// but assertions intentionally consume one joined publication. Keep the
+		// envelope addressable as `studio` while allowing `kind: studio,
+		// field: inspect` to resolve directly against the nested Studio state.
+		if assertion.Kind == "studio" && assertion.Field != "studio" {
+			if nested, nestedOK := snapshot.HostValues["studio"].(map[string]any); nestedOK {
+				values = nested
+			}
+		}
+		actual, ok := values[assertion.Field]
+		if assertion.Field == "" {
+			actual, ok = values, true
+		}
+		result.Actual, result.Passed = actual, ok && expectedEqual(expected, actual, assertion.Tolerance)
+		if !ok {
+			result.Reason = "unknown host or Studio field"
 		}
 	case "node_exists", "node_absent":
 		node := findNode(snapshot.View.Tree, nodeID(assertion))
@@ -394,6 +414,8 @@ func assertionFieldsAllowed(assertion Assertion) bool {
 	allowed := map[string]bool{"kind": true, "expected": true, "tolerance": true}
 	sets := map[string][]string{
 		"view":          {"field", "diagnostic_index", "diagnostic_code", "diagnostic_severity", "diagnostic_codes"},
+		"host":          {"field"},
+		"studio":        {"field"},
 		"node_exists":   {"semantic_id", "id"},
 		"node_absent":   {"semantic_id", "id"},
 		"node_state":    {"semantic_id", "id", "field", "value"},

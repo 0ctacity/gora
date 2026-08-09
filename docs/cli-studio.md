@@ -215,9 +215,9 @@ view-local clipboard tools, deterministic view-clock controls, finite
 view-local test-overlay/reload controls (`gora_apply_test_overlay`,
 `gora_clear_test_overlay`, `gora_inject_reload_events`, and finite counted
 fault configuration);
-without it, ordinary project/view tools remain unchanged. This input boundary
-proves canonical pointer/keyboard/scroll routing and publication, not delivery
-through a visible Gio/OS window. See
+without it, ordinary project/view tools remain unchanged. With a matching
+automation-enabled app or Studio view, the same MCP controls operate through
+the real Gio host event loop; native OS injection remains deferred. See
 [MCP server](mcp.md).
 
 ## Session security
@@ -226,3 +226,9 @@ The local Unix socket is keyed by the canonical root, document, and host mode.
 Its parent directory is owner-only (`0700`) and its socket is owner-only
 (`0600`). Stale sockets are removed after connection failure and on clean
 shutdown.
+
+When launched with `--automation`, app and Studio hosts publish their observed
+window configuration and Studio state through the MCP host resource. MCP
+window and Studio mutations are reduced on the same Gio event loop as toolbar
+actions, and responses wait for the corresponding stable frame. A normal
+headless view has no host resource and rejects host-window operations.

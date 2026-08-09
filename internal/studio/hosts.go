@@ -3,6 +3,7 @@ package studio
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"syscall"
 	"time"
 
@@ -54,6 +56,10 @@ func StartAppWithAutomation(root, entry, socketPath string, automationEnabled bo
 	controller := NewHostController(64)
 	driver := NewHostAutomationDriver(runtime)
 	identity := hostIdentity(root, entry, session.HostModeApp, automationEnabled)
+	controller.SetHostIdentity(identity.InstanceID, string(identity.Mode), identity.PID, identity.Capabilities)
+	if automationEnabled {
+		controller.SetCommandHandler(appWindowCommandHandler(window, controller))
+	}
 	go func() {
 		for {
 			select {
@@ -105,13 +111,17 @@ func appEventLoop(window *app.Window, runtime *Runtime, server *session.Server, 
 	defer controller.Close()
 	theme := material.NewTheme()
 	state := newAppUIState()
-	var operations op.Ops
 	for {
 		event := window.Event()
 		switch event := event.(type) {
 		case app.DestroyEvent:
+			controller.UpdateWindowState(image.Point{}, image.Point{}, 0, 0, "", false, false, true)
 			return
+		case app.ConfigEvent:
+			config := event.Config
+			controller.UpdateWindowState(config.Size, config.Size, 1, 1, config.Mode.String(), config.Focused, true, false)
 		case app.FrameEvent:
+			controller.UpdateMetrics(logicalViewport(event.Size, event.Metric), event.Size, event.Metric.PxPerDp, event.Metric.PxPerSp)
 			commands := controller.Drain()
 			applied := make([]struct {
 				command HostCommand
@@ -123,7 +133,8 @@ func appEventLoop(window *app.Window, runtime *Runtime, server *session.Server, 
 					err     error
 				}{command: command, err: command.Apply()}
 			}
-			gtx := app.NewContext(&operations, event)
+			frameOps := &op.Ops{}
+			gtx := app.NewContext(frameOps, event)
 			layoutAppContent(gtx, theme, runtime, state, window)
 			if driver != nil {
 				if tree, treeErr := runtime.CurrentRuntimeTree(); treeErr == nil {
@@ -131,16 +142,99 @@ func appEventLoop(window *app.Window, runtime *Runtime, server *session.Server, 
 				}
 			}
 			snapshot := runtime.Snapshot()
-			for _, item := range applied {
-				var data json.RawMessage
-				if item.err == nil && item.command.Result != nil {
-					data, item.err = item.command.Result()
-				}
-				controller.Complete(item.command.RequestID, item.err, data)
-			}
-			controller.Publish(HostPublication{RuntimeRevision: snapshot.PublishedRuntimeRevision, GeometryRevision: snapshot.PublishedGeometryRevision, FrameRevision: snapshot.FrameRevision})
+			trace := runtime.EventTrace()
 			event.Frame(gtx.Ops)
+			for _, item := range applied {
+				controller.Complete(item.command.RequestID, item.err)
+			}
+			controller.Publish(HostPublication{RuntimeRevision: snapshot.PublishedRuntimeRevision, GeometryRevision: snapshot.PublishedGeometryRevision, FrameRevision: snapshot.FrameRevision, InputRevision: snapshot.AutomationInputRevision, TraceRevision: trace.Revision, ClientFrame: &HostClientFrame{Ops: frameOps, Size: event.Size}})
 		}
+	}
+}
+
+func appWindowCommandHandler(window *app.Window, controller *HostController) HostCommandHandler {
+	return func(command HostCommandPayload) (func() error, func() (json.RawMessage, error), error) {
+		switch command.Kind {
+		case "capture_host_client":
+			if command.Scale <= 0 {
+				return nil, nil, fmt.Errorf("scale must be a positive integer")
+			}
+			return func() error { return nil }, func() (json.RawMessage, error) {
+				data, warning, identity, err := controller.CaptureClientPNG(command.Scale)
+				if err != nil {
+					return nil, err
+				}
+				return mustJSON(map[string]any{"png_base64": base64.StdEncoding.EncodeToString(data), "warning": warning, "identity": identity}), nil
+			}, nil
+		case "set_window":
+			if (command.Width == 0) != (command.Height == 0) || command.Width < 0 || command.Height < 0 {
+				return nil, nil, fmt.Errorf("window width and height must be supplied together")
+			}
+			if command.Width == 0 && command.Height == 0 && command.Mode == "" {
+				return nil, nil, fmt.Errorf("window change is empty")
+			}
+			if command.Mode != "" && command.Mode != "windowed" && command.Mode != "minimized" && command.Mode != "maximized" && command.Mode != "fullscreen" {
+				return nil, nil, fmt.Errorf("unsupported window mode %q", command.Mode)
+			}
+			// A size/mode transition is not complete when Perform returns. The
+			// owning event loop must observe a later ConfigEvent and publish the
+			// following stable frame before the waiter is released.
+			snapshot := controller.HostSnapshot()
+			sizeChanges := command.Width != 0 && (snapshot.LogicalClientWidth != command.Width || snapshot.LogicalClientHeight != command.Height)
+			modeChanges := command.Mode != "" && snapshot.WindowMode != command.Mode
+			if sizeChanges || modeChanges {
+				controller.RequireConfigBarrier(command.RequestID)
+			}
+			return func() error {
+					if command.Width != 0 {
+						window.Option(app.Size(unit.Dp(command.Width), unit.Dp(command.Height)))
+					}
+					if command.Mode != "" {
+						window.Perform(windowModeAction(command.Mode))
+					}
+					return nil
+				}, func() (json.RawMessage, error) {
+					snapshot := controller.HostSnapshot()
+					if command.Width != 0 && (snapshot.LogicalClientWidth != command.Width || snapshot.LogicalClientHeight != command.Height) {
+						return nil, fmt.Errorf("window size transition was not observed: requested %dx%d, observed %dx%d", command.Width, command.Height, snapshot.LogicalClientWidth, snapshot.LogicalClientHeight)
+					}
+					if command.Mode != "" && snapshot.WindowMode != command.Mode {
+						return nil, fmt.Errorf("window mode transition was not observed: requested %s, observed %s", command.Mode, snapshot.WindowMode)
+					}
+					return mustJSON(snapshot), nil
+				}, nil
+		case "window_action":
+			if command.Action != "raise" && command.Action != "center" && command.Action != "close" {
+				return nil, nil, fmt.Errorf("unsupported window action %q", command.Action)
+			}
+			return func() error {
+				switch command.Action {
+				case "raise":
+					window.Perform(system.ActionRaise)
+				case "center":
+					window.Perform(system.ActionCenter)
+				case "close":
+					window.Perform(system.ActionClose)
+					controller.CompleteNow(command.RequestID, mustJSON(controller.HostSnapshot()), nil)
+				}
+				return nil
+			}, func() (json.RawMessage, error) { return mustJSON(controller.HostSnapshot()), nil }, nil
+		default:
+			return nil, nil, fmt.Errorf("unsupported app host command %q", command.Kind)
+		}
+	}
+}
+
+func windowModeAction(mode string) system.Action {
+	switch mode {
+	case "minimized":
+		return system.ActionMinimize
+	case "maximized":
+		return system.ActionMaximize
+	case "fullscreen":
+		return system.ActionFullscreen
+	default:
+		return system.ActionUnmaximize
 	}
 }
 
@@ -253,7 +347,12 @@ func hostIdentity(root, entry string, mode session.HostMode, automationEnabled b
 	if _, err := rand.Read(bytes); err != nil {
 		bytes = []byte(filepath.Base(entry) + time.Now().String())
 	}
-	return session.HostIdentity{InstanceID: hex.EncodeToString(bytes), Root: root, Document: entry, Mode: mode, PID: os.Getpid(), Automation: automationEnabled, Capabilities: []string{"activation", "capture", "clock", "command", "editing", "faults", "input", "overlay", "reset", "scroll", "selection", "snapshot", "state", "trace", "tree", "viewport", "wait"}}
+	capabilities := []string{"activation", "capture", "clock", "command", "editing", "faults", "input", "overlay", "reset", "scroll", "selection", "snapshot", "state", "trace", "tree", "viewport", "wait", "window"}
+	if mode == session.HostModeStudio {
+		capabilities = append(capabilities, "studio")
+	}
+	sort.Strings(capabilities)
+	return session.HostIdentity{InstanceID: hex.EncodeToString(bytes), Root: root, Document: entry, Mode: mode, PID: os.Getpid(), Automation: automationEnabled, Capabilities: capabilities}
 }
 
 func runtimeAllowInvalid(root, entry string) (*Runtime, error) {

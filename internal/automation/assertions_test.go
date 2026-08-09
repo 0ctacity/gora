@@ -68,6 +68,29 @@ func TestEvaluateAssertionsReportsMismatchesWithoutMutatingSnapshot(t *testing.T
 	}
 }
 
+func TestEvaluateAssertionsJoinsHostAndStudioFields(t *testing.T) {
+	snapshot := AssertionSnapshot{HostValues: map[string]any{
+		"connection_state": "connected",
+		"frame_revision":   float64(9),
+		"studio": map[string]any{
+			"inspect": true,
+		},
+	}}
+	report, err := EvaluateAssertions(snapshot, []Assertion{
+		{Kind: "host", Field: "connection_state", Expected: "connected"},
+		{Kind: "host", Field: "frame_revision", Expected: float64(9)},
+		{Kind: "studio", Field: "studio", Expected: map[string]any{"inspect": true}},
+		{Kind: "studio", Field: "inspect", Expected: true},
+	})
+	if err != nil || !report.Passed {
+		t.Fatalf("host/studio assertion report=%+v err=%v", report, err)
+	}
+	failed, err := EvaluateAssertions(snapshot, []Assertion{{Kind: "host", Field: "unknown", Expected: true}})
+	if err != nil || failed.Passed || failed.Results[0].Reason != "unknown host or Studio field" {
+		t.Fatalf("unknown host field report=%+v err=%v", failed, err)
+	}
+}
+
 func TestEvaluateAssertionsSupportsScrollTransientScopeAndTraceFields(t *testing.T) {
 	root := &semantic.Node{ID: "root", Bounds: &semantic.Rect{X: 0, Y: 0, Width: 100, Height: 100}, Clip: &semantic.Rect{X: 0, Y: 0, Width: 100, Height: 100}, Children: []*semantic.Node{{ID: "scroll", Handle: "scroll-handle", Role: "scroll", Bounds: &semantic.Rect{X: 0, Y: 0, Width: 80, Height: 80}, Clip: &semantic.Rect{X: 0, Y: 0, Width: 80, Height: 80}}}}
 	checked := AssertionSnapshot{

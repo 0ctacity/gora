@@ -35,6 +35,7 @@ import (
 	"gioui.org/widget/material"
 
 	"gora/internal/automation"
+	"gora/internal/document"
 	"gora/internal/interaction"
 	"gora/internal/project"
 	"gora/internal/render"
@@ -46,46 +47,64 @@ import (
 const fieldClipboardMIME = "application/text"
 
 type uiState struct {
-	nextScreen        widget.Clickable
-	widthEditor       widget.Editor
-	heightEditor      widget.Editor
-	zoomOut           widget.Clickable
-	zoomIn            widget.Clickable
-	inspect           widget.Clickable
-	capture           widget.Clickable
-	output            widget.Editor
-	zoomValue         float32
-	zoomInitialized   bool
-	inspecting        bool
-	selected          string
-	selectedHandle    string
-	status            string
-	zoomInput         struct{}
-	zoomScrolling     bool
-	zoomBlockUntil    time.Time
-	canvasViewport    image.Point
-	canvasSize        image.Point
-	canvasPan         image.Point
-	scrollbar         widget.Scrollbar
-	runtimeTree       *semantic.Node
-	preview           render.GioCache
-	checkerboard      checkerboardCache
-	previewScroll     previewScrollbarModel
-	previewScrollRoot *project.Node
-	router            *interaction.Router
-	interactionInput  struct{}
-	inspectPointerID  int
-	inspectPressed    bool
-	inspectPending    bool
-	inspectPoint      image.Point
-	resetState        widget.Clickable
-	fieldPointerID    int
-	fieldSelectionID  string
-	fieldAnchor       int
-	lastFieldClick    time.Duration
-	lastFieldClickID  string
-	caretBlinkStart   time.Time
-	fieldClickCount   int
+	nextScreen         widget.Clickable
+	widthEditor        widget.Editor
+	heightEditor       widget.Editor
+	zoomOut            widget.Clickable
+	zoomIn             widget.Clickable
+	inspect            widget.Clickable
+	capture            widget.Clickable
+	output             widget.Editor
+	zoomValue          float32
+	zoomInitialized    bool
+	inspecting         bool
+	selected           string
+	selectedSemanticID string
+	selectedHandle     string
+	status             string
+	zoomInput          struct{}
+	zoomScrolling      bool
+	zoomBlockUntil     time.Time
+	canvasViewport     image.Point
+	canvasSize         image.Point
+	canvasPan          image.Point
+	scrollbar          widget.Scrollbar
+	runtimeTree        *semantic.Node
+	preview            render.GioCache
+	checkerboard       checkerboardCache
+	previewScroll      previewScrollbarModel
+	previewScrollRoot  *project.Node
+	router             *interaction.Router
+	interactionInput   struct{}
+	inspectPointerID   int
+	inspectPressed     bool
+	inspectPending     bool
+	inspectPoint       image.Point
+	resetState         widget.Clickable
+	fieldPointerID     int
+	fieldSelectionID   string
+	fieldAnchor        int
+	lastFieldClick     time.Duration
+	lastFieldClickID   string
+	caretBlinkStart    time.Time
+	fieldClickCount    int
+	controller         *StudioController
+}
+
+func newStudioUIState(runtime *Runtime) *uiState {
+	state := &uiState{zoomValue: 1, router: interaction.NewRouter(), controller: NewStudioController()}
+	state.output.SingleLine = true
+	state.output.Alignment = text.End
+	state.output.SetText(filepath.Join(filepath.Dir(runtime.entry), "gora-capture.png"))
+	state.controller.SyncFromUI(StudioState{Zoom: 1, CaptureOutput: state.output.Text()})
+	for _, editor := range []*widget.Editor{&state.widthEditor, &state.heightEditor} {
+		editor.SingleLine = true
+		editor.Submit = true
+		editor.Alignment = text.Middle
+		editor.Filter = "0123456789"
+		editor.MaxLen = 6
+	}
+	return state
 }
 
 type checkerboardCache struct {
@@ -116,6 +135,11 @@ func StartWithAutomation(root, entry, socketPath string, automationEnabled bool)
 	controller := NewHostController(64)
 	driver := NewHostAutomationDriver(runtime)
 	identity := hostIdentity(root, entry, session.HostModeStudio, automationEnabled)
+	controller.SetHostIdentity(identity.InstanceID, string(identity.Mode), identity.PID, identity.Capabilities)
+	state := newStudioUIState(runtime)
+	if automationEnabled {
+		controller.SetCommandHandler(studioWindowCommandHandler(window, runtime, controller, state))
+	}
 	go func() {
 		for {
 			select {
@@ -154,36 +178,32 @@ func StartWithAutomation(root, entry, socketPath string, automationEnabled bool)
 			}})
 		})
 	}()
-	go eventLoop(window, runtime, server, controller, driver, func() {
+	go eventLoop(window, runtime, server, controller, driver, state, func() {
 		signal.Stop(signals)
 		cancel()
 	})
 	return nil
 }
 
-func eventLoop(window *app.Window, runtime *Runtime, server *session.Server, controller *HostController, driver *automation.Driver, cleanup func()) {
+func eventLoop(window *app.Window, runtime *Runtime, server *session.Server, controller *HostController, driver *automation.Driver, state *uiState, cleanup func()) {
 	defer cleanup()
 	defer server.Close()
 	defer controller.Close()
 	theme := material.NewTheme()
-	state := &uiState{zoomValue: 1, router: interaction.NewRouter()}
-	state.output.SingleLine = true
-	state.output.Alignment = text.End
-	state.output.SetText(filepath.Join(filepath.Dir(runtime.entry), "gora-capture.png"))
-	for _, editor := range []*widget.Editor{&state.widthEditor, &state.heightEditor} {
-		editor.SingleLine = true
-		editor.Submit = true
-		editor.Alignment = text.Middle
-		editor.Filter = "0123456789"
-		editor.MaxLen = 6
+	if state == nil {
+		state = newStudioUIState(runtime)
 	}
-	var operations op.Ops
 	for {
 		event := window.Event()
 		switch event := event.(type) {
 		case app.DestroyEvent:
+			controller.UpdateWindowState(image.Point{}, image.Point{}, 0, 0, "", false, false, true)
 			return
+		case app.ConfigEvent:
+			config := event.Config
+			controller.UpdateWindowState(config.Size, config.Size, 1, 1, config.Mode.String(), config.Focused, true, false)
 		case app.FrameEvent:
+			controller.UpdateMetrics(logicalViewport(event.Size, event.Metric), event.Size, event.Metric.PxPerDp, event.Metric.PxPerSp)
 			commands := controller.Drain()
 			applied := make([]struct {
 				command HostCommand
@@ -195,23 +215,82 @@ func eventLoop(window *app.Window, runtime *Runtime, server *session.Server, con
 					err     error
 				}{command: command, err: command.Apply()}
 			}
-			context := app.NewContext(&operations, event)
+			frameOps := &op.Ops{}
+			context := app.NewContext(frameOps, event)
 			layoutStudio(context, theme, runtime, state, window)
+			controller.UpdateStudioState(HostStudioSnapshot{
+				Selection:            runtime.Snapshot().Screen,
+				ViewportWidth:        runtime.Snapshot().Viewport.X,
+				ViewportHeight:       runtime.Snapshot().Viewport.Y,
+				Zoom:                 state.zoomValue,
+				Inspect:              state.inspecting,
+				SelectedSemanticID:   state.selectedSemanticID,
+				CanvasViewportWidth:  state.canvasViewport.X,
+				CanvasViewportHeight: state.canvasViewport.Y,
+				CanvasWidth:          state.canvasSize.X,
+				CanvasHeight:         state.canvasSize.Y,
+				CanvasPanX:           state.canvasPan.X,
+				CanvasPanY:           state.canvasPan.Y,
+				Status:               state.status,
+				CaptureOutput:        state.output.Text(),
+			}, state.controller.Snapshot().Revision)
 			if driver != nil {
 				if tree, treeErr := runtime.CurrentRuntimeTree(); treeErr == nil {
 					driver.Update(tree)
 				}
 			}
 			snapshot := runtime.Snapshot()
-			for _, item := range applied {
-				var data json.RawMessage
-				if item.err == nil && item.command.Result != nil {
-					data, item.err = item.command.Result()
-				}
-				controller.Complete(item.command.RequestID, item.err, data)
-			}
-			controller.Publish(HostPublication{RuntimeRevision: snapshot.PublishedRuntimeRevision, GeometryRevision: snapshot.PublishedGeometryRevision, FrameRevision: snapshot.FrameRevision})
+			trace := runtime.EventTrace()
 			event.Frame(context.Ops)
+			for _, item := range applied {
+				controller.Complete(item.command.RequestID, item.err)
+			}
+			controller.Publish(HostPublication{RuntimeRevision: snapshot.PublishedRuntimeRevision, GeometryRevision: snapshot.PublishedGeometryRevision, FrameRevision: snapshot.FrameRevision, InputRevision: snapshot.AutomationInputRevision, TraceRevision: trace.Revision, ClientFrame: &HostClientFrame{Ops: frameOps, Size: event.Size}})
+		}
+	}
+}
+
+func studioWindowCommandHandler(window *app.Window, runtime *Runtime, host *HostController, state *uiState) HostCommandHandler {
+	return func(command HostCommandPayload) (func() error, func() (json.RawMessage, error), error) {
+		switch command.Kind {
+		case "set_window", "window_action", "capture_host_client":
+			return appWindowCommandHandler(window, host)(command)
+		case "set_studio_state":
+			return func() error {
+					change := StudioStateChange{Inspect: command.Inspect, PanX: command.PanX, PanY: command.PanY, ResetState: command.ResetState}
+					if command.Selection != "" {
+						change.Selection = &command.Selection
+					}
+					if command.Width != 0 {
+						change.ViewportWidth, change.ViewportHeight = &command.Width, &command.Height
+					}
+					if command.Zoom != 0 {
+						change.Zoom = &command.Zoom
+					}
+					if command.Inspect != nil && !*command.Inspect {
+						emptySelection := ""
+						change.SelectedSemanticID = &emptySelection
+					} else if command.SelectedID != "" {
+						change.SelectedSemanticID = &command.SelectedID
+					}
+					if command.OutputSet {
+						change.CaptureOutput = &command.Output
+					}
+					if command.ResetState {
+						status := "state reset"
+						change.Status = &status
+					}
+					if err := applyStudioUITransition(runtime, state, change); err != nil {
+						return err
+					}
+					window.Invalidate()
+					return nil
+				}, func() (json.RawMessage, error) {
+					snapshot := host.HostSnapshot()
+					return mustJSON(snapshot), nil
+				}, nil
+		default:
+			return nil, nil, fmt.Errorf("unsupported Studio host command %q", command.Kind)
 		}
 	}
 }
@@ -230,8 +309,8 @@ func layoutStudio(gtx layout.Context, theme *material.Theme, runtime *Runtime, s
 			int(float32(gtx.Constraints.Max.X)/scale),
 			max(1, int(float32(gtx.Constraints.Max.Y)/scale)-110),
 		)
-		state.zoomValue = fitZoom(snapshot.Viewport, available)
-		state.zoomInitialized = true
+		zoom := fitZoom(snapshot.Viewport, available)
+		_ = applyStudioUITransition(runtime, state, StudioStateChange{Zoom: &zoom})
 	}
 
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
@@ -259,15 +338,25 @@ func layoutStudioCanvas(gtx layout.Context, theme *material.Theme, runtime *Runt
 		previewGtx.Dp(unit.Dp(snapshot.Viewport.X)),
 		previewGtx.Dp(unit.Dp(snapshot.Viewport.Y)),
 	)
+	if state.controller != nil {
+		state.controller.SetCanvas(viewport, size)
+		clamped := state.controller.Snapshot()
+		state.canvasPan = image.Pt(clamped.CanvasPanX, clamped.CanvasPanY)
+	}
 	oldHorizontalOverflow := max(0, state.canvasSize.X-state.canvasViewport.X)
+	oldVerticalOverflow := max(0, state.canvasSize.Y-state.canvasViewport.Y)
 	state.canvasViewport = viewport
 	state.canvasSize = size
 	horizontalOverflow := max(0, size.X-viewport.X)
+	verticalOverflow := max(0, size.Y-viewport.Y)
 	if oldHorizontalOverflow == 0 && horizontalOverflow > 0 {
 		state.canvasPan.X = horizontalOverflow / 2
 	}
+	if oldVerticalOverflow == 0 && verticalOverflow > 0 {
+		state.canvasPan.Y = verticalOverflow / 2
+	}
 	state.canvasPan.X = min(max(0, state.canvasPan.X), horizontalOverflow)
-	state.canvasPan.Y = max(0, size.Y-viewport.Y) / 2
+	state.canvasPan.Y = min(max(0, state.canvasPan.Y), verticalOverflow)
 
 	hardClip := clip.Rect{Max: viewport}.Push(gtx.Ops)
 	event.Op(gtx.Ops, &state.zoomInput)
@@ -297,6 +386,19 @@ func layoutStudioCanvas(gtx layout.Context, theme *material.Theme, runtime *Runt
 		paintHighlight(previewGtx, result.Bounds[state.selectedHandle])
 	}
 	state.runtimeTree = result.Tree
+	if state.controller != nil {
+		visible := make(map[string]bool)
+		for _, node := range semantic.Flatten(result.Tree) {
+			hasBounds := node.Bounds != nil && node.Bounds.Width > 0 && node.Bounds.Height > 0
+			visible[node.ID] = node.Visible && hasBounds && node.InViewport
+		}
+		state.controller.PruneSelection(visible)
+		if state.selectedSemanticID != "" && !visible[state.selectedSemanticID] {
+			state.selectedSemanticID = ""
+			state.selectedHandle = ""
+			state.selected = ""
+		}
+	}
 	runtime.PublishFrame(result.Tree, result.Scroll)
 	if state.router == nil {
 		state.router = interaction.NewRouter()
@@ -347,6 +449,175 @@ func renderState(snapshot Snapshot) render.State {
 		Hovered:    snapshot.Transient.Hovered, Pressed: snapshot.Transient.Pressed, Focused: snapshot.Transient.Focused,
 		OpenSelect: snapshot.Transient.OpenSelect, ActiveOption: snapshot.Transient.ActiveOption,
 	}
+}
+
+// selectableSemanticNode resolves authored semantic IDs for Studio inspect
+// state. Renderer handles are intentionally an internal paint/highlight key
+// and are never accepted from MCP or persisted in the controller snapshot.
+func selectableSemanticNode(root *semantic.Node, id string) *semantic.Node {
+	if root == nil || id == "" {
+		return nil
+	}
+	for _, node := range semantic.Flatten(root) {
+		if node.ID != id || !node.Visible || !node.InViewport || node.Bounds == nil || node.Bounds.Width <= 0 || node.Bounds.Height <= 0 {
+			continue
+		}
+		return node
+	}
+	return nil
+}
+
+// previewStudioTree resolves and lays out a candidate selection/viewport
+// without mutating Runtime. Studio batches use it to validate fields in their
+// documented order before committing any runtime or controller state.
+func previewStudioTree(runtime *Runtime, selection string, viewport image.Point) (*semantic.Node, error) {
+	runtime.mu.RLock()
+	if runtime.loaded == nil {
+		runtime.mu.RUnlock()
+		return nil, fmt.Errorf("no valid runtime tree is available")
+	}
+	if selection == "" {
+		selection = runtime.selected
+	}
+	if viewport.X <= 0 || viewport.Y <= 0 {
+		viewport = runtime.viewport
+	}
+	root := runtime.loaded.Root
+	if runtime.loaded.Document.Kind == document.KindApp {
+		root = runtime.loaded.Screens[selection]
+	}
+	if root == nil {
+		runtime.mu.RUnlock()
+		return nil, fmt.Errorf("unknown selection %q", selection)
+	}
+	values := map[string]map[string]any{}
+	transient := interaction.Transient{}
+	if runtime.state != nil {
+		values = runtime.state.AllValues()
+		transient = runtime.state.Transient()
+	}
+	var editing map[string]interaction.EditingState
+	if runtime.editing != nil {
+		editing = runtime.editing.States()
+	}
+	snapshot := Snapshot{
+		Screen: selection, Viewport: viewport, Scroll: cloneScroll(runtime.scroll),
+		StateValues: values, Transient: transient, Editing: editing,
+		AssetBytes: assetBytesFromOverlay(runtime.overlay),
+	}
+	runtime.mu.RUnlock()
+	if transient.OpenSelect != "" {
+		root = interaction.ResolveTreeWithFields(root, values, transient, editing, selection)
+	} else {
+		root = interaction.ResolvePersistentTreeWithFields(root, values, editing, selection)
+	}
+	return render.Render(root, viewport, renderState(snapshot)).Tree, nil
+}
+
+func applyStudioUITransition(runtime *Runtime, state *uiState, change StudioStateChange) error {
+	if runtime == nil || state == nil || state.controller == nil {
+		return fmt.Errorf("Studio controller is unavailable")
+	}
+	snapshot := runtime.Snapshot()
+	if change.Selection != nil {
+		found := false
+		for _, selection := range snapshot.Screens {
+			if selection == *change.Selection {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("unknown selection %q", *change.Selection)
+		}
+	}
+	if change.ViewportWidth != nil {
+		if change.ViewportHeight == nil || *change.ViewportWidth <= 0 || *change.ViewportHeight <= 0 {
+			return fmt.Errorf("studio viewport dimensions must be positive")
+		}
+	}
+	if change.Zoom != nil && (*change.Zoom < 0.25 || *change.Zoom > 4) {
+		return errStudioZoomRange
+	}
+	var candidateTree *semantic.Node
+	if change.SelectedSemanticID != nil {
+		inspectEnabled := state.controller.Snapshot().Inspect
+		if change.Inspect != nil {
+			inspectEnabled = *change.Inspect
+		}
+		if *change.SelectedSemanticID != "" {
+			if !inspectEnabled {
+				return fmt.Errorf("selected semantic ID requires inspect mode")
+			}
+			selection := snapshot.Screen
+			if change.Selection != nil {
+				selection = *change.Selection
+			}
+			viewport := snapshot.Viewport
+			if change.ViewportWidth != nil {
+				viewport = image.Pt(*change.ViewportWidth, *change.ViewportHeight)
+			}
+			tree, err := previewStudioTree(runtime, selection, viewport)
+			if err != nil {
+				return err
+			}
+			candidateTree = tree
+			if selectableSemanticNode(tree, *change.SelectedSemanticID) == nil {
+				return fmt.Errorf("semantic ID %q is not visible and selectable", *change.SelectedSemanticID)
+			}
+		}
+	}
+	if change.Selection != nil && !runtime.SelectScreen(*change.Selection) {
+		return fmt.Errorf("unknown selection %q", *change.Selection)
+	}
+	if change.ViewportWidth != nil {
+		runtime.SetViewport(*change.ViewportWidth, *change.ViewportHeight)
+	}
+	if change.ResetState {
+		runtime.ResetState()
+	}
+	// Runtime mutations above are all prevalidated. Commit the reducer only
+	// after they succeed so a rejected transition cannot leave Studio and the
+	// document runtime on different revisions. Toolbar widgets and MCP use
+	// this same commit path.
+	if err := state.controller.Apply(change); err != nil {
+		return err
+	}
+	applied := state.controller.Snapshot()
+	state.zoomValue = applied.Zoom
+	state.zoomInitialized = true
+	state.inspecting = applied.Inspect
+	state.selectedSemanticID = applied.SelectedSemanticID
+	state.canvasPan = image.Pt(applied.CanvasPanX, applied.CanvasPanY)
+	state.status = applied.Status
+	if change.CaptureOutput != nil {
+		state.output.SetText(applied.CaptureOutput)
+	}
+	tree := candidateTree
+	if tree == nil {
+		tree, _ = runtime.CurrentRuntimeTree()
+	}
+	if tree != nil {
+		if node := selectableSemanticNode(tree, state.selectedSemanticID); node != nil {
+			state.selectedHandle = node.Handle
+		} else {
+			state.selectedHandle = ""
+		}
+	}
+	if change.Inspect != nil {
+		state.router.SetInspecting(*change.Inspect)
+		if !*change.Inspect {
+			state.selected = ""
+			state.inspectPressed = false
+			state.inspectPending = false
+			clearFieldSelectionOwnership(state)
+		}
+		runtime.SetTransient(state.router.Transient())
+	}
+	if change.ResetState {
+		state.router.Update(nil)
+	}
+	return nil
 }
 
 func liveRenderState(snapshot Snapshot, now, caretBlinkStart time.Time) render.State {
@@ -550,13 +821,21 @@ func handleActions(gtx layout.Context, runtime *Runtime, state *uiState, snapsho
 	scrollEvents := collectCanvasScrollEvents(gtx, state)
 	blockPageScroll := state.blockPageScroll(gtx.Now, scrollEvents.zoom, float32(len(scrollEvents.events)))
 	if scrollEvents.zoom != 0 {
-		state.zoomValue = zoomAfterTrackpadScroll(state.zoomValue, scrollEvents.zoom)
+		zoom := zoomAfterTrackpadScroll(state.zoomValue, scrollEvents.zoom)
+		if err := applyStudioUITransition(runtime, state, StudioStateChange{Zoom: &zoom}); err != nil {
+			state.status = err.Error()
+		}
 	}
 	if !blockPageScroll && !state.router.ScrollbarPointerOwned() && len(scrollEvents.events) != 0 {
 		scale := state.zoomValue * gtx.Metric.PxPerDp
+		beforePan := state.canvasPan
 		if routeScrollEvents(runtime, state, snapshot, scrollEvents.events, scale, func(delta float32) bool {
 			return state.panCanvas("horizontal", delta)
 		}) {
+			if state.canvasPan != beforePan {
+				panX, panY := state.canvasPan.X, state.canvasPan.Y
+				_ = applyStudioUITransition(runtime, state, StudioStateChange{PanX: &panX, PanY: &panY})
+			}
 			window.Invalidate()
 		}
 	}
@@ -568,36 +847,38 @@ func handleActions(gtx layout.Context, runtime *Runtime, state *uiState, snapsho
 				break
 			}
 		}
-		runtime.SelectScreen(snapshot.Screens[index])
+		selection := snapshot.Screens[index]
+		if err := applyStudioUITransition(runtime, state, StudioStateChange{Selection: &selection}); err != nil {
+			state.status = err.Error()
+		}
 	}
 	if viewportSubmitted(gtx, state) {
 		viewport, err := viewportFromEditors(state)
 		if err != nil {
-			state.status = err.Error()
+			status := err.Error()
+			_ = applyStudioUITransition(runtime, state, StudioStateChange{Status: &status})
 		} else {
-			runtime.SetViewport(viewport.X, viewport.Y)
+			_ = applyStudioUITransition(runtime, state, StudioStateChange{ViewportWidth: &viewport.X, ViewportHeight: &viewport.Y})
 		}
 	}
 	if state.zoomOut.Clicked(gtx) {
-		state.zoomValue = zoomByStep(state.zoomValue, -1)
+		zoom := zoomByStep(state.zoomValue, -1)
+		_ = applyStudioUITransition(runtime, state, StudioStateChange{Zoom: &zoom})
 	}
 	if state.zoomIn.Clicked(gtx) {
-		state.zoomValue = zoomByStep(state.zoomValue, 1)
+		zoom := zoomByStep(state.zoomValue, 1)
+		_ = applyStudioUITransition(runtime, state, StudioStateChange{Zoom: &zoom})
 	}
 	if state.inspect.Clicked(gtx) {
-		state.inspecting = !state.inspecting
-		state.selected = ""
-		state.selectedHandle = ""
-		state.inspectPressed = false
-		state.inspectPending = false
-		clearFieldSelectionOwnership(state)
-		state.router.SetInspecting(state.inspecting)
-		runtime.SetTransient(state.router.Transient())
+		inspect := !state.inspecting
+		emptySelection := ""
+		if err := applyStudioUITransition(runtime, state, StudioStateChange{Inspect: &inspect, SelectedSemanticID: &emptySelection}); err != nil {
+			state.status = err.Error()
+		}
 	}
 	if state.resetState.Clicked(gtx) {
-		runtime.ResetState()
-		state.router.Update(nil)
-		state.status = "state reset"
+		status := "state reset"
+		_ = applyStudioUITransition(runtime, state, StudioStateChange{ResetState: true, Status: &status})
 	}
 	if state.inspectPending && state.inspecting && snapshot.Root != nil {
 		state.inspectPending = false
@@ -605,7 +886,19 @@ func handleActions(gtx layout.Context, runtime *Runtime, state *uiState, snapsho
 			return node.Visible
 		})
 		if node != nil {
-			state.selectedHandle = node.Handle
+			selectedID := node.ID
+			if state.controller != nil {
+				if err := applyStudioUITransition(runtime, state, StudioStateChange{SelectedSemanticID: &selectedID}); err != nil {
+					status := err.Error()
+					_ = applyStudioUITransition(runtime, state, StudioStateChange{Status: &status})
+				}
+			} else {
+				// Lightweight renderer tests may intentionally omit the Studio
+				// controller; keep their internal highlight path while retaining
+				// the authored semantic ID as the selection value.
+				state.selectedSemanticID = selectedID
+				state.selectedHandle = node.Handle
+			}
 			state.selected = fmt.Sprintf("%s %q role=%s label=%q enabled=%t hovered=%t pressed=%t focused=%t scope=%s state=%v actions=%v bounds=%v clip=%v props=%v · %s:%d · %v",
 				node.Type, node.Name,
 				node.Role, node.Label, node.Enabled, node.Hovered, node.Pressed, node.Focused,
@@ -614,13 +907,20 @@ func handleActions(gtx layout.Context, runtime *Runtime, state *uiState, snapsho
 		}
 	}
 	if state.capture.Clicked(gtx) {
+		output := state.output.Text()
+		if state.controller.Snapshot().CaptureOutput != output {
+			_ = applyStudioUITransition(runtime, state, StudioStateChange{CaptureOutput: &output})
+		}
 		warning, err := runtime.Capture(state.output.Text(), 1)
 		if err != nil {
-			state.status = err.Error()
+			status := err.Error()
+			_ = applyStudioUITransition(runtime, state, StudioStateChange{Status: &status})
 		} else if warning != "" {
-			state.status = warning
+			status := warning
+			_ = applyStudioUITransition(runtime, state, StudioStateChange{Status: &status})
 		} else {
-			state.status = "captured " + state.output.Text()
+			status := "captured " + state.output.Text()
+			_ = applyStudioUITransition(runtime, state, StudioStateChange{Status: &status})
 		}
 	}
 	_ = window

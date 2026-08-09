@@ -13,7 +13,8 @@ V1 is deliberately a preview tool. It does not generate production UI code and
 does not include URL routing, animation, remote assets, SVG, secure/password
 fields, file inputs, or OS-level input injection. The optional MCP automation
 gate provides deterministic renderer-neutral pointer and keyboard batches for
-testing headless app/component views.
+headless views and can attach to an automation-enabled visible app or Studio
+host without creating a shadow runtime.
 
 ## Install
 
@@ -93,8 +94,9 @@ Start it with renderer-neutral input automation enabled:
 
 Agents can then use `gora_dispatch_input` for validated pointer, keyboard, and
 wheel/trackpad event batches, `gora_wait_for_view` for publication/idle
-barriers, and the opt-in bounded event trace tools/resources. This does not
-inject events into a visible native window.
+barriers, and the opt-in bounded event trace tools/resources. Attached
+app/Studio views also expose host metrics and finite window/Studio-state tools
+through the same Gio event loop; native OS input injection remains deferred.
 
 Automation batches also support focused grapheme-indexed editing, composition,
 view-local clipboard copy/cut/paste, undo/redo, and deterministic frozen view

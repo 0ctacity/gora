@@ -231,3 +231,23 @@ external edits retain their last-good runtime snapshots.
    capture the visible result.
 6. Patch documents with the latest source revisions and re-read affected
    resources after the coalesced update.
+
+## Attached app and Studio hosts
+
+Run the MCP server with `--automation`, then start a visible host with
+`gora run <file> --automation` or `gora run <file> --studio --automation`.
+Open the matching view with `host_mode: "app"` or `host_mode: "studio"`.
+Attached views expose the immutable
+`gora://project/{project-id}/views/{view-id}/host` resource. It reports the
+host identity, connection state, logical and physical client metrics, Gio
+window mode/focus/visibility, revisions, pending-command count, and Studio
+selection/viewport/zoom/inspect/pan/output metadata. Headless views never
+expose this resource.
+
+The attached-only tools `gora_set_window`, `gora_perform_window_action`, and
+`gora_set_studio_state` enqueue finite operations on the host's Gio event loop.
+They return only after the host publishes its next stable frame; unsupported
+mode transitions are reported as errors. Closing a window acknowledges the
+request and then disconnects the view. The `host_client` capture target uses
+the attached host capture path; the default `document` target remains
+unchanged and headless views reject `host_client`.

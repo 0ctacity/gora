@@ -99,6 +99,7 @@ type ViewBackend interface {
 	Mode() session.HostMode
 	Connected() bool
 	Snapshot(context.Context) (studio.AutomationSnapshot, error)
+	HostSnapshot(context.Context) (studio.HostSnapshot, error)
 	Wait(context.Context, studio.WaitForViewRequest) (studio.AutomationSnapshot, error)
 	Inspect(context.Context) ([]byte, error)
 	SetViewport(context.Context, int, int) error
@@ -134,6 +135,9 @@ func (backend *headlessBackend) Snapshot(context.Context) (studio.AutomationSnap
 		return studio.AutomationSnapshot{}, fmt.Errorf("headless backend is unavailable")
 	}
 	return backend.runtime.AutomationSnapshot(), nil
+}
+func (backend *headlessBackend) HostSnapshot(context.Context) (studio.HostSnapshot, error) {
+	return studio.HostSnapshot{}, fmt.Errorf("host resource is unavailable for headless views")
 }
 func (backend *headlessBackend) Wait(ctx context.Context, request studio.WaitForViewRequest) (studio.AutomationSnapshot, error) {
 	if backend == nil || backend.runtime == nil {
@@ -251,6 +255,53 @@ func (backend *hostBackend) Snapshot(_ context.Context) (studio.AutomationSnapsh
 		return backend.last, fmt.Errorf("attached host is disconnected: %s", backend.reason)
 	}
 	return backend.last, nil
+}
+func (backend *hostBackend) HostSnapshot(ctx context.Context) (studio.HostSnapshot, error) {
+	if backend == nil {
+		return studio.HostSnapshot{}, fmt.Errorf("host backend is unavailable")
+	}
+	backend.mu.Lock()
+	if !backend.connected && backend.lastHost.SchemaVersion != 0 {
+		snapshot := hostSnapshotFromDisconnected(backend)
+		backend.mu.Unlock()
+		return snapshot, fmt.Errorf("attached host is disconnected: %s", snapshot.ConnectionState)
+	}
+	backend.mu.Unlock()
+	if err := backend.ensureConnected(); err != nil {
+		backend.mu.Lock()
+		snapshot := hostSnapshotFromDisconnected(backend)
+		backend.mu.Unlock()
+		return snapshot, err
+	}
+	backend.mu.Lock()
+	socketPath := backend.socketPath
+	backend.mu.Unlock()
+	response, err := session.Send(socketPath, session.Request{Version: session.ProtocolVersion, RequestID: opaqueID(), Action: session.ActionHostSnapshot}, 500*time.Millisecond)
+	if err != nil {
+		backend.mu.Lock()
+		backend.connected = false
+		backend.reason = err.Error()
+		snapshot := hostSnapshotFromDisconnected(backend)
+		backend.mu.Unlock()
+		return snapshot, err
+	}
+	if !response.OK {
+		return studio.HostSnapshot{}, fmt.Errorf("host snapshot rejected: %s", response.Error)
+	}
+	var snapshot studio.HostSnapshot
+	if err := json.Unmarshal(response.Data, &snapshot); err != nil {
+		return studio.HostSnapshot{}, err
+	}
+	backend.mu.Lock()
+	backend.lastHost = snapshot
+	backend.mu.Unlock()
+	return snapshot, nil
+}
+
+func hostSnapshotFromDisconnected(backend *hostBackend) studio.HostSnapshot {
+	snapshot := backend.lastHost
+	snapshot.ConnectionState = "disconnected"
+	return snapshot
 }
 func (backend *hostBackend) Wait(ctx context.Context, request studio.WaitForViewRequest) (studio.AutomationSnapshot, error) {
 	if backend == nil {
