@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"image"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 
 	"gora/internal/document"
 	"gora/internal/interaction"
+	"gora/internal/scrollinput"
 	"gora/internal/semantic"
 )
 
@@ -25,6 +27,21 @@ type Runtime interface {
 	ScrollSemanticID(string, string, int, int) error
 	SetTransient(interaction.Transient)
 	PublishRouterSnapshot(interaction.RouterSnapshot)
+}
+
+// ScrollRuntime is implemented by hosts that share the renderer-neutral
+// scroll adapter. It is optional so focused router tests can use a minimal
+// fake runtime.
+type ScrollRuntime interface {
+	RouteScroll(scrollinput.Event) (scrollinput.Outcome, error)
+}
+
+type TraceRuntime interface {
+	RecordEventTrace(TraceEntry)
+}
+
+type TraceSnapshotRuntime interface {
+	EventTrace() TraceSnapshot
 }
 
 // RevisionSnapshot is the bounded revision subset returned with each event
@@ -45,7 +62,7 @@ type SnapshotFunc func() RevisionSnapshot
 // not apply to the selected type/kind are ignored only after validation.
 type Event struct {
 	Type      string   `json:"type"`
-	Kind      string   `json:"kind"`
+	Kind      string   `json:"kind,omitempty"`
 	PointerID int      `json:"pointer_id,omitempty"`
 	Source    string   `json:"source,omitempty"`
 	X         float64  `json:"x,omitempty"`
@@ -55,6 +72,11 @@ type Event struct {
 	TimeMS    float64  `json:"time_ms,omitempty"`
 	Name      string   `json:"name,omitempty"`
 	Repeat    bool     `json:"repeat,omitempty"`
+	DeltaX    float64  `json:"delta_x,omitempty"`
+	DeltaY    float64  `json:"delta_y,omitempty"`
+	Units     string   `json:"units,omitempty"`
+	Phase     string   `json:"phase,omitempty"`
+	Momentum  string   `json:"momentum,omitempty"`
 }
 
 // Result is one deterministic per-event outcome. Revision fields are filled
@@ -72,6 +94,7 @@ type Result struct {
 	Activation                *ActivationEffect                   `json:"activation,omitempty"`
 	ValueChange               *ValueEffect                        `json:"value_change,omitempty"`
 	ScrollChange              *ScrollEffect                       `json:"scroll_change,omitempty"`
+	ScrollRouting             *scrollinput.Outcome                `json:"scroll,omitempty"`
 	RuntimeRevision           uint64                              `json:"runtime_revision"`
 	FrameRevision             uint64                              `json:"frame_revision"`
 	GeometryRevision          uint64                              `json:"geometry_revision"`
@@ -113,13 +136,15 @@ type ScrollEffect struct {
 // MCP view. Calls are serialized so a batch cannot interleave with another
 // client operating the same view.
 type Driver struct {
-	mu       sync.Mutex
-	runtime  Runtime
-	router   *interaction.Router
-	tree     *semantic.Node
-	pointers map[int]pointerState
-	closed   bool
-	snapshot SnapshotFunc
+	mu             sync.Mutex
+	runtime        Runtime
+	router         *interaction.Router
+	tree           *semantic.Node
+	pointers       map[int]pointerState
+	closed         bool
+	snapshot       SnapshotFunc
+	scrollPhase    string
+	scrollMomentum string
 }
 
 // pointerState is the small amount of pointer timeline state needed to
@@ -162,6 +187,7 @@ func (d *Driver) Update(tree *semantic.Node) {
 	}
 	d.tree = tree
 	d.pointers = make(map[int]pointerState)
+	d.scrollPhase, d.scrollMomentum = "", ""
 	d.router.Update(tree)
 }
 
@@ -173,6 +199,7 @@ func (d *Driver) Close() {
 	if !d.closed {
 		d.closed = true
 		d.pointers = make(map[int]pointerState)
+		d.scrollPhase, d.scrollMomentum = "", ""
 		d.router.SetInspecting(true)
 	}
 	d.mu.Unlock()
@@ -191,6 +218,10 @@ func (d *Driver) Dispatch(events []Event) ([]Result, error) {
 	if err := validateBatchWithPointers(events, d.pointers); err != nil {
 		return nil, err
 	}
+	phase, momentum, err := validateScrollTimeline(events, d.scrollPhase, d.scrollMomentum)
+	if err != nil {
+		return nil, err
+	}
 	if d.tree == nil && d.runtime != nil {
 		tree, err := d.runtime.CurrentRuntimeTree()
 		if err != nil {
@@ -207,13 +238,17 @@ func (d *Driver) Dispatch(events []Event) ([]Result, error) {
 		}
 		results = append(results, result)
 	}
+	d.scrollPhase, d.scrollMomentum = phase, momentum
 	return results, nil
 }
 
 func (d *Driver) dispatchOne(index int, event Event) (Result, error) {
 	before := d.router.Snapshot()
 	beforeTransient := d.router.Transient()
+	beforeRevisions := d.currentRevisions()
+	beforeTrace := d.currentTraceRevision()
 	result := Result{Index: index, Type: event.Type, Kind: event.Kind, FocusBefore: before.FocusedID, CaptureBefore: cloneCapture(before.PointerCapture)}
+	d.recordTrace(TraceEntry{Stage: "accepted", EventIndex: index, Type: event.Type, RuntimeBefore: beforeRevisions.RuntimeRevision, GeometryBefore: beforeRevisions.GeometryRevision, FrameBefore: beforeRevisions.FrameRevision, TraceBefore: beforeTrace})
 	var activation interaction.Activation
 	var activated bool
 	var changed bool
@@ -271,6 +306,27 @@ func (d *Driver) dispatchOne(index int, event Event) (Result, error) {
 			delete(d.pointers, event.PointerID)
 			d.router.Cancel(event.PointerID)
 			result.Consumed = true
+		}
+	case "scroll":
+		if runtime, ok := d.runtime.(ScrollRuntime); ok {
+			scrollEvent := scrollinput.Event{Source: event.Source, Point: point, DeltaX: event.DeltaX, DeltaY: event.DeltaY, Units: event.Units, Phase: event.Phase, Momentum: event.Momentum, Modifiers: append([]string(nil), event.Modifiers...)}
+			routing, err := runtime.RouteScroll(scrollEvent)
+			if err != nil {
+				return Result{}, err
+			}
+			result.ScrollRouting = &routing
+			result.TargetID = routing.OwnerID
+			result.Consumed = routing.ConsumedX != 0 || routing.ConsumedY != 0
+			changed = routing.Changed
+			d.recordTrace(TraceEntry{Stage: "conversion", EventIndex: index, Type: event.Type, DeltaX: routing.LogicalDeltaX, DeltaY: routing.LogicalDeltaY, ConsumedX: routing.ConsumedX, ConsumedY: routing.ConsumedY, ResidualX: routing.ResidualX, ResidualY: routing.ResidualY})
+			d.recordTrace(TraceEntry{Stage: "candidates", EventIndex: index, Type: event.Type, TargetID: routing.OwnerID, IDs: routing.Candidates})
+			d.recordTrace(TraceEntry{Stage: "owner_selection", EventIndex: index, Type: event.Type, TargetID: routing.OwnerID, SemanticID: routing.FieldOwnerID})
+			d.recordTrace(TraceEntry{Stage: "capture_decision", EventIndex: index, Type: event.Type, TargetID: routing.OwnerID, Outcome: "none"})
+			for _, axis := range routing.Axes {
+				d.recordTrace(TraceEntry{Stage: "axis_routing", EventIndex: index, Type: event.Type, Axis: axis.Axis, Consumed: axis.Consumed, Residual: axis.Residual, Outcome: fmt.Sprintf("containment=%t", axis.ContainmentStop)})
+			}
+		} else {
+			return Result{}, fmt.Errorf("automation runtime does not support scroll input")
 		}
 	case "key":
 		result.TargetID = before.FocusedID
@@ -376,6 +432,40 @@ func (d *Driver) dispatchOne(index int, event Event) (Result, error) {
 	after := d.router.Snapshot()
 	result.FocusAfter = after.FocusedID
 	result.CaptureAfter = cloneCapture(after.PointerCapture)
+	if event.Type != "scroll" {
+		candidateIDs := traceCandidateIDs(d.tree, point)
+		if event.Type == "key" && result.FocusAfter != "" {
+			candidateIDs = []string{result.FocusAfter}
+		}
+		d.recordTrace(TraceEntry{Stage: "candidates", EventIndex: index, Type: event.Type, TargetID: result.TargetID, IDs: candidateIDs})
+		owner := result.TargetID
+		if event.Type == "key" {
+			owner = result.FocusAfter
+		}
+		d.recordTrace(TraceEntry{Stage: "owner_selection", EventIndex: index, Type: event.Type, TargetID: owner, SemanticID: owner})
+		captureOutcome := "none"
+		if event.Type == "key" && before.KeyboardPress != nil {
+			captureOutcome = "keyboard_retained"
+		} else if before.PointerCapture != nil {
+			captureOutcome = "retained"
+		}
+		if event.Type == "key" && after.KeyboardPress != nil {
+			if captureOutcome == "keyboard_retained" {
+				captureOutcome = "keyboard_retained"
+			} else {
+				captureOutcome = "keyboard_acquired"
+			}
+		} else if result.CaptureAfter != nil {
+			if captureOutcome == "retained" {
+				captureOutcome = "retained"
+			} else {
+				captureOutcome = "acquired"
+			}
+		} else if before.PointerCapture != nil {
+			captureOutcome = "released"
+		}
+		d.recordTrace(TraceEntry{Stage: "capture_decision", EventIndex: index, Type: event.Type, TargetID: result.TargetID, Outcome: captureOutcome})
+	}
 	if d.snapshot != nil {
 		revisions := d.snapshot()
 		result.RuntimeRevision = revisions.RuntimeRevision
@@ -385,7 +475,95 @@ func (d *Driver) dispatchOne(index int, event Event) (Result, error) {
 		result.PublishedGeometryRevision = revisions.PublishedGeometryRevision
 		result.AutomationInputRevision = revisions.AutomationInputRevision
 	}
+	afterRevisions := d.currentRevisions()
+	afterTrace := d.currentTraceRevision()
+	mutationOutcome := "none"
+	if changed {
+		mutationOutcome = "queued"
+	}
+	d.recordTrace(TraceEntry{Stage: "mutation", EventIndex: index, Type: event.Type, TargetID: result.TargetID, Outcome: mutationOutcome, RuntimeBefore: beforeRevisions.RuntimeRevision, RuntimeAfter: afterRevisions.RuntimeRevision, GeometryBefore: beforeRevisions.GeometryRevision, GeometryAfter: afterRevisions.GeometryRevision, FrameBefore: beforeRevisions.FrameRevision, FrameAfter: afterRevisions.FrameRevision, TraceBefore: beforeTrace, TraceAfter: afterTrace})
+	invalidationOutcome := "none"
+	if changed {
+		invalidationOutcome = "runtime"
+	}
+	d.recordTrace(TraceEntry{Stage: "invalidation", EventIndex: index, Type: event.Type, Outcome: invalidationOutcome, RuntimeBefore: beforeRevisions.RuntimeRevision, RuntimeAfter: afterRevisions.RuntimeRevision, GeometryBefore: beforeRevisions.GeometryRevision, GeometryAfter: afterRevisions.GeometryRevision, FrameBefore: beforeRevisions.FrameRevision, FrameAfter: afterRevisions.FrameRevision, TraceBefore: beforeTrace, TraceAfter: afterTrace})
+	if afterRevisions.FrameRevision > beforeRevisions.FrameRevision {
+		d.recordTrace(TraceEntry{Stage: "publication", EventIndex: index, Type: event.Type, Outcome: fmt.Sprintf("frame=%d", afterRevisions.FrameRevision), RuntimeBefore: beforeRevisions.RuntimeRevision, RuntimeAfter: afterRevisions.RuntimeRevision, GeometryBefore: beforeRevisions.GeometryRevision, GeometryAfter: afterRevisions.GeometryRevision, FrameBefore: beforeRevisions.FrameRevision, FrameAfter: afterRevisions.FrameRevision, TraceBefore: beforeTrace, TraceAfter: afterTrace})
+	} else {
+		reason := "no_frame"
+		if result.ScrollRouting != nil && result.ScrollRouting.NoFrameReason != "" {
+			reason = result.ScrollRouting.NoFrameReason
+		} else if !changed && (before.FocusedID != after.FocusedID || captureChanged(before.PointerCapture, after.PointerCapture)) {
+			reason = "router_only"
+		} else if !result.Consumed {
+			reason = "unconsumed"
+		} else if changed {
+			reason = "no_frame_revision"
+		}
+		d.recordTrace(TraceEntry{Stage: "publication", EventIndex: index, Type: event.Type, Outcome: reason, RuntimeBefore: beforeRevisions.RuntimeRevision, RuntimeAfter: afterRevisions.RuntimeRevision, GeometryBefore: beforeRevisions.GeometryRevision, GeometryAfter: afterRevisions.GeometryRevision, FrameBefore: beforeRevisions.FrameRevision, FrameAfter: afterRevisions.FrameRevision, TraceBefore: beforeTrace, TraceAfter: afterTrace})
+	}
 	return result, nil
+}
+
+func captureChanged(before, after *interaction.PointerCaptureSnapshot) bool {
+	if before == nil || after == nil {
+		return before != after
+	}
+	return before.PointerID != after.PointerID || before.OwnerID != after.OwnerID || before.Source != after.Source || before.Buttons != after.Buttons || before.Point != after.Point
+}
+
+func traceCandidateIDs(root *semantic.Node, point image.Point) []string {
+	if root == nil {
+		return nil
+	}
+	nodes := make([]*semantic.Node, 0)
+	for _, node := range semantic.Flatten(root) {
+		if node == nil || node.ID == "" || !node.Visible || !node.InViewport || node.Bounds == nil || node.Clip == nil {
+			continue
+		}
+		bounds := node.Bounds.ImageRectangle().Intersect(node.Clip.ImageRectangle())
+		if bounds.Empty() || !point.In(bounds) {
+			continue
+		}
+		nodes = append(nodes, node)
+	}
+	sort.SliceStable(nodes, func(i, j int) bool {
+		if nodes[i].PaintOrder != nodes[j].PaintOrder {
+			return nodes[i].PaintOrder > nodes[j].PaintOrder
+		}
+		return len(nodes[i].Breadcrumb) > len(nodes[j].Breadcrumb)
+	})
+	ids := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		ids = append(ids, node.ID)
+	}
+	return ids
+}
+
+func (d *Driver) currentRevisions() RevisionSnapshot {
+	if d == nil || d.snapshot == nil {
+		return RevisionSnapshot{}
+	}
+	return d.snapshot()
+}
+
+func (d *Driver) currentTraceRevision() uint64 {
+	if d == nil || d.runtime == nil {
+		return 0
+	}
+	if trace, ok := d.runtime.(TraceSnapshotRuntime); ok {
+		return trace.EventTrace().Revision
+	}
+	return 0
+}
+
+func (d *Driver) recordTrace(entry TraceEntry) {
+	if d == nil || d.runtime == nil {
+		return
+	}
+	if recorder, ok := d.runtime.(TraceRuntime); ok {
+		recorder.RecordEventTrace(entry)
+	}
 }
 
 func semanticNodeByID(root *semantic.Node, id string) *semantic.Node {
@@ -415,6 +593,55 @@ func validateBatch(events []Event) error {
 	return validateBatchWithPointers(events, nil)
 }
 
+func validateScrollTimeline(events []Event, initialPhase, initialMomentum string) (string, string, error) {
+	phase, momentum := initialPhase, initialMomentum
+	for index, event := range events {
+		if event.Type != "scroll" {
+			continue
+		}
+		switch event.Phase {
+		case "begin":
+			if phase == "begin" || phase == "update" {
+				return phase, momentum, fmt.Errorf("event %d scroll begin repeats an active gesture", index)
+			}
+			phase = "begin"
+		case "update":
+			if phase == "" {
+				phase = "update"
+			}
+		case "end", "cancel":
+			phase = ""
+		}
+		canceled := event.Phase == "cancel"
+		switch event.Momentum {
+		case "begin":
+			if momentum == "begin" || momentum == "update" {
+				return phase, momentum, fmt.Errorf("event %d scroll momentum begin repeats an active sequence", index)
+			}
+			momentum = "begin"
+		case "update":
+			if canceled {
+				momentum = ""
+				continue
+			}
+			if momentum == "" {
+				return phase, momentum, fmt.Errorf("event %d scroll momentum update requires begin", index)
+			}
+			momentum = "update"
+		case "end":
+			if momentum == "" && !canceled {
+				return phase, momentum, fmt.Errorf("event %d scroll momentum end requires begin", index)
+			}
+			momentum = ""
+		case "none":
+			if event.Phase == "cancel" {
+				momentum = ""
+			}
+		}
+	}
+	return phase, momentum, nil
+}
+
 func validateBatchWithPointers(events []Event, initial map[int]pointerState) error {
 	if len(events) == 0 {
 		return fmt.Errorf("events must not be empty")
@@ -425,7 +652,7 @@ func validateBatchWithPointers(events []Event, initial map[int]pointerState) err
 	}
 	lastTime := float64(0)
 	for index, event := range events {
-		if event.Type != "pointer" && event.Type != "key" {
+		if event.Type != "pointer" && event.Type != "key" && event.Type != "scroll" {
 			return fmt.Errorf("event %d has unsupported type %q", index, event.Type)
 		}
 		if !finiteNonNegative(event.TimeMS) || (index > 0 && event.TimeMS < lastTime) {
@@ -473,6 +700,28 @@ func validateBatchWithPointers(events []Event, initial map[int]pointerState) err
 				delete(pointers, event.PointerID)
 			default:
 				return fmt.Errorf("event %d has unsupported pointer kind %q", index, event.Kind)
+			}
+		} else if event.Type == "scroll" {
+			if event.PointerID != 0 {
+				return fmt.Errorf("event %d scroll pointer_id must be omitted", index)
+			}
+			if !finite(event.X) || !finite(event.Y) {
+				return fmt.Errorf("event %d scroll coordinates must be finite", index)
+			}
+			if event.Source != "wheel" && event.Source != "trackpad" {
+				return fmt.Errorf("event %d scroll source must be wheel or trackpad", index)
+			}
+			if event.Units != "logical" && event.Units != "physical_pixels" {
+				return fmt.Errorf("event %d scroll units must be logical or physical_pixels", index)
+			}
+			if event.Phase != "begin" && event.Phase != "update" && event.Phase != "end" && event.Phase != "cancel" {
+				return fmt.Errorf("event %d scroll phase must be begin, update, end, or cancel", index)
+			}
+			if event.Momentum != "" && event.Momentum != "none" && event.Momentum != "begin" && event.Momentum != "update" && event.Momentum != "end" {
+				return fmt.Errorf("event %d scroll momentum must be none, begin, update, or end", index)
+			}
+			if !finite(event.DeltaX) || !finite(event.DeltaY) {
+				return fmt.Errorf("event %d scroll deltas must be finite", index)
 			}
 		} else {
 			if event.Kind != "down" && event.Kind != "up" {

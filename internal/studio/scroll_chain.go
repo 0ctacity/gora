@@ -5,21 +5,24 @@ import (
 	"math"
 
 	"gora/internal/render"
+	"gora/internal/scrollinput"
 	"gora/internal/semantic"
 )
 
 // scrollChainPlan is the renderer-neutral result of routing one logical wheel
 // event through the deepest scrollport under its document point.
 type scrollChainPlan struct {
-	Updates   map[string]image.Point
-	Remaining image.Point
+	Updates     map[string]image.Point
+	Remaining   image.Point
+	Axes        map[string][]scrollinput.Consumer
+	Containment map[string]bool
 }
 
 // planScrollChain routes each enabled axis independently through the selected
 // scrollport's inner-to-outer ancestor chain. Published renderer metrics are
 // authoritative for axis enablement and maximum extents.
 func planScrollChain(root *semantic.Node, metrics map[string]render.ScrollMetrics, offsets map[string]image.Point, point, delta image.Point) scrollChainPlan {
-	plan := scrollChainPlan{Updates: make(map[string]image.Point), Remaining: delta}
+	plan := scrollChainPlan{Updates: make(map[string]image.Point), Remaining: delta, Axes: map[string][]scrollinput.Consumer{"x": nil, "y": nil}, Containment: map[string]bool{"x": false, "y": false}}
 	chain := scrollChainAt(root, point)
 	if len(chain) == 0 {
 		return plan
@@ -40,11 +43,15 @@ func planScrollChain(root *semantic.Node, metrics map[string]render.ScrollMetric
 		current := clampScrollOffsetForMetric(previous, metric)
 		consumedX := 0
 		consumedY := 0
-		if metric.EnabledX {
+		if metric.EnabledX && remainingX != 0 {
+			before := current.X
 			current.X, consumedX = consumeScrollAxis(current.X, metric.Maximum.X, remainingX)
+			plan.Axes["x"] = append(plan.Axes["x"], scrollinput.Consumer{ID: semanticIDOrHandle(node), Axis: "x", Before: float64(before), After: float64(current.X), Consumed: float64(consumedX)})
 		}
-		if metric.EnabledY {
+		if metric.EnabledY && remainingY != 0 {
+			before := current.Y
 			current.Y, consumedY = consumeScrollAxis(current.Y, metric.Maximum.Y, remainingY)
+			plan.Axes["y"] = append(plan.Axes["y"], scrollinput.Consumer{ID: semanticIDOrHandle(node), Axis: "y", Before: float64(before), After: float64(current.Y), Consumed: float64(consumedY)})
 		}
 		if current != previous {
 			working[key] = current
@@ -53,16 +60,28 @@ func planScrollChain(root *semantic.Node, metrics map[string]render.ScrollMetric
 		remainingX -= consumedX
 		remainingY -= consumedY
 		if scrollChainContain(node) {
-			if metric.EnabledX {
+			if metric.EnabledX && remainingX != 0 {
 				remainingX = 0
+				plan.Containment["x"] = true
 			}
-			if metric.EnabledY {
+			if metric.EnabledY && remainingY != 0 {
 				remainingY = 0
+				plan.Containment["y"] = true
 			}
 		}
 	}
 	plan.Remaining = image.Pt(remainingX, remainingY)
 	return plan
+}
+
+func semanticIDOrHandle(node *semantic.Node) string {
+	if node == nil {
+		return ""
+	}
+	if node.ID != "" {
+		return node.ID
+	}
+	return node.Handle
 }
 
 func scrollChainAt(root *semantic.Node, point image.Point) []*semantic.Node {

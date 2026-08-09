@@ -41,10 +41,11 @@ asset work across its views; it does not recursively discover the root.
   `gora_set_state`, `gora_reset_state`, `gora_set_control_value`, and
   `gora_capture`. Runtime calls require matching project and view IDs.
 - Automation (enabled only with `gora mcp --automation`):
-  `gora_wait_for_view` and `gora_dispatch_input`. Dispatch accepts one fully
-  validated ordered batch of renderer-neutral pointer or keyboard events and
-  returns one result per event with canonical target, focus/capture,
-  consumed state, effects, and resulting revisions. A malformed event
+  `gora_wait_for_view`, `gora_dispatch_input`, `gora_configure_event_trace`,
+  and `gora_clear_event_trace`. Dispatch accepts one fully validated ordered
+  batch of renderer-neutral pointer, keyboard, or wheel/trackpad scroll events
+  and returns one result per event with canonical target, focus/capture,
+  consumed state, effects, scroll-axis routing, and resulting revisions. A malformed event
   anywhere in a batch is rejected before the first event is delivered.
   `wait` may be `none`, `published`, or `idle`; the default timeout is 5s and
   the accepted range is 1–60000ms. Secondary/middle/none pointer buttons are
@@ -107,6 +108,15 @@ page, Home/End, Backspace/Delete, `A`–`Z`, and `0`–`9`. Modifiers are a uniq
 subset of `shift`, `control`, `command`, and `option`; event times are finite,
 non-negative, and monotonic within a batch.
 
+Scroll events use `source` `wheel` or `trackpad`, `units` `logical` or
+`physical_pixels`, independent finite `delta_x`/`delta_y`, `phase` `begin`,
+`update`, `end`, or `cancel`, and `momentum` `none`, `begin`, `update`, or
+`end`. Physical deltas are converted once using the published view metric.
+Zero/zero deltas are valid phase-only transitions. The pointer location selects
+the deepest topmost clipped scroll candidate; each axis reports ordered
+consumers, consumed amount, residual, containment, and final offsets. Command-
+modified scroll is reported unconsumed for ordinary headless views.
+
 Each app/component view owns one bounded automation router. It uses the same
 canonical clipped hit testing, pointer capture, focus traversal, control
 activation, scroll metrics, and state/value reducers as the runtime. A valid
@@ -115,6 +125,15 @@ resource notification; `published`/`idle` waits reuse the frame barrier and do
 not synthesize an extra frame. Closing or reloading a view clears stale
 pointer and keyboard ownership. Token views reject automation tools and
 resources, and project/view mismatches are rejected before delivery.
+
+Event tracing is opt-in and view-local. Configure a fixed ring with capacity
+`1..4096` (default `512`) through `gora_configure_event_trace`; enabling starts
+a generation and `gora_clear_event_trace` removes entries without changing it.
+Read `gora://project/{project-id}/views/{view-id}/automation/trace` for immutable
+bounded entries covering acceptance, conversion, final-paint candidates,
+ownership/capture, per-axis residuals, mutation, invalidation, and publication
+or no-frame reasons. Trace updates use the same revisioned resource notifications
+as the automation snapshot.
 
 ## Resources and subscriptions
 

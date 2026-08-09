@@ -205,10 +205,11 @@ The MCP server is distinct from `gora run --headless`: the latter owns one
 document and the existing Unix-socket CLI session, while `gora mcp` owns
 multiple explicit projects and views for agent inspection, control, capture,
 and structured document editing. Add `--automation` to register the
-renderer-neutral `gora_dispatch_input` batch tool and the
-`gora_wait_for_view`/automation resource; without it, ordinary project/view
-tools remain unchanged. This input boundary proves canonical pointer/keyboard
-routing and publication, not delivery through a visible Gio/OS window. See
+renderer-neutral `gora_dispatch_input` batch tool, the
+`gora_wait_for_view`/automation resource, and bounded scroll event tracing;
+without it, ordinary project/view tools remain unchanged. This input boundary
+proves canonical pointer/keyboard/scroll routing and publication, not delivery
+through a visible Gio/OS window. See
 [MCP server](mcp.md).
 
 ## Session security

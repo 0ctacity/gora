@@ -333,6 +333,20 @@ func TestEditingStoreScrollsOverflowingTextAreaWithinItsLineBounds(t *testing.T)
 	}
 }
 
+func TestEditingStoreCanScrollInternalDoesNotMutate(t *testing.T) {
+	maxLines := 2
+	store := NewEditingStore()
+	store.Reconcile([]FieldSpec{{ID: "notes", Scope: "screen", Binding: "notes", Type: "text", Multiline: true, Value: "12345\n67890\nabcde", MaxLines: &maxLines, Declaration: document.StateDeclaration{Type: "text"}}})
+	store.SetVisualColumns("notes", 5)
+	before := store.Revision()
+	if !store.CanScrollInternal("notes", -1) || store.Revision() != before {
+		t.Fatalf("can-scroll mutated store: can=%v revision=%d before=%d", store.CanScrollInternal("notes", -1), store.Revision(), before)
+	}
+	if !store.ScrollInternal("notes", -1) || store.CanScrollInternal("notes", -1) {
+		t.Fatal("can-scroll boundary did not track current offset")
+	}
+}
+
 func TestEditingStoreCaretMovementReclaimsManualTextAreaScroll(t *testing.T) {
 	maxLines := 2
 	store := NewEditingStore()

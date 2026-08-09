@@ -6,6 +6,7 @@ import (
 
 	"gora/internal/document"
 	"gora/internal/interaction"
+	"gora/internal/scrollinput"
 	"gora/internal/semantic"
 )
 
@@ -20,6 +21,132 @@ func TestDriverRejectsAnInvalidBatchBeforeDeliveringEarlierEvents(t *testing.T) 
 	}
 	if got := driver.Router().Transient().Focused; got != "" {
 		t.Fatalf("invalid batch delivered event 1, focus=%q", got)
+	}
+}
+
+func TestDriverScrollNormalizesPhysicalDiagonalAndRoutesBothAxes(t *testing.T) {
+	runtime := &fakeRuntime{tree: runtimeTree()}
+	runtime.scrollScale = 2
+	driver := NewDriver(runtime)
+	results, err := driver.Dispatch([]Event{{Type: "scroll", Source: "trackpad", X: 20, Y: 30, DeltaX: 18.5, DeltaY: -42, Units: "physical_pixels", Phase: "update", Momentum: "none", TimeMS: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].ScrollRouting == nil {
+		t.Fatalf("results=%+v", results)
+	}
+	got := results[0].ScrollRouting
+	if got.LogicalDeltaX != 9 || got.LogicalDeltaY != -21 {
+		t.Fatalf("normalized scroll=%+v", got)
+	}
+}
+
+func TestDriverScrollAcceptsPhaseOnlyAndRejectsInvalidScrollBatch(t *testing.T) {
+	runtime := &fakeRuntime{tree: runtimeTree()}
+	driver := NewDriver(runtime)
+	if _, err := driver.Dispatch([]Event{{Type: "scroll", Source: "wheel", Units: "logical", Phase: "begin", Momentum: "begin", TimeMS: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runtime.scrollInputs) != 1 || runtime.scrollInputs[0].DeltaX != 0 || runtime.scrollInputs[0].DeltaY != 0 {
+		t.Fatalf("phase-only input=%+v", runtime.scrollInputs)
+	}
+	if _, err := driver.Dispatch([]Event{{Type: "scroll", Source: "wheel", Units: "logical", DeltaX: 1, Phase: "bogus", TimeMS: 2}}); err == nil {
+		t.Fatal("invalid scroll phase accepted")
+	}
+}
+
+func TestDriverScrollMomentumSequenceAndCancel(t *testing.T) {
+	runtime := &fakeRuntime{tree: runtimeTree()}
+	driver := NewDriver(runtime)
+	if _, err := driver.Dispatch([]Event{{Type: "scroll", Source: "trackpad", Units: "logical", Phase: "begin", Momentum: "begin", TimeMS: 1}, {Type: "scroll", Source: "trackpad", Units: "logical", Phase: "update", Momentum: "update", TimeMS: 2}, {Type: "scroll", Source: "trackpad", Units: "logical", Phase: "cancel", Momentum: "end", TimeMS: 3}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := driver.Dispatch([]Event{{Type: "scroll", Source: "trackpad", Units: "logical", Phase: "update", Momentum: "update", TimeMS: 4}}); err == nil {
+		t.Fatal("momentum update after cancel accepted")
+	}
+}
+
+func TestDriverScrollTraceUsesRoutingStages(t *testing.T) {
+	runtime := &fakeRuntime{tree: runtimeTree()}
+	driver := NewDriver(runtime)
+	if _, err := driver.Dispatch([]Event{{Type: "scroll", Source: "wheel", X: 5, Y: 6, DeltaY: 4, Units: "logical", Phase: "update", Momentum: "none", TimeMS: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"accepted", "conversion", "candidates", "owner_selection", "capture_decision", "mutation", "invalidation", "publication"}
+	if len(runtime.traces) < len(want) {
+		t.Fatalf("traces=%+v", runtime.traces)
+	}
+	for i, stage := range want {
+		if runtime.traces[i].Stage != stage {
+			t.Fatalf("trace[%d]=%+v, want stage %q", i, runtime.traces[i], stage)
+		}
+	}
+}
+
+func TestDriverTracePublicationIsEventLocalForPhaseOnlyAndBlockedScroll(t *testing.T) {
+	runtime := &fakeRuntime{tree: runtimeTree()}
+	driver := NewDriverWithSnapshot(runtime, func() RevisionSnapshot {
+		return RevisionSnapshot{RuntimeRevision: 4, FrameRevision: 9, GeometryRevision: 7, PublishedRuntimeRevision: 4, PublishedGeometryRevision: 7}
+	})
+	if _, err := driver.Dispatch([]Event{{Type: "scroll", Source: "wheel", Units: "logical", Phase: "begin", Momentum: "none", TimeMS: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := driver.Dispatch([]Event{{Type: "scroll", Source: "wheel", Units: "logical", DeltaX: 10, DeltaY: 5, Modifiers: []string{"command"}, Phase: "update", Momentum: "none", TimeMS: 2}}); err != nil {
+		t.Fatal(err)
+	}
+	publications := make([]TraceEntry, 0, 2)
+	for _, trace := range runtime.traces {
+		if trace.Stage == "publication" {
+			publications = append(publications, trace)
+		}
+	}
+	if len(publications) != 2 || publications[0].FrameBefore != publications[0].FrameAfter || publications[1].FrameBefore != publications[1].FrameAfter {
+		t.Fatalf("event-local publications=%+v", publications)
+	}
+	if publications[0].Outcome != "phase_only" || publications[1].Outcome != "command_modified_headless_scroll_blocked" {
+		t.Fatalf("publication reasons=%+v", publications)
+	}
+}
+
+func TestDriverPointerAndKeyboardTraceOwnershipStages(t *testing.T) {
+	button := interactiveNode("button", "button", "button", image.Rect(0, 0, 80, 30), image.Rect(0, 0, 100, 100), 0, 2)
+	runtime := &fakeRuntime{tree: runtimeTree(button)}
+	driver := NewDriver(runtime)
+	if _, err := driver.Dispatch([]Event{{Type: "pointer", Kind: "press", PointerID: 1, Source: "mouse", X: 10, Y: 10, Button: "primary", TimeMS: 1}, {Type: "pointer", Kind: "release", PointerID: 1, Source: "mouse", X: 10, Y: 10, Button: "primary", TimeMS: 2}, {Type: "key", Kind: "down", Name: "Tab", TimeMS: 3}, {Type: "key", Kind: "down", Name: "Space", TimeMS: 4}}); err != nil {
+		t.Fatal(err)
+	}
+	var captures, owners int
+	for _, trace := range runtime.traces {
+		if trace.Stage == "capture_decision" {
+			captures++
+		}
+		if trace.Stage == "owner_selection" && trace.TargetID != "" {
+			owners++
+		}
+	}
+	if captures < 4 || owners < 4 {
+		t.Fatalf("trace ownership stages captures=%d owners=%d traces=%+v", captures, owners, runtime.traces)
+	}
+}
+
+func TestTraceRecorderRetainsBoundedEntriesAcrossThousandEvents(t *testing.T) {
+	recorder := NewTraceRecorder()
+	if err := recorder.Configure(true, 8); err != nil {
+		t.Fatal(err)
+	}
+	updates, unsubscribe := recorder.Subscribe()
+	defer unsubscribe()
+	for i := 0; i < 1000; i++ {
+		recorder.Record(TraceEntry{Stage: "accepted", EventIndex: i})
+	}
+	snapshot := recorder.Snapshot()
+	if len(snapshot.Entries) != 8 || snapshot.Entries[len(snapshot.Entries)-1].EventIndex != 999 {
+		t.Fatalf("bounded snapshot=%+v", snapshot)
+	}
+	select {
+	case <-updates:
+	default:
+		t.Fatal("subscriber did not receive coalesced update")
 	}
 }
 
@@ -391,15 +518,49 @@ func runtimeTree(children ...*semantic.Node) *semantic.Node {
 }
 
 type fakeRuntime struct {
-	tree        *semantic.Node
-	activations []interaction.Activation
-	values      []interaction.ControlValueChange
-	scrolls     []interaction.ScrollChange
-	transients  []interaction.Transient
-	published   []interaction.RouterSnapshot
-	treeCalls   int
-	transient   interaction.Transient
+	tree         *semantic.Node
+	activations  []interaction.Activation
+	values       []interaction.ControlValueChange
+	scrolls      []interaction.ScrollChange
+	transients   []interaction.Transient
+	published    []interaction.RouterSnapshot
+	treeCalls    int
+	transient    interaction.Transient
+	scrollScale  float64
+	scrollInputs []scrollinput.Event
+	traces       []TraceEntry
 }
+
+func (f *fakeRuntime) RouteScroll(event scrollinput.Event) (scrollinput.Outcome, error) {
+	f.scrollInputs = append(f.scrollInputs, event)
+	if f.scrollScale <= 0 {
+		f.scrollScale = 1
+	}
+	outcome, err := scrollinput.Normalize(event, f.scrollScale)
+	if err != nil {
+		return scrollinput.Outcome{}, err
+	}
+	for _, modifier := range event.Modifiers {
+		if modifier == "command" || modifier == "control" {
+			outcome.NoFrameReason = "command_modified_headless_scroll_blocked"
+			outcome.ResidualX = outcome.LogicalDeltaX
+			outcome.ResidualY = outcome.LogicalDeltaY
+			outcome.Axes = []scrollinput.AxisResult{{Axis: "x", Residual: outcome.ResidualX}, {Axis: "y", Residual: outcome.ResidualY}}
+			return outcome, nil
+		}
+	}
+	outcome.OwnerID = "canvas"
+	outcome.ConsumedX = outcome.LogicalDeltaX
+	outcome.ConsumedY = outcome.LogicalDeltaY
+	outcome.ResidualX, outcome.ResidualY = 0, 0
+	outcome.Changed = outcome.LogicalDeltaX != 0 || outcome.LogicalDeltaY != 0
+	if !outcome.Changed {
+		outcome.NoFrameReason = "phase_only"
+		outcome.Axes = []scrollinput.AxisResult{{Axis: "x"}, {Axis: "y"}}
+	}
+	return outcome, nil
+}
+func (f *fakeRuntime) RecordEventTrace(entry TraceEntry) { f.traces = append(f.traces, entry) }
 
 func (f *fakeRuntime) CurrentRuntimeTree() (*semantic.Node, error) { f.treeCalls++; return f.tree, nil }
 func (f *fakeRuntime) RuntimeTree() (*semantic.Node, error)        { return f.tree, nil }

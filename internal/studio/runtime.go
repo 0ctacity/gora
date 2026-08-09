@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"math"
 	"net/url"
 	"path/filepath"
 	"reflect"
@@ -16,11 +17,13 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
+	"gora/internal/automation"
 	"gora/internal/document"
 	"gora/internal/interaction"
 	"gora/internal/navigation"
 	"gora/internal/project"
 	"gora/internal/render"
+	"gora/internal/scrollinput"
 	"gora/internal/semantic"
 	"gora/internal/session"
 )
@@ -138,6 +141,8 @@ type Runtime struct {
 	effectiveTransient        interaction.Transient
 	publishedTree             *semantic.Node
 	publishedScroll           map[string]render.ScrollMetrics
+	scrollMetricScale         float64
+	trace                     *automation.TraceRecorder
 	router                    *interaction.Router
 	routerSnapshot            interaction.RouterSnapshot
 	routerSnapshotSet         bool
@@ -159,7 +164,9 @@ type Runtime struct {
 func newRuntime(root, entry string) *Runtime {
 	return &Runtime{
 		root: root, entry: entry, scroll: make(map[string]image.Point),
-		state: interaction.NewStore(), editing: interaction.NewEditingStore(),
+		scrollMetricScale: 1,
+		trace:             automation.NewTraceRecorder(),
+		state:             interaction.NewStore(), editing: interaction.NewEditingStore(),
 		router: interaction.NewRouter(), syncCh: make(chan struct{}), doneCh: make(chan struct{}),
 	}
 }
@@ -214,8 +221,51 @@ func (runtime *Runtime) Close() {
 		return
 	}
 	runtime.closed = true
+	if runtime.trace != nil {
+		runtime.trace.Close()
+	}
 	close(runtime.doneCh)
 	runtime.signalLocked()
+}
+
+// ConfigureEventTrace enables or disables the bounded per-view automation
+// trace. Enabling starts a new generation; clearing preserves its identity.
+func (runtime *Runtime) ConfigureEventTrace(enabled bool, capacity int) error {
+	runtime.mu.Lock()
+	if runtime.trace == nil {
+		runtime.trace = automation.NewTraceRecorder()
+	}
+	trace := runtime.trace
+	runtime.mu.Unlock()
+	return trace.Configure(enabled, capacity)
+}
+
+func (runtime *Runtime) ClearEventTrace() {
+	runtime.mu.RLock()
+	trace := runtime.trace
+	runtime.mu.RUnlock()
+	if trace != nil {
+		trace.Clear()
+	}
+}
+
+func (runtime *Runtime) EventTrace() automation.TraceSnapshot {
+	runtime.mu.RLock()
+	trace := runtime.trace
+	runtime.mu.RUnlock()
+	if trace == nil {
+		return automation.TraceSnapshot{Capacity: 512}
+	}
+	return trace.Snapshot()
+}
+
+func (runtime *Runtime) RecordEventTrace(entry automation.TraceEntry) {
+	runtime.mu.RLock()
+	trace := runtime.trace
+	runtime.mu.RUnlock()
+	if trace != nil {
+		trace.Record(entry)
+	}
 }
 
 func (runtime *Runtime) Reload() {
@@ -1439,6 +1489,47 @@ func (runtime *Runtime) ScrollFieldInternal(id string, lines int) bool {
 	return true
 }
 
+func (runtime *Runtime) CanScrollFieldInternal(id string, lines int) bool {
+	runtime.mu.RLock()
+	defer runtime.mu.RUnlock()
+	return runtime.editing != nil && runtime.editing.CanScrollInternal(id, lines)
+}
+
+// commitScrollInput applies field-internal scrolling and document scroll
+// offsets under one runtime lock/revision. Native and automation adapters use
+// this to preserve diagonal ownership without exposing an intermediate frame.
+func (runtime *Runtime) commitScrollInput(fieldID string, fieldLines, fieldColumns int, points map[string]image.Point) bool {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	changed := false
+	if runtime.editing != nil && fieldID != "" {
+		if fieldColumns > 0 && runtime.editing.SetVisualColumns(fieldID, fieldColumns) {
+			changed = true
+		}
+		if fieldLines != 0 && runtime.editing.ScrollInternal(fieldID, fieldLines) {
+			changed = true
+		}
+	}
+	if runtime.scroll == nil {
+		runtime.scroll = make(map[string]image.Point)
+	}
+	for key, offset := range points {
+		if key != "" && runtime.scroll[key] != offset {
+			changed = true
+		}
+	}
+	if changed {
+		for key, offset := range points {
+			if key != "" {
+				runtime.scroll[key] = offset
+			}
+		}
+		runtime.effectiveRoot = nil
+		runtime.runtimeRevision++
+	}
+	return changed
+}
+
 func (runtime *Runtime) DeleteFieldSelection(id string, backward, word bool) bool {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
@@ -2035,6 +2126,232 @@ func (runtime *Runtime) setScrollPoints(points map[string]image.Point) bool {
 	}
 	runtime.runtimeRevision++
 	return true
+}
+
+// SetScrollMetricScale records the published native metric used to convert
+// physical-pixel wheel deltas before ownership routing. Headless views retain
+// the default scale of one.
+func (runtime *Runtime) SetScrollMetricScale(scale float64) {
+	if scale <= 0 || math.IsNaN(scale) || math.IsInf(scale, 0) {
+		scale = 1
+	}
+	runtime.mu.Lock()
+	runtime.scrollMetricScale = scale
+	runtime.mu.Unlock()
+}
+
+// RouteScroll is the renderer-neutral scroll adapter used by automation and
+// native hosts. It consumes independent axes through the published chain and
+// commits all changed offsets atomically.
+func (runtime *Runtime) RouteScroll(event scrollinput.Event) (scrollinput.Outcome, error) {
+	if runtime == nil {
+		return scrollinput.Outcome{}, fmt.Errorf("runtime is unavailable")
+	}
+	runtime.mu.RLock()
+	if runtime.closed {
+		runtime.mu.RUnlock()
+		return scrollinput.Outcome{}, ErrRuntimeClosed
+	}
+	tree := runtime.publishedTree
+	metrics := cloneScrollMetrics(runtime.publishedScroll)
+	offsets := cloneScroll(runtime.scroll)
+	scale := runtime.scrollMetricScale
+	runtime.mu.RUnlock()
+	if tree == nil {
+		return scrollinput.Outcome{}, fmt.Errorf("no published runtime tree is available")
+	}
+	outcome, err := scrollinput.Normalize(event, scale)
+	if err != nil {
+		return scrollinput.Outcome{}, err
+	}
+	outcome.Candidates = scrollCandidateIDs(tree, event.Point)
+	if hasCommandModifier(event.Modifiers) {
+		outcome.NoFrameReason = "command_modified_headless_scroll_blocked"
+		outcome.ResidualX = outcome.LogicalDeltaX
+		outcome.ResidualY = outcome.LogicalDeltaY
+		outcome.Axes = []scrollinput.AxisResult{{Axis: "x", Residual: outcome.ResidualX, ContainmentStop: true}, {Axis: "y", Residual: outcome.ResidualY, ContainmentStop: true}}
+		return outcome, nil
+	}
+	if outcome.Phase == "cancel" {
+		outcome.LogicalDeltaX = 0
+		outcome.LogicalDeltaY = 0
+		outcome.ResidualX = 0
+		outcome.ResidualY = 0
+		outcome.NoFrameReason = "phase_cancel"
+		outcome.Axes = []scrollinput.AxisResult{{Axis: "x"}, {Axis: "y"}}
+		return outcome, nil
+	}
+	delta := image.Pt(int(outcome.LogicalDeltaX), int(outcome.LogicalDeltaY))
+	if delta == (image.Point{}) {
+		outcome.NoFrameReason = "phase_only"
+		outcome.Axes = []scrollinput.AxisResult{{Axis: "x", Residual: 0}, {Axis: "y", Residual: 0}}
+		return outcome, nil
+	}
+	fieldID, fieldLines, fieldColumns := "", 0, 0
+	fieldConsumedY := false
+	if owner := topmostScrollPriority(tree, event.Point); owner != nil {
+		if owner.Type == "slider" || owner.Role == "slider" {
+			outcome.OwnerID = semanticIDOrHandle(owner)
+			outcome.ResidualX, outcome.ResidualY = 0, 0
+			outcome.Axes = []scrollinput.AxisResult{{Axis: "x", ContainmentStop: true}, {Axis: "y", ContainmentStop: true}}
+			outcome.NoFrameReason = "slider_owns_scroll"
+			return outcome, nil
+		}
+		if owner.Type == "text_area" {
+			outcome.FieldOwnerID = semanticIDOrHandle(owner)
+			outcome.OwnerID = outcome.FieldOwnerID
+			fieldID = owner.ID
+			if fieldID == "" {
+				fieldID = owner.Handle
+			}
+			fieldLines = int(math.Round(float64(delta.Y) / 16))
+			if fieldLines == 0 && delta.Y != 0 {
+				fieldLines = 1
+				if delta.Y < 0 {
+					fieldLines = -1
+				}
+			}
+			if columns, ok := fieldVisualColumns(owner); ok {
+				fieldColumns = columns
+			}
+			fieldConsumedY = delta.Y != 0 && runtime.CanScrollFieldInternal(owner.ID, fieldLines)
+			if fieldConsumedY {
+				delta.Y = 0
+			}
+		}
+		if fieldID == "" && (owner.Role == "scrollbar" || owner.Type == "scrollbar" || owner.Type == "scrollbar_track" || owner.Type == "scrollbar_thumb") {
+			outcome.OwnerID = semanticIDOrHandle(owner)
+			// A wheel over a scrollbar is an axis-local semantic scroll shortcut;
+			// it never leaks into an unrelated document chain.
+			axis := owner.Orientation
+			if axis == "" {
+				axis = "vertical"
+			}
+			if axis == "horizontal" {
+				delta.Y = 0
+			} else {
+				delta.X = 0
+			}
+			if delta != (image.Point{}) {
+				if err := runtime.ScrollSemanticID(owner.ID, "by", delta.X, delta.Y); err == nil {
+					if axis == "horizontal" {
+						outcome.ConsumedX = float64(delta.X)
+					} else {
+						outcome.ConsumedY = float64(delta.Y)
+					}
+					outcome.Changed = true
+					outcome.ResidualX = float64(int(outcome.LogicalDeltaX) - int(outcome.ConsumedX))
+					outcome.ResidualY = float64(int(outcome.LogicalDeltaY) - int(outcome.ConsumedY))
+					if axis == "horizontal" {
+						outcome.ResidualY = 0
+						outcome.Axes = []scrollinput.AxisResult{{Axis: "x", Consumed: outcome.ConsumedX, Residual: 0, ContainmentStop: true, Consumers: []scrollinput.Consumer{{ID: outcome.OwnerID, Axis: "x", Consumed: outcome.ConsumedX}}}, {Axis: "y", Residual: 0, ContainmentStop: true}}
+					} else {
+						outcome.ResidualX = 0
+						outcome.Axes = []scrollinput.AxisResult{{Axis: "x", Residual: 0, ContainmentStop: true}, {Axis: "y", Consumed: outcome.ConsumedY, Residual: 0, ContainmentStop: true, Consumers: []scrollinput.Consumer{{ID: outcome.OwnerID, Axis: "y", Consumed: outcome.ConsumedY}}}}
+					}
+					outcome.FinalOffsets = cloneScroll(runtime.Snapshot().Scroll)
+					return outcome, nil
+				}
+			}
+			if axis == "horizontal" {
+				outcome.ResidualY = 0
+			} else {
+				outcome.ResidualX = 0
+			}
+			outcome.NoFrameReason = "scrollbar_owns_axis"
+			return outcome, nil
+		}
+	}
+	plan := scrollChainPlan{Updates: make(map[string]image.Point), Remaining: delta, Axes: map[string][]scrollinput.Consumer{"x": nil, "y": nil}, Containment: map[string]bool{"x": false, "y": false}}
+	if delta != (image.Point{}) {
+		plan = planScrollChain(tree, metrics, offsets, event.Point, delta)
+	}
+	for _, axis := range []string{"x", "y"} {
+		consumers := append([]scrollinput.Consumer(nil), plan.Axes[axis]...)
+		if axis == "y" && fieldConsumedY {
+			consumers = append([]scrollinput.Consumer{{ID: outcome.FieldOwnerID, Axis: "y", Consumed: outcome.LogicalDeltaY}}, consumers...)
+		}
+		axisResult := scrollinput.AxisResult{Axis: axis, Consumers: consumers, ContainmentStop: plan.Containment[axis]}
+		for _, consumer := range consumers {
+			axisResult.Consumed += consumer.Consumed
+		}
+		if axis == "x" {
+			axisResult.Residual = float64(plan.Remaining.X)
+			outcome.ConsumedX = axisResult.Consumed
+			outcome.ResidualX = axisResult.Residual
+		} else {
+			axisResult.Residual = float64(plan.Remaining.Y)
+			outcome.ConsumedY = axisResult.Consumed
+			outcome.ResidualY = axisResult.Residual
+		}
+		outcome.Axes = append(outcome.Axes, axisResult)
+	}
+	if len(plan.Axes["x"]) != 0 || len(plan.Axes["y"]) != 0 {
+		if chain := scrollChainAt(tree, event.Point); len(chain) != 0 {
+			outcome.OwnerID = semanticIDOrHandle(chain[len(chain)-1])
+			outcome.CanvasOwnerID = outcome.OwnerID
+		}
+	}
+	finalOffsets := cloneScroll(offsets)
+	for key, offset := range plan.Updates {
+		finalOffsets[key] = offset
+	}
+	outcome.FinalOffsets = finalOffsets
+	fieldDeltaY := 0
+	if fieldConsumedY {
+		fieldDeltaY = fieldLines
+	}
+	outcome.Changed = runtime.commitScrollInput(fieldID, fieldDeltaY, fieldColumns, plan.Updates)
+	if !outcome.Changed {
+		outcome.NoFrameReason = "no_scroll_consumed"
+	}
+	return outcome, nil
+}
+
+func hasCommandModifier(modifiers []string) bool {
+	for _, modifier := range modifiers {
+		if modifier == "command" || modifier == "control" {
+			return true
+		}
+	}
+	return false
+}
+
+func scrollCandidateIDs(root *semantic.Node, point image.Point) []string {
+	nodes := make([]*semantic.Node, 0)
+	for _, node := range semantic.Flatten(root) {
+		if node == nil || !node.Visible || !node.InViewport || node.Bounds == nil || node.Clip == nil || !point.In(node.Bounds.ImageRectangle().Intersect(node.Clip.ImageRectangle())) {
+			continue
+		}
+		switch node.Type {
+		case "scroll", "text_area", "scrollbar", "scrollbar_track", "scrollbar_thumb", "slider":
+			nodes = append(nodes, node)
+		}
+	}
+	sort.SliceStable(nodes, func(i, j int) bool {
+		if nodes[i].PaintOrder != nodes[j].PaintOrder {
+			return nodes[i].PaintOrder > nodes[j].PaintOrder
+		}
+		return len(nodes[i].Breadcrumb) > len(nodes[j].Breadcrumb)
+	})
+	ids := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		ids = append(ids, semanticIDOrHandle(node))
+	}
+	return ids
+}
+
+func topmostScrollPriority(root *semantic.Node, point image.Point) *semantic.Node {
+	ids := scrollCandidateIDs(root, point)
+	if len(ids) == 0 {
+		return nil
+	}
+	for _, node := range semantic.Flatten(root) {
+		if semanticIDOrHandle(node) == ids[0] {
+			return node
+		}
+	}
+	return nil
 }
 
 func (runtime *Runtime) Inspect(hostMode string) ([]byte, string, error) {

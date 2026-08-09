@@ -99,6 +99,7 @@ func layoutAppContent(gtx layout.Context, theme *material.Theme, runtime *Runtim
 	state.canvasViewport = pixelSize
 	state.canvasSize = pixelSize
 	state.canvasPan = image.Point{}
+	runtime.SetScrollMetricScale(float64(gtx.Metric.PxPerDp))
 	handleAppActions(gtx, runtime, state, snapshot, window)
 	snapshot = runtime.Snapshot()
 

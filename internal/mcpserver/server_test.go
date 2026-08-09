@@ -13,6 +13,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"gora/internal/automation"
 	"gora/internal/studio"
 )
 
@@ -901,6 +902,159 @@ func TestMCPAutomationResourceSubscriptionPublishesAfterFrameAndUnsubscribe(t *t
 	select {
 	case uri := <-updates:
 		t.Fatalf("notification delivered after unsubscribe: %q", uri)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestMCPAutomationTraceConfigureDispatchReadAndClear(t *testing.T) {
+	root := t.TempDir()
+	entry := filepath.Join(root, "app.gora")
+	if err := os.WriteFile(entry, []byte("gora: 1\nkind: app\nviewport: { width: 100, height: 80 }\nentry: main\nscreens:\n  main: { type: spacer }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service := NewServiceWithOptions(NewRegistry(), ServiceOptions{Automation: true})
+	defer service.Close()
+	ctx := context.Background()
+	clientTransport, serverTransport := mcp.NewInMemoryTransports()
+	if _, err := service.server.Connect(ctx, serverTransport, nil); err != nil {
+		t.Fatal(err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "trace-test", Version: "1"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	opened, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_open_project", Arguments: map[string]any{"root": root}})
+	if err != nil || opened.IsError {
+		t.Fatalf("open project: %v %+v", err, opened)
+	}
+	projectID := stringField(opened.StructuredContent, "project_id")
+	viewResult, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_open_view", Arguments: map[string]any{"project_id": projectID, "file": "app.gora"}})
+	if err != nil || viewResult.IsError {
+		t.Fatalf("open view: %v %+v", err, viewResult)
+	}
+	viewID := stringField(viewResult.StructuredContent, "view_id")
+	configured, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_configure_event_trace", Arguments: map[string]any{"project_id": projectID, "view_id": viewID, "enabled": true, "capacity": 2}})
+	if err != nil || configured.IsError {
+		t.Fatalf("configure trace: %v %+v", err, configured)
+	}
+	dispatched, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_dispatch_input", Arguments: map[string]any{"project_id": projectID, "view_id": viewID, "wait": "none", "events": []any{map[string]any{"type": "scroll", "source": "wheel", "x": 1, "y": 1, "delta_y": 0, "units": "logical", "phase": "begin", "momentum": "none", "time_ms": 1}}}})
+	if err != nil || dispatched.IsError {
+		for _, content := range dispatched.Content {
+			if text, ok := content.(*mcp.TextContent); ok {
+				t.Logf("dispatch error text: %s", text.Text)
+			}
+		}
+		t.Fatalf("dispatch: %v %+v", err, dispatched)
+	}
+	traceURI := "gora://project/" + projectID + "/views/" + viewID + "/automation/trace"
+	resource, err := session.ReadResource(ctx, &mcp.ReadResourceParams{URI: traceURI})
+	if err != nil || len(resource.Contents) != 1 {
+		t.Fatalf("read trace: %v %+v", err, resource)
+	}
+	var trace struct {
+		Generation uint64 `json:"generation"`
+		Capacity   int    `json:"capacity"`
+		Entries    []struct {
+			Stage   string `json:"stage"`
+			Outcome string `json:"outcome"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal([]byte(resource.Contents[0].Text), &trace); err != nil {
+		t.Fatal(err)
+	}
+	if trace.Generation == 0 || trace.Capacity != 2 || len(trace.Entries) != 2 {
+		t.Fatalf("trace=%+v", trace)
+	}
+	if trace.Entries[len(trace.Entries)-1].Stage != "publication" || trace.Entries[len(trace.Entries)-1].Outcome != "phase_only" {
+		t.Fatalf("trace publication=%+v", trace.Entries)
+	}
+	cleared, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_clear_event_trace", Arguments: map[string]any{"project_id": projectID, "view_id": viewID}})
+	if err != nil || cleared.IsError {
+		t.Fatalf("clear trace: %v %+v", err, cleared)
+	}
+	if got := stringField(cleared.StructuredContent, "view_id"); got != viewID {
+		t.Fatalf("clear output=%+v", cleared.StructuredContent)
+	}
+}
+
+func TestMCPTraceSubscriptionCoalescesBatchAndSuppressesDisabledDispatch(t *testing.T) {
+	root := t.TempDir()
+	entry := filepath.Join(root, "app.gora")
+	if err := os.WriteFile(entry, []byte("gora: 1\nkind: app\nviewport: { width: 100, height: 80 }\nentry: main\nscreens:\n  main: { type: spacer }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service := NewServiceWithOptions(NewRegistry(), ServiceOptions{Automation: true})
+	defer service.Close()
+	ctx := context.Background()
+	clientTransport, serverTransport := mcp.NewInMemoryTransports()
+	if _, err := service.server.Connect(ctx, serverTransport, nil); err != nil {
+		t.Fatal(err)
+	}
+	updates := make(chan string, 32)
+	client := mcp.NewClient(&mcp.Implementation{Name: "trace-subscription-test", Version: "1"}, &mcp.ClientOptions{ResourceUpdatedHandler: func(_ context.Context, request *mcp.ResourceUpdatedNotificationRequest) {
+		if request != nil && request.Params != nil {
+			updates <- request.Params.URI
+		}
+	}})
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	opened, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_open_project", Arguments: map[string]any{"root": root}})
+	if err != nil || opened.IsError {
+		t.Fatalf("open project: %v %+v", err, opened)
+	}
+	projectID := stringField(opened.StructuredContent, "project_id")
+	viewResult, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_open_view", Arguments: map[string]any{"project_id": projectID, "file": "app.gora"}})
+	if err != nil || viewResult.IsError {
+		t.Fatalf("open view: %v %+v", err, viewResult)
+	}
+	viewID := stringField(viewResult.StructuredContent, "view_id")
+	traceURI := "gora://project/" + projectID + "/views/" + viewID + "/automation/trace"
+	if err := session.Subscribe(ctx, &mcp.SubscribeParams{URI: traceURI}); err != nil {
+		t.Fatalf("subscribe trace: %v", err)
+	}
+	configured, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_configure_event_trace", Arguments: map[string]any{"project_id": projectID, "view_id": viewID, "enabled": true, "capacity": 4}})
+	if err != nil || configured.IsError {
+		t.Fatalf("configure trace: %v %+v", err, configured)
+	}
+	events := make([]any, 0, 1000)
+	for index := 0; index < 1000; index++ {
+		events = append(events, map[string]any{"type": "scroll", "source": "wheel", "x": 1, "y": 1, "units": "logical", "phase": "update", "momentum": "none", "time_ms": index + 1})
+	}
+	dispatched, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_dispatch_input", Arguments: map[string]any{"project_id": projectID, "view_id": viewID, "wait": "none", "events": events}})
+	if err != nil || dispatched.IsError {
+		t.Fatalf("dispatch trace batch: %v %+v", err, dispatched)
+	}
+	for len(updates) > 0 {
+		<-updates
+	}
+	resource, err := session.ReadResource(ctx, &mcp.ReadResourceParams{URI: traceURI})
+	if err != nil || len(resource.Contents) != 1 {
+		t.Fatalf("read trace: %v %+v", err, resource)
+	}
+	var trace automation.TraceSnapshot
+	if err := json.Unmarshal([]byte(resource.Contents[0].Text), &trace); err != nil {
+		t.Fatal(err)
+	}
+	if len(trace.Entries) != 4 || trace.Entries[len(trace.Entries)-1].EventIndex != 999 {
+		t.Fatalf("trace rollover/coalescing=%+v", trace)
+	}
+	if _, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_configure_event_trace", Arguments: map[string]any{"project_id": projectID, "view_id": viewID, "enabled": false, "capacity": 4}}); err != nil {
+		t.Fatal(err)
+	}
+	for len(updates) > 0 {
+		<-updates
+	}
+	if _, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_dispatch_input", Arguments: map[string]any{"project_id": projectID, "view_id": viewID, "wait": "none", "events": []any{map[string]any{"type": "scroll", "source": "wheel", "units": "logical", "phase": "update", "momentum": "none", "time_ms": 1001}}}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case uri := <-updates:
+		t.Fatalf("disabled dispatch emitted trace update %q", uri)
 	case <-time.After(100 * time.Millisecond):
 	}
 }

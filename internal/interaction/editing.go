@@ -615,6 +615,20 @@ func (s *EditingStore) ScrollInternal(id string, lines int) bool {
 	return true
 }
 
+// CanScrollInternal reports whether an internal multiline scroll would move
+// the field without mutating its editing state.
+func (s *EditingStore) CanScrollInternal(id string, lines int) bool {
+	state := s.fields[id]
+	if state == nil || !state.spec.Multiline || state.spec.MaxLines == nil || *state.spec.MaxLines <= 0 || lines == 0 {
+		return false
+	}
+	layout := visualFieldLayout(state, []rune(state.Draft))
+	maximum := max(0, len(layout.widths)-*state.spec.MaxLines)
+	current := min(max(0, int(state.InternalOffset)), maximum)
+	next := min(max(0, current+lines), maximum)
+	return next != current
+}
+
 // DeleteSelection removes the current selection or the adjacent
 // grapheme/word. It returns false when the requested deletion is a no-op.
 func (s *EditingStore) DeleteSelection(id string, backward, word bool) bool {

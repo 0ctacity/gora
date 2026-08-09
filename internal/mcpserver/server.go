@@ -189,6 +189,24 @@ type DispatchOutput struct {
 	Resources []string                  `json:"resources"`
 }
 
+type ConfigureEventTraceInput struct {
+	ProjectID string `json:"project_id"`
+	ViewID    string `json:"view_id"`
+	Enabled   bool   `json:"enabled"`
+	Capacity  int    `json:"capacity,omitempty"`
+}
+
+type ClearEventTraceInput struct {
+	ProjectID string `json:"project_id"`
+	ViewID    string `json:"view_id"`
+}
+
+type EventTraceOutput struct {
+	ProjectID string                   `json:"project_id"`
+	ViewID    string                   `json:"view_id"`
+	Trace     automation.TraceSnapshot `json:"trace"`
+}
+
 type ApplyChangesInput struct {
 	ProjectID string           `json:"project_id"`
 	Changes   []DocumentChange `json:"changes"`
@@ -613,11 +631,39 @@ func (s *Service) registerAutomationTools() {
 		}
 		return nil, output, nil
 	})
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_configure_event_trace", Description: "Configure the bounded per-view automation event trace.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input ConfigureEventTraceInput) (*mcp.CallToolResult, EventTraceOutput, error) {
+		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
+		if err != nil {
+			return nil, EventTraceOutput{}, err
+		}
+		if err := runtime.ConfigureEventTrace(input.Enabled, input.Capacity); err != nil {
+			return nil, EventTraceOutput{}, err
+		}
+		output := EventTraceOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Trace: runtime.EventTrace()}
+		s.notifyView(input.ProjectID, input.ViewID)
+		if !output.Trace.Enabled {
+			s.notifyTrace(input.ProjectID, input.ViewID)
+		}
+		return nil, output, nil
+	})
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_clear_event_trace", Description: "Clear the per-view automation event trace while preserving its generation.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input ClearEventTraceInput) (*mcp.CallToolResult, EventTraceOutput, error) {
+		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
+		if err != nil {
+			return nil, EventTraceOutput{}, err
+		}
+		runtime.ClearEventTrace()
+		output := EventTraceOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Trace: runtime.EventTrace()}
+		s.notifyView(input.ProjectID, input.ViewID)
+		if !output.Trace.Enabled {
+			s.notifyTrace(input.ProjectID, input.ViewID)
+		}
+		return nil, output, nil
+	})
 }
 
 func automationResources(projectID, viewID string) []string {
 	base := "gora://project/" + projectID + "/views/" + viewID
-	return []string{base + "/tree", base + "/automation"}
+	return []string{base + "/tree", base + "/automation", base + "/automation/trace"}
 }
 
 func (s *Service) registerAutomationResources() {
@@ -634,6 +680,20 @@ func (s *Service) registerAutomationResources() {
 			return nil, mcp.ResourceNotFoundError(request.Params.URI)
 		}
 		return jsonResource(request.Params.URI, runtime.AutomationSnapshot())
+	})
+	s.server.AddResourceTemplate(&mcp.ResourceTemplate{
+		URITemplate: "gora://project/{project_id}/views/{view_id}/automation/trace",
+		Name:        "gora-view-automation-trace", MIMEType: "application/json",
+	}, func(_ context.Context, request *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+		projectID, viewID, ok := parseTraceURI(request.Params.URI)
+		if !ok {
+			return nil, mcp.ResourceNotFoundError(request.Params.URI)
+		}
+		runtime, err := s.registry.Runtime(projectID, viewID)
+		if err != nil {
+			return nil, mcp.ResourceNotFoundError(request.Params.URI)
+		}
+		return jsonResource(request.Params.URI, runtime.EventTrace())
 	})
 }
 
@@ -723,6 +783,19 @@ func (s *Service) validateSubscription(_ context.Context, request *mcp.Subscribe
 	}
 	uri := request.Params.URI
 	if uri == "gora://projects" {
+		return nil
+	}
+	if projectID, viewID, ok := parseTraceURI(uri); ok {
+		if !s.automation {
+			return fmt.Errorf("automation resources are disabled")
+		}
+		view, err := s.registry.ViewSummary(projectID, viewID)
+		if err != nil {
+			return fmt.Errorf("unknown project or view: %w", err)
+		}
+		if !view.RuntimeAvailable {
+			return fmt.Errorf("automation is unavailable for token views")
+		}
 		return nil
 	}
 	if projectID, viewID, ok := parseAutomationURI(uri); ok {
@@ -847,6 +920,14 @@ func (s *Service) addViewResources(projectID, viewID string) {
 			}
 			return jsonResource(request.Params.URI, runtime.AutomationSnapshot())
 		})
+		traceURI := viewURI + "/automation/trace"
+		s.server.AddResource(&mcp.Resource{URI: traceURI, Name: "gora-view-automation-trace", MIMEType: "application/json"}, func(_ context.Context, request *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+			runtime, err := s.registry.Runtime(projectID, viewID)
+			if err != nil {
+				return nil, mcp.ResourceNotFoundError(request.Params.URI)
+			}
+			return jsonResource(request.Params.URI, runtime.EventTrace())
+		})
 	}
 	s.server.AddResource(&mcp.Resource{URI: treeURI, Name: "gora-runtime-tree", MIMEType: "application/json"}, func(_ context.Context, request *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
 		runtime, err := s.registry.Runtime(projectID, viewID)
@@ -895,7 +976,19 @@ func (s *Service) notifyView(projectID, viewID string) {
 	_ = s.server.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: base + "/tree"})
 	if s.automation {
 		_ = s.server.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: base + "/automation"})
+		runtime, err := s.registry.Runtime(projectID, viewID)
+		if err == nil && runtime.EventTrace().Enabled {
+			_ = s.server.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: base + "/automation/trace"})
+		}
 	}
+}
+
+func (s *Service) notifyTrace(projectID, viewID string) {
+	if !s.automation {
+		return
+	}
+	base := "gora://project/" + projectID + "/views/" + viewID
+	_ = s.server.ResourceUpdated(context.Background(), &mcp.ResourceUpdatedNotificationParams{URI: base + "/automation/trace"})
 }
 
 func (s *Service) removeProjectResources(projectID string, views []ViewSummary, sources []SourceSummary) {
@@ -905,7 +998,7 @@ func (s *Service) removeProjectResources(projectID string, views []ViewSummary, 
 		viewBase := base + "/views/" + view.ID
 		uris = append(uris, viewBase, viewBase+"/tree")
 		if s.automation {
-			uris = append(uris, viewBase+"/automation")
+			uris = append(uris, viewBase+"/automation", viewBase+"/automation/trace")
 		}
 	}
 	for _, source := range sources {
@@ -950,6 +1043,20 @@ func parseAutomationURI(uri string) (string, string, bool) {
 		return "", "", false
 	}
 	rest := strings.TrimSuffix(strings.TrimPrefix(uri, prefix), "/automation")
+	parts := strings.SplitN(rest, "/views/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || strings.Contains(parts[1], "/") {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
+func parseTraceURI(uri string) (string, string, bool) {
+	const prefix = "gora://project/"
+	const suffix = "/automation/trace"
+	if !strings.HasPrefix(uri, prefix) || !strings.HasSuffix(uri, suffix) {
+		return "", "", false
+	}
+	rest := strings.TrimSuffix(strings.TrimPrefix(uri, prefix), suffix)
 	parts := strings.SplitN(rest, "/views/", 2)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || strings.Contains(parts[1], "/") {
 		return "", "", false

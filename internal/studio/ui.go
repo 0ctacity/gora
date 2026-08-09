@@ -36,6 +36,7 @@ import (
 	"gora/internal/interaction"
 	"gora/internal/project"
 	"gora/internal/render"
+	"gora/internal/scrollinput"
 	"gora/internal/semantic"
 	"gora/internal/session"
 )
@@ -1204,41 +1205,19 @@ func routeScrollEvents(runtime *Runtime, state *uiState, snapshot Snapshot, even
 	if scale <= 0 {
 		scale = 1
 	}
-	working := cloneScroll(snapshot.Scroll)
-	changes := make(map[string]image.Point)
-	metrics := runtime.publishedScrollMetrics()
+	runtime.SetScrollMetricScale(float64(scale))
+	changed := false
 	for _, event := range events {
-		delta := logicalScrollDelta(event.delta.X, event.delta.Y, scale)
-		if delta.Y != 0 {
-			if field := textAreaScrollTarget(state.runtimeTree, event.point); field != nil {
-				if columns, ok := fieldVisualColumns(field); ok {
-					runtime.SetFieldVisualColumns(field.ID, columns)
-				}
-				lines := int(math.Round(float64(event.delta.Y) / 16))
-				if lines == 0 {
-					lines = 1
-					if event.delta.Y < 0 {
-						lines = -1
-					}
-				}
-				if runtime.ScrollFieldInternal(field.ID, lines) {
-					delta.Y = 0
-				}
-			}
+		deltaX, deltaY := float64(event.delta.X), float64(event.delta.Y)
+		if deltaX != 0 && panHorizontal != nil && panHorizontal(event.delta.X) {
+			deltaX = 0
 		}
-		if delta.X != 0 && panHorizontal != nil && panHorizontal(event.delta.X) {
-			delta.X = 0
-		}
-		if delta == (image.Point{}) {
-			continue
-		}
-		planned := planScrollChain(state.runtimeTree, metrics, working, event.point, delta)
-		for key, offset := range planned.Updates {
-			working[key] = offset
-			changes[key] = offset
+		outcome, err := runtime.RouteScroll(scrollinput.Event{Source: "trackpad", Point: event.point, DeltaX: deltaX, DeltaY: deltaY, Units: "physical_pixels", Phase: "update", Momentum: "none"})
+		if err == nil && outcome.Changed {
+			changed = true
 		}
 	}
-	return runtime.setScrollPoints(changes)
+	return changed
 }
 
 func textAreaScrollTarget(root *semantic.Node, point image.Point) *semantic.Node {

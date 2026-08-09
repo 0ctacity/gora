@@ -79,8 +79,9 @@ Start it with renderer-neutral input automation enabled:
 ./gora mcp --automation
 ```
 
-Agents can then use `gora_dispatch_input` for validated pointer/keyboard event
-batches and `gora_wait_for_view` for publication/idle barriers. This does not
+Agents can then use `gora_dispatch_input` for validated pointer, keyboard, and
+wheel/trackpad event batches, `gora_wait_for_view` for publication/idle
+barriers, and the opt-in bounded event trace tools/resources. This does not
 inject events into a visible native window.
 
 To exercise percentage sizing, aspect ratios, intrinsic containers, and
