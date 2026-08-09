@@ -132,6 +132,31 @@ func TestRunSelectsAppStudioAndHeadlessModes(t *testing.T) {
 	}
 }
 
+func TestRunAutomationRequiresWindowedHost(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.gora")
+	if err := os.WriteFile(path, []byte("gora: 1\nkind: app\nviewport: { width: 100, height: 80 }\nentry: main\nscreens:\n  main: { type: spacer }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var launched LaunchConfig
+	var stdout, stderr bytes.Buffer
+	if exit := Run([]string{"run", path, "--root", dir, "--automation"}, &stdout, &stderr, func(config LaunchConfig) error {
+		launched = config
+		return nil
+	}); exit != 0 || launched.Mode != LaunchApp || !launched.Automation {
+		t.Fatalf("app automation exit=%d config=%+v stderr=%s", exit, launched, stderr.String())
+	}
+	launched = LaunchConfig{}
+	stdout.Reset()
+	stderr.Reset()
+	if exit := Run([]string{"run", path, "--root", dir, "--headless", "--automation"}, &stdout, &stderr, func(config LaunchConfig) error {
+		launched = config
+		return nil
+	}); exit != 2 || launched.Mode != "" || !bytes.Contains(stderr.Bytes(), []byte("--automation")) {
+		t.Fatalf("headless automation exit=%d config=%+v stderr=%s", exit, launched, stderr.String())
+	}
+}
+
 func TestRunRejectsConflictingHostModes(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "app.gora")

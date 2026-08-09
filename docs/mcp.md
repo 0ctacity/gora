@@ -26,7 +26,9 @@ path is the project identity, so symlink-equivalent roots reuse one opaque
 `gora_close_project` or server shutdown.
 
 Call `gora_open_view` with that project ID and a contained `.gora` entry. The
-same canonical entry reuses one `view_id`. Each app or component view owns its
+same canonical entry and `host_mode` reuses one `view_id`; `host_mode` defaults
+to `headless`. Use `host_mode: "app"` or `"studio"` only when the matching
+automation-enabled `gora run` host is already running. Each app or component view owns its
 viewport, selection, navigation, state, scroll offsets, tree, and last-good
 frame. Token views support sources, diagnostics, and editing, but reject
 runtime operations. A project shares known sources, dependency watching, and
@@ -36,7 +38,10 @@ asset work across its views; it does not recursively discover the root.
 
 - Lifecycle: `gora_open_project`, `gora_list_projects`,
   `gora_close_project`, `gora_open_view`, `gora_list_views`, and
-  `gora_close_view`.
+  `gora_close_view`. Attached view summaries include `host_mode`, connection
+  state, opaque host identity, process ID, protocol, and sorted capabilities;
+  socket paths are never exposed. Closing an attached view detaches MCP only
+  and does not close the host.
 - Runtime: `gora_set_viewport`, `gora_select`, `gora_activate`, `gora_scroll`,
   `gora_set_state`, `gora_reset_state`, `gora_set_control_value`, and
   `gora_capture`. Runtime calls require matching project and view IDs.

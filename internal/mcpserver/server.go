@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 
 	"gora/internal/automation"
 	"gora/internal/semantic"
+	"gora/internal/session"
 	"gora/internal/studio"
 )
 
@@ -48,6 +50,7 @@ type ProjectInput struct {
 type OpenViewInput struct {
 	ProjectID string `json:"project_id"`
 	File      string `json:"file" jsonschema:"root-relative or absolute .gora entry file"`
+	HostMode  string `json:"host_mode,omitempty" jsonschema:"headless, app, or studio; defaults to headless"`
 }
 
 type ViewInput struct {
@@ -433,7 +436,7 @@ func (s *Service) registerLifecycleTools() {
 		return nil, ClosedOutput{Closed: err == nil, ID: input.ProjectID}, err
 	})
 	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_open_view", Description: "Open or reuse a live app, component, or token view within a project.", Annotations: closedWrite}, func(_ context.Context, _ *mcp.CallToolRequest, input OpenViewInput) (*mcp.CallToolResult, ViewSummary, error) {
-		result, err := s.registry.OpenView(input.ProjectID, input.File)
+		result, err := s.registry.OpenView(input.ProjectID, input.File, input.HostMode)
 		if err == nil {
 			s.addViewResources(input.ProjectID, result.ID)
 			if sources, sourceErr := s.registry.KnownSources(input.ProjectID); sourceErr == nil {
@@ -468,58 +471,80 @@ func (s *Service) registerLifecycleTools() {
 
 func (s *Service) registerRuntimeTools() {
 	mutation := &mcp.ToolAnnotations{ReadOnlyHint: false, IdempotentHint: false, OpenWorldHint: boolPointer(false), DestructiveHint: boolPointer(false)}
-	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_set_viewport", Description: "Set a view's logical viewport.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input ViewportInput) (*mcp.CallToolResult, RuntimeMutationOutput, error) {
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_set_viewport", Description: "Set a view's logical viewport.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input ViewportInput) (*mcp.CallToolResult, RuntimeMutationOutput, error) {
 		if input.Width <= 0 || input.Height <= 0 {
 			return nil, RuntimeMutationOutput{}, fmt.Errorf("viewport dimensions must be positive")
 		}
-		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
+		backend, err := s.registry.Backend(input.ProjectID, input.ViewID)
 		if err != nil {
 			return nil, RuntimeMutationOutput{}, err
 		}
-		runtime.SetViewport(input.Width, input.Height)
+		if err := backend.SetViewport(ctx, input.Width, input.Height); err != nil {
+			return nil, RuntimeMutationOutput{}, err
+		}
 		return s.runtimeMutation(input.ProjectID, input.ViewID)
 	})
-	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_select", Description: "Select an app screen or component fixture.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input SelectInput) (*mcp.CallToolResult, RuntimeMutationOutput, error) {
-		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_select", Description: "Select an app screen or component fixture.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input SelectInput) (*mcp.CallToolResult, RuntimeMutationOutput, error) {
+		backend, err := s.registry.Backend(input.ProjectID, input.ViewID)
 		if err != nil {
 			return nil, RuntimeMutationOutput{}, err
 		}
-		if !runtime.SelectScreen(input.Name) {
-			return nil, RuntimeMutationOutput{}, fmt.Errorf("unknown selection %q", input.Name)
+		if err := backend.Select(ctx, input.Name); err != nil {
+			return nil, RuntimeMutationOutput{}, err
 		}
 		return s.runtimeMutation(input.ProjectID, input.ViewID)
 	})
-	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_activate", Description: "Activate one visible enabled semantic control.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input ActivateInput) (*mcp.CallToolResult, RuntimeMutationOutput, error) {
-		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_activate", Description: "Activate one visible enabled semantic control.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input ActivateInput) (*mcp.CallToolResult, RuntimeMutationOutput, error) {
+		backend, err := s.registry.Backend(input.ProjectID, input.ViewID)
 		if err == nil {
-			err = runtime.ActivateSemanticID(input.SemanticID)
+			err = backend.Activate(ctx, input.SemanticID)
 		}
 		if err != nil {
 			return nil, RuntimeMutationOutput{}, err
 		}
 		return s.runtimeMutation(input.ProjectID, input.ViewID)
 	})
-	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_scroll", Description: "Scroll one visible scroll node by delta or to an absolute offset.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input ScrollInput) (*mcp.CallToolResult, RuntimeMutationOutput, error) {
-		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_scroll", Description: "Scroll one visible scroll node by delta or to an absolute offset.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input ScrollInput) (*mcp.CallToolResult, RuntimeMutationOutput, error) {
+		backend, err := s.registry.Backend(input.ProjectID, input.ViewID)
 		if err == nil {
-			err = runtime.ScrollSemanticID(input.SemanticID, input.Mode, input.X, input.Y)
+			err = backend.Scroll(ctx, input.SemanticID, input.Mode, input.X, input.Y)
 		}
 		if err != nil {
 			return nil, RuntimeMutationOutput{}, err
 		}
 		return s.runtimeMutation(input.ProjectID, input.ViewID)
 	})
-	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_set_state", Description: "Atomically set typed values in one visible lexical state scope.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input SetStateInput) (*mcp.CallToolResult, RuntimeMutationOutput, error) {
-		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_set_state", Description: "Atomically set typed values in one visible lexical state scope.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input SetStateInput) (*mcp.CallToolResult, RuntimeMutationOutput, error) {
+		backend, err := s.registry.Backend(input.ProjectID, input.ViewID)
 		if err == nil {
-			err = runtime.SetStateValues(input.ScopeID, input.Values)
+			err = backend.SetState(ctx, input.ScopeID, input.Values)
 		}
 		if err != nil {
 			return nil, RuntimeMutationOutput{}, err
 		}
 		return s.runtimeMutation(input.ProjectID, input.ViewID)
 	})
-	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_set_control_value", Description: "Set one visible enabled semantic control's bound value.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input SetControlValueInput) (*mcp.CallToolResult, ControlValueOutput, error) {
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_set_control_value", Description: "Set one visible enabled semantic control's bound value.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input SetControlValueInput) (*mcp.CallToolResult, ControlValueOutput, error) {
+		backend, backendErr := s.registry.Backend(input.ProjectID, input.ViewID)
+		if backendErr != nil {
+			return nil, ControlValueOutput{}, backendErr
+		}
+		if backend.Mode() != session.HostModeHeadless {
+			data, commandErr := s.registry.HostCommandResult(ctx, input.ProjectID, input.ViewID, "set_control_value", map[string]any{"semantic_id": input.SemanticID, "value": input.Value})
+			if commandErr != nil {
+				return nil, ControlValueOutput{}, commandErr
+			}
+			var result struct {
+				Value any `json:"value"`
+			}
+			_ = json.Unmarshal(data, &result)
+			view, summaryErr := s.registry.ViewSummary(input.ProjectID, input.ViewID)
+			if summaryErr != nil {
+				return nil, ControlValueOutput{}, summaryErr
+			}
+			s.notifyView(input.ProjectID, input.ViewID)
+			return nil, ControlValueOutput{ProjectID: input.ProjectID, View: view, Value: result.Value}, nil
+		}
 		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
 		if err != nil {
 			return nil, ControlValueOutput{}, err
@@ -543,11 +568,34 @@ func (s *Service) registerRuntimeTools() {
 		s.notifyView(input.ProjectID, input.ViewID)
 		return nil, ControlValueOutput{ProjectID: input.ProjectID, View: view, Value: value}, nil
 	})
-	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_set_field_draft", Description: "Set one visible editable field's draft; valid typed values publish immediately.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input SetFieldDraftInput) (*mcp.CallToolResult, FieldDraftOutput, error) {
-		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
-		if err == nil {
-			err = runtime.SetFieldDraft(input.SemanticID, input.Draft)
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_set_field_draft", Description: "Set one visible editable field's draft; valid typed values publish immediately.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input SetFieldDraftInput) (*mcp.CallToolResult, FieldDraftOutput, error) {
+		backend, backendErr := s.registry.Backend(input.ProjectID, input.ViewID)
+		if backendErr != nil {
+			return nil, FieldDraftOutput{}, backendErr
 		}
+		if backend.Mode() != session.HostModeHeadless {
+			data, commandErr := s.registry.HostCommandResult(ctx, input.ProjectID, input.ViewID, "set_field_draft", map[string]any{"semantic_id": input.SemanticID, "draft": input.Draft})
+			if commandErr != nil {
+				return nil, FieldDraftOutput{}, commandErr
+			}
+			var result struct {
+				Draft string `json:"draft"`
+				Value any    `json:"value"`
+				Valid bool   `json:"valid"`
+			}
+			_ = json.Unmarshal(data, &result)
+			view, summaryErr := s.registry.ViewSummary(input.ProjectID, input.ViewID)
+			if summaryErr != nil {
+				return nil, FieldDraftOutput{}, summaryErr
+			}
+			s.notifyView(input.ProjectID, input.ViewID)
+			return nil, FieldDraftOutput{ProjectID: input.ProjectID, View: view, Draft: result.Draft, Value: result.Value, Valid: result.Valid}, nil
+		}
+		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
+		if err != nil {
+			return nil, FieldDraftOutput{}, err
+		}
+		err = runtime.SetFieldDraft(input.SemanticID, input.Draft)
 		if err != nil {
 			return nil, FieldDraftOutput{}, err
 		}
@@ -578,9 +626,18 @@ func (s *Service) registerRuntimeTools() {
 		valid := field.Valid != nil && *field.Valid
 		return nil, FieldDraftOutput{ProjectID: input.ProjectID, View: view, Draft: fmt.Sprint(field.Value), Value: field.CommittedValue, Valid: valid, Issues: field.Issues}, nil
 	})
-	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_submit_form", Description: "Validate and submit one local form by semantic ID.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input ActivateInput) (*mcp.CallToolResult, RuntimeMutationOutput, error) {
-		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
-		if err == nil {
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_submit_form", Description: "Validate and submit one local form by semantic ID.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input ActivateInput) (*mcp.CallToolResult, RuntimeMutationOutput, error) {
+		backend, err := s.registry.Backend(input.ProjectID, input.ViewID)
+		if err != nil {
+			return nil, RuntimeMutationOutput{}, err
+		}
+		if backend.Mode() != session.HostModeHeadless {
+			err = backend.SubmitForm(ctx, input.SemanticID)
+		} else {
+			runtime, runtimeErr := s.registry.Runtime(input.ProjectID, input.ViewID)
+			if runtimeErr != nil {
+				return nil, RuntimeMutationOutput{}, runtimeErr
+			}
 			err = runtime.SubmitForm(input.SemanticID)
 		}
 		if err != nil {
@@ -588,9 +645,18 @@ func (s *Service) registerRuntimeTools() {
 		}
 		return s.runtimeMutation(input.ProjectID, input.ViewID)
 	})
-	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_reset_form", Description: "Reset only the states bound to fields in one local form.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input ActivateInput) (*mcp.CallToolResult, RuntimeMutationOutput, error) {
-		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
-		if err == nil {
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_reset_form", Description: "Reset only the states bound to fields in one local form.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input ActivateInput) (*mcp.CallToolResult, RuntimeMutationOutput, error) {
+		backend, err := s.registry.Backend(input.ProjectID, input.ViewID)
+		if err != nil {
+			return nil, RuntimeMutationOutput{}, err
+		}
+		if backend.Mode() != session.HostModeHeadless {
+			err = backend.ResetForm(ctx, input.SemanticID)
+		} else {
+			runtime, runtimeErr := s.registry.Runtime(input.ProjectID, input.ViewID)
+			if runtimeErr != nil {
+				return nil, RuntimeMutationOutput{}, runtimeErr
+			}
 			err = runtime.ResetForm(input.SemanticID)
 		}
 		if err != nil {
@@ -598,9 +664,18 @@ func (s *Service) registerRuntimeTools() {
 		}
 		return s.runtimeMutation(input.ProjectID, input.ViewID)
 	})
-	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_reset_state", Description: "Reset one state scope or the selected view context.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input ResetStateInput) (*mcp.CallToolResult, RuntimeMutationOutput, error) {
-		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
-		if err == nil {
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_reset_state", Description: "Reset one state scope or the selected view context.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input ResetStateInput) (*mcp.CallToolResult, RuntimeMutationOutput, error) {
+		backend, err := s.registry.Backend(input.ProjectID, input.ViewID)
+		if err != nil {
+			return nil, RuntimeMutationOutput{}, err
+		}
+		if backend.Mode() != session.HostModeHeadless {
+			err = backend.ResetState(ctx, input.ScopeID)
+		} else {
+			runtime, runtimeErr := s.registry.Runtime(input.ProjectID, input.ViewID)
+			if runtimeErr != nil {
+				return nil, RuntimeMutationOutput{}, runtimeErr
+			}
 			err = runtime.ResetStateScope(input.ScopeID)
 		}
 		if err != nil {
@@ -608,9 +683,50 @@ func (s *Service) registerRuntimeTools() {
 		}
 		return s.runtimeMutation(input.ProjectID, input.ViewID)
 	})
-	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_capture", Description: "Capture the current view as inline PNG content and optionally a new project-contained file.", Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, IdempotentHint: false, OpenWorldHint: boolPointer(false), DestructiveHint: boolPointer(false)}}, func(_ context.Context, _ *mcp.CallToolRequest, input CaptureInput) (*mcp.CallToolResult, CaptureOutput, error) {
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_capture", Description: "Capture the current view as inline PNG content and optionally a new project-contained file.", Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, IdempotentHint: false, OpenWorldHint: boolPointer(false), DestructiveHint: boolPointer(false)}}, func(ctx context.Context, _ *mcp.CallToolRequest, input CaptureInput) (*mcp.CallToolResult, CaptureOutput, error) {
 		if input.Scale <= 0 {
 			return nil, CaptureOutput{}, fmt.Errorf("scale must be a positive integer")
+		}
+		backend, err := s.registry.Backend(input.ProjectID, input.ViewID)
+		if err != nil {
+			return nil, CaptureOutput{}, err
+		}
+		if backend.Mode() != session.HostModeHeadless {
+			data, commandErr := s.registry.HostCommandResult(ctx, input.ProjectID, input.ViewID, "capture", map[string]any{"scale": input.Scale})
+			if commandErr != nil {
+				return nil, CaptureOutput{}, commandErr
+			}
+			var result struct {
+				PNGBase64 string `json:"png_base64"`
+				Warning   string `json:"warning"`
+			}
+			if unmarshalErr := json.Unmarshal(data, &result); unmarshalErr != nil {
+				return nil, CaptureOutput{}, unmarshalErr
+			}
+			png, decodeErr := base64.StdEncoding.DecodeString(result.PNGBase64)
+			if decodeErr != nil {
+				return nil, CaptureOutput{}, decodeErr
+			}
+			output := ""
+			if input.Output != "" {
+				root, rootErr := s.registry.ProjectRoot(input.ProjectID)
+				if rootErr != nil {
+					return nil, CaptureOutput{}, rootErr
+				}
+				output, err = containedCapturePath(root, input.Output)
+				if err == nil {
+					err = writeNewFile(output, png)
+				}
+				if err != nil {
+					return nil, CaptureOutput{}, err
+				}
+			}
+			view, summaryErr := s.registry.ViewSummary(input.ProjectID, input.ViewID)
+			if summaryErr != nil {
+				return nil, CaptureOutput{}, summaryErr
+			}
+			resultOutput := CaptureOutput{ProjectID: input.ProjectID, View: view, Width: view.Viewport.Width * input.Scale, Height: view.Viewport.Height * input.Scale, Warning: result.Warning, Output: output}
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.ImageContent{Data: png, MIMEType: "image/png"}}}, resultOutput, nil
 		}
 		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
 		if err != nil {
@@ -658,6 +774,26 @@ func (s *Service) registerRuntimeTools() {
 func (s *Service) registerAutomationTools() {
 	readOnly := &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true, OpenWorldHint: boolPointer(false)}
 	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_assert_view", Description: "Evaluate finite deterministic assertions against one immutable published view snapshot.", Annotations: readOnly}, func(ctx context.Context, _ *mcp.CallToolRequest, input AssertViewInput) (*mcp.CallToolResult, AssertViewOutput, error) {
+		backend, backendErr := s.registry.Backend(input.ProjectID, input.ViewID)
+		if backendErr != nil {
+			return nil, AssertViewOutput{}, backendErr
+		}
+		if backend.Mode() != session.HostModeHeadless {
+			data, commandErr := s.registry.HostCommandResult(ctx, input.ProjectID, input.ViewID, "assert", map[string]any{"assertions": input.Assertions})
+			if commandErr != nil {
+				return nil, AssertViewOutput{}, commandErr
+			}
+			var report automation.AssertionReport
+			if err := json.Unmarshal(data, &report); err != nil {
+				return nil, AssertViewOutput{}, err
+			}
+			snapshot, snapshotErr := s.registry.AutomationSnapshot(input.ProjectID, input.ViewID)
+			if snapshotErr != nil && snapshotErr.Error() != "" {
+				return nil, AssertViewOutput{}, snapshotErr
+			}
+			output := AssertViewOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Passed: report.Passed, Results: report.Results, RuntimeRevision: snapshot.RuntimeRevision, FrameRevision: snapshot.FrameRevision, GeometryRevision: snapshot.GeometryRevision, PublishedRuntimeRevision: snapshot.PublishedRuntimeRevision, PublishedGeometryRevision: snapshot.PublishedGeometryRevision, Snapshot: snapshot, Resources: automationResources(input.ProjectID, input.ViewID)}
+			return nil, output, nil
+		}
 		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
 		if err != nil {
 			return nil, AssertViewOutput{}, err
@@ -689,7 +825,7 @@ func (s *Service) registerAutomationTools() {
 		return nil, output, nil
 	})
 	captureMutation := &mcp.ToolAnnotations{ReadOnlyHint: false, IdempotentHint: false, OpenWorldHint: boolPointer(false), DestructiveHint: boolPointer(false)}
-	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_compare_capture", Description: "Compare an overlay-free current view PNG with a contained reference image using deterministic NRGBA pixels.", Annotations: captureMutation}, func(_ context.Context, _ *mcp.CallToolRequest, input CompareCaptureInput) (*mcp.CallToolResult, CompareCaptureOutput, error) {
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_compare_capture", Description: "Compare an overlay-free current view PNG with a contained reference image using deterministic NRGBA pixels.", Annotations: captureMutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input CompareCaptureInput) (*mcp.CallToolResult, CompareCaptureOutput, error) {
 		if input.Scale <= 0 {
 			return nil, CompareCaptureOutput{}, fmt.Errorf("scale must be a positive integer")
 		}
@@ -704,12 +840,19 @@ func (s *Service) registerAutomationTools() {
 				return nil, CompareCaptureOutput{}, fmt.Errorf("mask coordinates and dimensions must be non-negative")
 			}
 		}
-		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
+		backend, err := s.registry.Backend(input.ProjectID, input.ViewID)
 		if err != nil {
 			return nil, CompareCaptureOutput{}, err
 		}
-		if s.automation && s.registry.ConsumeTestFault(input.ProjectID, input.ViewID, "capture_failure") {
-			return nil, CompareCaptureOutput{}, fmt.Errorf("injected capture failure")
+		var runtime *studio.Runtime
+		if backend.Mode() == session.HostModeHeadless {
+			runtime, err = s.registry.Runtime(input.ProjectID, input.ViewID)
+			if err != nil {
+				return nil, CompareCaptureOutput{}, err
+			}
+			if s.automation && s.registry.ConsumeTestFault(input.ProjectID, input.ViewID, "capture_failure") {
+				return nil, CompareCaptureOutput{}, fmt.Errorf("injected capture failure")
+			}
 		}
 		root, err := s.registry.ProjectRoot(input.ProjectID)
 		if err != nil {
@@ -735,13 +878,24 @@ func (s *Service) registerAutomationTools() {
 				return nil, CompareCaptureOutput{}, statErr
 			}
 		}
-		capture := s.capturePNG
-		if capture == nil {
-			capture = func(runtime *studio.Runtime, scale int) ([]byte, string, automation.CaptureIdentity, error) {
-				return runtime.CapturePNGReadOnly(scale)
+		var current []byte
+		var warning string
+		var captureIdentity automation.CaptureIdentity
+		if runtime == nil {
+			backend, backendErr := s.registry.Backend(input.ProjectID, input.ViewID)
+			if backendErr != nil {
+				return nil, CompareCaptureOutput{}, backendErr
 			}
+			current, warning, captureIdentity, err = backend.Capture(ctx, input.Scale)
+		} else {
+			capture := s.capturePNG
+			if capture == nil {
+				capture = func(runtime *studio.Runtime, scale int) ([]byte, string, automation.CaptureIdentity, error) {
+					return runtime.CapturePNGReadOnly(scale)
+				}
+			}
+			current, warning, captureIdentity, err = capture(runtime, input.Scale)
 		}
-		current, warning, captureIdentity, err := capture(runtime, input.Scale)
 		if err != nil {
 			return nil, CompareCaptureOutput{}, err
 		}
@@ -774,9 +928,10 @@ func (s *Service) registerAutomationTools() {
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.ImageContent{Data: comparison.CurrentPNG, MIMEType: "image/png"}, &mcp.ImageContent{Data: comparison.DiffPNG, MIMEType: "image/png"}}, StructuredContent: output}, output, nil
 	})
 	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_wait_for_view", Description: "Wait for a deterministic published or idle view frame and return its automation snapshot.", Annotations: readOnly}, func(ctx context.Context, _ *mcp.CallToolRequest, input WaitForViewInput) (*mcp.CallToolResult, WaitForViewOutput, error) {
-		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
-		if err != nil {
-			return nil, WaitForViewOutput{}, err
+		runtime, runtimeErr := s.registry.Runtime(input.ProjectID, input.ViewID)
+		if runtimeErr != nil {
+			// Attached views use their host-owned long-poll session bridge.
+			runtime = nil
 		}
 		request := studio.WaitForViewRequest{Condition: input.Condition, StableFrames: input.StableFrames}
 		if input.AfterFrameRevision != nil {
@@ -796,7 +951,13 @@ func (s *Service) registerAutomationTools() {
 		} else {
 			request.Timeout = time.Duration(input.TimeoutMS) * time.Millisecond
 		}
-		snapshot, waitErr := runtime.WaitForView(ctx, request)
+		var snapshot studio.AutomationSnapshot
+		var waitErr error
+		if runtime != nil {
+			snapshot, waitErr = runtime.WaitForView(ctx, request)
+		} else {
+			snapshot, waitErr = s.registry.WaitForView(ctx, input.ProjectID, input.ViewID, request)
+		}
 		output := WaitForViewOutput{
 			ProjectID: input.ProjectID,
 			ViewID:    input.ViewID,
@@ -832,7 +993,17 @@ func (s *Service) registerAutomationTools() {
 		}
 		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
 		if err != nil {
-			return nil, DispatchOutput{}, err
+			data, commandErr := s.registry.HostCommandResult(ctx, input.ProjectID, input.ViewID, "dispatch", map[string]any{"events": input.Events})
+			if commandErr != nil {
+				return nil, DispatchOutput{}, commandErr
+			}
+			var results []automation.Result
+			_ = json.Unmarshal(data, &results)
+			snapshot, snapshotErr := s.registry.AutomationSnapshot(input.ProjectID, input.ViewID)
+			if snapshotErr != nil && snapshotErr.Error() != "" {
+				return nil, DispatchOutput{}, snapshotErr
+			}
+			return nil, DispatchOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Results: results, Snapshot: snapshot, Resources: automationResources(input.ProjectID, input.ViewID)}, nil
 		}
 		driver, err := s.registry.AutomationDriver(input.ProjectID, input.ViewID)
 		if err != nil {
@@ -866,10 +1037,16 @@ func (s *Service) registerAutomationTools() {
 		}
 		return nil, output, nil
 	})
-	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_configure_event_trace", Description: "Configure the bounded per-view automation event trace.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input ConfigureEventTraceInput) (*mcp.CallToolResult, EventTraceOutput, error) {
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_configure_event_trace", Description: "Configure the bounded per-view automation event trace.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input ConfigureEventTraceInput) (*mcp.CallToolResult, EventTraceOutput, error) {
 		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
 		if err != nil {
-			return nil, EventTraceOutput{}, err
+			data, commandErr := s.registry.HostCommandResult(ctx, input.ProjectID, input.ViewID, "configure_trace", map[string]any{"enabled": input.Enabled, "capacity": input.Capacity})
+			if commandErr != nil {
+				return nil, EventTraceOutput{}, commandErr
+			}
+			var trace automation.TraceSnapshot
+			_ = json.Unmarshal(data, &trace)
+			return nil, EventTraceOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Trace: trace}, nil
 		}
 		if err := runtime.ConfigureEventTrace(input.Enabled, input.Capacity); err != nil {
 			return nil, EventTraceOutput{}, err
@@ -881,10 +1058,16 @@ func (s *Service) registerAutomationTools() {
 		}
 		return nil, output, nil
 	})
-	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_clear_event_trace", Description: "Clear the per-view automation event trace while preserving its generation.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input ClearEventTraceInput) (*mcp.CallToolResult, EventTraceOutput, error) {
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_clear_event_trace", Description: "Clear the per-view automation event trace while preserving its generation.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input ClearEventTraceInput) (*mcp.CallToolResult, EventTraceOutput, error) {
 		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
 		if err != nil {
-			return nil, EventTraceOutput{}, err
+			data, commandErr := s.registry.HostCommandResult(ctx, input.ProjectID, input.ViewID, "clear_trace", nil)
+			if commandErr != nil {
+				return nil, EventTraceOutput{}, commandErr
+			}
+			var trace automation.TraceSnapshot
+			_ = json.Unmarshal(data, &trace)
+			return nil, EventTraceOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Trace: trace}, nil
 		}
 		runtime.ClearEventTrace()
 		output := EventTraceOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Trace: runtime.EventTrace()}
@@ -894,27 +1077,48 @@ func (s *Service) registerAutomationTools() {
 		}
 		return nil, output, nil
 	})
-	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_set_automation_clipboard", Description: "Set the isolated clipboard for one automation view.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input SetAutomationClipboardInput) (*mcp.CallToolResult, AutomationClipboardOutput, error) {
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_set_automation_clipboard", Description: "Set the isolated clipboard for one automation view.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input SetAutomationClipboardInput) (*mcp.CallToolResult, AutomationClipboardOutput, error) {
 		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
 		if err != nil {
-			return nil, AutomationClipboardOutput{}, err
+			if err := s.registry.HostCommand(ctx, input.ProjectID, input.ViewID, "set_clipboard", map[string]any{"text": input.Text}); err != nil {
+				return nil, AutomationClipboardOutput{}, err
+			}
+			s.notifyView(input.ProjectID, input.ViewID)
+			return nil, AutomationClipboardOutput{ProjectID: input.ProjectID, ViewID: input.ViewID}, nil
 		}
 		runtime.SetAutomationClipboard(input.Text)
 		output := AutomationClipboardOutput{ProjectID: input.ProjectID, ViewID: input.ViewID}
 		s.notifyView(input.ProjectID, input.ViewID)
 		return nil, output, nil
 	})
-	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_read_automation_clipboard", Description: "Read the isolated clipboard for one automation view.", Annotations: readOnly}, func(_ context.Context, _ *mcp.CallToolRequest, input ReadAutomationClipboardInput) (*mcp.CallToolResult, AutomationClipboardOutput, error) {
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_read_automation_clipboard", Description: "Read the isolated clipboard for one automation view.", Annotations: readOnly}, func(ctx context.Context, _ *mcp.CallToolRequest, input ReadAutomationClipboardInput) (*mcp.CallToolResult, AutomationClipboardOutput, error) {
 		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
 		if err != nil {
-			return nil, AutomationClipboardOutput{}, err
+			data, commandErr := s.registry.HostCommandResult(ctx, input.ProjectID, input.ViewID, "get_clipboard", nil)
+			if commandErr != nil {
+				return nil, AutomationClipboardOutput{}, commandErr
+			}
+			var result struct {
+				Text string `json:"text"`
+			}
+			_ = json.Unmarshal(data, &result)
+			return nil, AutomationClipboardOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Text: result.Text}, nil
 		}
 		return nil, AutomationClipboardOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Text: runtime.AutomationClipboard()}, nil
 	})
-	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_set_view_clock", Description: "Set one automation view's interaction clock to real or frozen mode.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input SetViewClockInput) (*mcp.CallToolResult, ViewClockOutput, error) {
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_set_view_clock", Description: "Set one automation view's interaction clock to real or frozen mode.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input SetViewClockInput) (*mcp.CallToolResult, ViewClockOutput, error) {
 		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
 		if err != nil {
-			return nil, ViewClockOutput{}, err
+			data, commandErr := s.registry.HostCommandResult(ctx, input.ProjectID, input.ViewID, "set_clock", map[string]any{"mode": input.Mode})
+			if commandErr != nil {
+				return nil, ViewClockOutput{}, commandErr
+			}
+			var result struct {
+				Clock    studio.ViewClockSnapshot  `json:"clock"`
+				Snapshot studio.AutomationSnapshot `json:"snapshot"`
+			}
+			_ = json.Unmarshal(data, &result)
+			return nil, ViewClockOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Clock: result.Clock, Snapshot: result.Snapshot}, nil
 		}
 		before := runtime.AutomationSnapshot()
 		beforeTrace := runtime.EventTrace().Revision
@@ -928,10 +1132,19 @@ func (s *Service) registerAutomationTools() {
 		s.notifyView(input.ProjectID, input.ViewID)
 		return nil, output, nil
 	})
-	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_advance_view_clock", Description: "Advance a frozen automation view clock by a positive duration.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input AdvanceViewClockInput) (*mcp.CallToolResult, ViewClockOutput, error) {
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_advance_view_clock", Description: "Advance a frozen automation view clock by a positive duration.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input AdvanceViewClockInput) (*mcp.CallToolResult, ViewClockOutput, error) {
 		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
 		if err != nil {
-			return nil, ViewClockOutput{}, err
+			data, commandErr := s.registry.HostCommandResult(ctx, input.ProjectID, input.ViewID, "advance_clock", map[string]any{"delta_ms": input.DeltaMS, "run_until_idle": input.RunUntilIdle})
+			if commandErr != nil {
+				return nil, ViewClockOutput{}, commandErr
+			}
+			var result struct {
+				Clock    studio.ViewClockSnapshot  `json:"clock"`
+				Snapshot studio.AutomationSnapshot `json:"snapshot"`
+			}
+			_ = json.Unmarshal(data, &result)
+			return nil, ViewClockOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Clock: result.Clock, Snapshot: result.Snapshot}, nil
 		}
 		before := runtime.AutomationSnapshot()
 		beforeTrace := runtime.EventTrace().Revision
@@ -948,10 +1161,19 @@ func (s *Service) registerAutomationTools() {
 		s.notifyView(input.ProjectID, input.ViewID)
 		return nil, output, nil
 	})
-	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_run_until_idle", Description: "Drain due timers for a frozen automation view.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input ReadAutomationClipboardInput) (*mcp.CallToolResult, ViewClockOutput, error) {
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_run_until_idle", Description: "Drain due timers for a frozen automation view.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input ReadAutomationClipboardInput) (*mcp.CallToolResult, ViewClockOutput, error) {
 		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
 		if err != nil {
-			return nil, ViewClockOutput{}, err
+			data, commandErr := s.registry.HostCommandResult(ctx, input.ProjectID, input.ViewID, "run_until_idle", nil)
+			if commandErr != nil {
+				return nil, ViewClockOutput{}, commandErr
+			}
+			var result struct {
+				Clock    studio.ViewClockSnapshot  `json:"clock"`
+				Snapshot studio.AutomationSnapshot `json:"snapshot"`
+			}
+			_ = json.Unmarshal(data, &result)
+			return nil, ViewClockOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Clock: result.Clock, Snapshot: result.Snapshot}, nil
 		}
 		before := runtime.AutomationSnapshot()
 		beforeTrace := runtime.EventTrace().Revision
@@ -976,30 +1198,30 @@ func (s *Service) registerAutomationResources() {
 	s.server.AddResourceTemplate(&mcp.ResourceTemplate{
 		URITemplate: "gora://project/{project_id}/views/{view_id}/automation",
 		Name:        "gora-view-automation", MIMEType: "application/json",
-	}, func(_ context.Context, request *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+	}, func(ctx context.Context, request *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
 		projectID, viewID, ok := parseAutomationURI(request.Params.URI)
 		if !ok {
 			return nil, mcp.ResourceNotFoundError(request.Params.URI)
 		}
-		runtime, err := s.registry.Runtime(projectID, viewID)
-		if err != nil {
+		snapshot, err := s.registry.AutomationSnapshot(projectID, viewID)
+		if err != nil && snapshot.SchemaVersion == 0 {
 			return nil, mcp.ResourceNotFoundError(request.Params.URI)
 		}
-		return jsonResource(request.Params.URI, runtime.AutomationSnapshot())
+		return jsonResource(request.Params.URI, snapshot)
 	})
 	s.server.AddResourceTemplate(&mcp.ResourceTemplate{
 		URITemplate: "gora://project/{project_id}/views/{view_id}/automation/trace",
 		Name:        "gora-view-automation-trace", MIMEType: "application/json",
-	}, func(_ context.Context, request *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+	}, func(ctx context.Context, request *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
 		projectID, viewID, ok := parseTraceURI(request.Params.URI)
 		if !ok {
 			return nil, mcp.ResourceNotFoundError(request.Params.URI)
 		}
-		runtime, err := s.registry.Runtime(projectID, viewID)
+		trace, err := s.registry.AutomationTrace(ctx, projectID, viewID)
 		if err != nil {
 			return nil, mcp.ResourceNotFoundError(request.Params.URI)
 		}
-		return jsonResource(request.Params.URI, runtime.EventTrace())
+		return jsonResource(request.Params.URI, trace)
 	})
 }
 
@@ -1031,7 +1253,18 @@ func (s *Service) registerEditingTools() {
 func (s *Service) runtimeMutation(projectID, viewID string) (*mcp.CallToolResult, RuntimeMutationOutput, error) {
 	runtime, err := s.registry.Runtime(projectID, viewID)
 	if err != nil {
-		return nil, RuntimeMutationOutput{}, err
+		view, summaryErr := s.registry.ViewSummary(projectID, viewID)
+		if summaryErr != nil {
+			return nil, RuntimeMutationOutput{}, summaryErr
+		}
+		if view.HostMode == "headless" {
+			return nil, RuntimeMutationOutput{}, err
+		}
+		if view.ConnectionState != "connected" {
+			return nil, RuntimeMutationOutput{}, fmt.Errorf("attached host disconnected: %s", view.DisconnectReason)
+		}
+		s.notifyView(projectID, viewID)
+		return nil, RuntimeMutationOutput{ProjectID: projectID, View: view}, nil
 	}
 	if _, err := runtime.RuntimeTree(); err != nil {
 		return nil, RuntimeMutationOutput{}, err
@@ -1180,7 +1413,7 @@ func (s *Service) validateSubscription(_ context.Context, request *mcp.Subscribe
 			if !view.RuntimeAvailable {
 				return fmt.Errorf("runtime tree is unavailable for token views")
 			}
-			if _, err := s.registry.Runtime(projectID, viewID); err != nil {
+			if _, err := s.registry.InspectView(projectID, viewID); err != nil {
 				return err
 			}
 			return nil
@@ -1233,19 +1466,19 @@ func (s *Service) addViewResources(projectID, viewID string) {
 	if s.automation {
 		automationURI := viewURI + "/automation"
 		s.server.AddResource(&mcp.Resource{URI: automationURI, Name: "gora-view-automation", MIMEType: "application/json"}, func(_ context.Context, request *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
-			runtime, err := s.registry.Runtime(projectID, viewID)
-			if err != nil {
+			snapshot, err := s.registry.AutomationSnapshot(projectID, viewID)
+			if err != nil && snapshot.SchemaVersion == 0 {
 				return nil, mcp.ResourceNotFoundError(request.Params.URI)
 			}
-			return jsonResource(request.Params.URI, runtime.AutomationSnapshot())
+			return jsonResource(request.Params.URI, snapshot)
 		})
 		traceURI := viewURI + "/automation/trace"
 		s.server.AddResource(&mcp.Resource{URI: traceURI, Name: "gora-view-automation-trace", MIMEType: "application/json"}, func(_ context.Context, request *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
-			runtime, err := s.registry.Runtime(projectID, viewID)
+			trace, err := s.registry.AutomationTrace(context.Background(), projectID, viewID)
 			if err != nil {
 				return nil, mcp.ResourceNotFoundError(request.Params.URI)
 			}
-			return jsonResource(request.Params.URI, runtime.EventTrace())
+			return jsonResource(request.Params.URI, trace)
 		})
 		overlayURI := viewURI + "/automation/overlay"
 		s.server.AddResource(&mcp.Resource{URI: overlayURI, Name: "gora-view-automation-overlay", MIMEType: "application/json"}, func(_ context.Context, request *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
@@ -1257,13 +1490,9 @@ func (s *Service) addViewResources(projectID, viewID string) {
 		})
 	}
 	s.server.AddResource(&mcp.Resource{URI: treeURI, Name: "gora-runtime-tree", MIMEType: "application/json"}, func(_ context.Context, request *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
-		runtime, err := s.registry.Runtime(projectID, viewID)
+		data, err := s.registry.InspectView(projectID, viewID)
 		if err != nil {
 			return nil, mcp.ResourceNotFoundError(request.Params.URI)
-		}
-		data, _, err := runtime.Inspect("headless")
-		if err != nil {
-			return nil, err
 		}
 		return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{URI: request.Params.URI, MIMEType: "application/json", Text: string(data)}}}, nil
 	})

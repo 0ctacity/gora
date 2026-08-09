@@ -226,11 +226,16 @@ func runCommand(args []string, stderr io.Writer, launch Launcher) int {
 	root := flags.String("root", "", "containment root")
 	studioMode := flags.Bool("studio", false, "open Studio")
 	headlessMode := flags.Bool("headless", false, "run without a visible window")
+	automationMode := flags.Bool("automation", false, "enable the versioned host automation bridge")
 	if err := flags.Parse(options); err != nil || flags.NArg() != 0 {
 		return ExitFailure
 	}
 	if *studioMode && *headlessMode {
 		fmt.Fprintln(stderr, "--studio and --headless are mutually exclusive")
+		return ExitFailure
+	}
+	if *headlessMode && *automationMode {
+		fmt.Fprintln(stderr, "--automation is only valid for app or Studio hosts; it cannot be combined with --headless")
 		return ExitFailure
 	}
 	mode := LaunchApp
@@ -278,7 +283,7 @@ func runCommand(args []string, stderr io.Writer, launch Launcher) int {
 		fmt.Fprintln(stderr, "runtime launcher is unavailable")
 		return ExitFailure
 	}
-	if err := launch(LaunchConfig{Root: resolvedRoot, Document: resolvedFile, SocketPath: socket, Mode: mode}); err != nil {
+	if err := launch(LaunchConfig{Root: resolvedRoot, Document: resolvedFile, SocketPath: socket, Mode: mode, Automation: *automationMode}); err != nil {
 		fmt.Fprintln(stderr, err)
 		return ExitFailure
 	}
@@ -409,7 +414,7 @@ func sortDiagnostics(diagnostics []document.Diagnostic) {
 
 func usage(output io.Writer) {
 	fmt.Fprintln(output, "usage:")
-	fmt.Fprintln(output, "  gora run <file> [--root <dir>] [--studio|--headless]")
+	fmt.Fprintln(output, "  gora run <file> [--root <dir>] [--studio|--headless] [--automation]")
 	fmt.Fprintln(output, "  gora validate <file> [--root <dir>] [--format text|json]")
 	fmt.Fprintln(output, "  gora render <file> --output <new.png> [--scale <positive-integer>] [--root <dir>] [--from app|studio|headless]")
 	fmt.Fprintln(output, "  gora inspect <file> [--root <dir>] [--from app|studio|headless]")

@@ -45,7 +45,7 @@ Diagnostics are sorted by file, line, column, and code.
 ## `gora run`
 
 ```text
-gora run <file> [--root <dir>] [--studio|--headless]
+gora run <file> [--root <dir>] [--studio|--headless] [--automation]
 ```
 
 Apps and components run in one of three mutually exclusive hosts. Token modules
@@ -60,6 +60,9 @@ are validation-only.
   creating a visible platform window. It watches dependencies and retains the
   current viewport, selection, scroll offsets, and interaction state for
   automation and future MCP integration.
+- `--automation` enables the versioned owner-only host bridge for a visible app
+  or Studio session. It cannot be combined with `--headless`; headless views
+  already provide an MCP-owned automation backend.
 
 The flags `--studio` and `--headless` cannot be combined. Session identity
 includes the canonical root, document, and host mode, so app, Studio, and

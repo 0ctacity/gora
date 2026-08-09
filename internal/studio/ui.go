@@ -2,6 +2,7 @@ package studio
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"image"
 	"image/color"
@@ -33,6 +34,7 @@ import (
 	"gioui.org/widget"
 	"gioui.org/widget/material"
 
+	"gora/internal/automation"
 	"gora/internal/interaction"
 	"gora/internal/project"
 	"gora/internal/render"
@@ -97,6 +99,12 @@ type checkerboardCache struct {
 
 // Start creates the Gio window and live session. Call app.Main after it returns.
 func Start(root, entry, socketPath string) error {
+	return StartWithAutomation(root, entry, socketPath, false)
+}
+
+// StartWithAutomation opens Studio and optionally advertises the versioned
+// host automation bridge.
+func StartWithAutomation(root, entry, socketPath string, automationEnabled bool) error {
 	runtime, err := NewRuntime(root, entry)
 	if err != nil {
 		// An invalid initial document is still a valid Studio state.
@@ -105,11 +113,25 @@ func Start(root, entry, socketPath string) error {
 	}
 	window := new(app.Window)
 	window.Option(app.Title("Gora Studio — "+filepath.Base(entry)), app.Size(unit.Dp(1200), unit.Dp(820)))
-	server, err := session.Listen(socketPath, runtime.SessionHandler("studio", func() {
+	controller := NewHostController(64)
+	driver := NewHostAutomationDriver(runtime)
+	identity := hostIdentity(root, entry, session.HostModeStudio, automationEnabled)
+	go func() {
+		for {
+			select {
+			case <-controller.Wake():
+				window.Invalidate()
+			case <-controller.Done():
+				return
+			}
+		}
+	}()
+	server, err := session.Listen(socketPath, runtime.SessionHandlerWithController("studio", identity, controller, func() {
 		window.Perform(system.ActionRaise)
 		window.Invalidate()
-	}))
+	}, driver))
 	if err != nil {
+		controller.Close()
 		return err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -125,18 +147,24 @@ func Start(root, entry, socketPath string) error {
 		}
 	}()
 	go func() {
-		_ = runtime.Watch(ctx, window.Invalidate)
+		_ = runtime.WatchWithReload(ctx, window.Invalidate, func() {
+			_ = controller.TrySubmit(HostCommand{RequestID: fmt.Sprintf("watch-%d", time.Now().UnixNano()), Apply: func() error {
+				runtime.Reload()
+				return nil
+			}})
+		})
 	}()
-	go eventLoop(window, runtime, server, func() {
+	go eventLoop(window, runtime, server, controller, driver, func() {
 		signal.Stop(signals)
 		cancel()
 	})
 	return nil
 }
 
-func eventLoop(window *app.Window, runtime *Runtime, server *session.Server, cleanup func()) {
+func eventLoop(window *app.Window, runtime *Runtime, server *session.Server, controller *HostController, driver *automation.Driver, cleanup func()) {
 	defer cleanup()
 	defer server.Close()
+	defer controller.Close()
 	theme := material.NewTheme()
 	state := &uiState{zoomValue: 1, router: interaction.NewRouter()}
 	state.output.SingleLine = true
@@ -156,8 +184,33 @@ func eventLoop(window *app.Window, runtime *Runtime, server *session.Server, cle
 		case app.DestroyEvent:
 			return
 		case app.FrameEvent:
+			commands := controller.Drain()
+			applied := make([]struct {
+				command HostCommand
+				err     error
+			}, len(commands))
+			for index, command := range commands {
+				applied[index] = struct {
+					command HostCommand
+					err     error
+				}{command: command, err: command.Apply()}
+			}
 			context := app.NewContext(&operations, event)
 			layoutStudio(context, theme, runtime, state, window)
+			if driver != nil {
+				if tree, treeErr := runtime.CurrentRuntimeTree(); treeErr == nil {
+					driver.Update(tree)
+				}
+			}
+			snapshot := runtime.Snapshot()
+			for _, item := range applied {
+				var data json.RawMessage
+				if item.err == nil && item.command.Result != nil {
+					data, item.err = item.command.Result()
+				}
+				controller.Complete(item.command.RequestID, item.err, data)
+			}
+			controller.Publish(HostPublication{RuntimeRevision: snapshot.PublishedRuntimeRevision, GeometryRevision: snapshot.PublishedGeometryRevision, FrameRevision: snapshot.FrameRevision})
 			event.Frame(context.Ops)
 		}
 	}

@@ -1,18 +1,23 @@
 package mcpserver
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"gora/internal/automation"
 	"gora/internal/document"
 	"gora/internal/project"
+	"gora/internal/session"
 	"gora/internal/studio"
 )
 
@@ -35,6 +40,13 @@ type ViewSummary struct {
 	Viewport         struct{ Width, Height int } `json:"viewport"`
 	Revision         uint64                      `json:"revision"`
 	Diagnostics      []document.Diagnostic       `json:"diagnostics"`
+	HostMode         session.HostMode            `json:"host_mode"`
+	ConnectionState  string                      `json:"connection_state"`
+	HostInstanceID   string                      `json:"host_instance_id,omitempty"`
+	ProtocolVersion  int                         `json:"protocol_version,omitempty"`
+	Capabilities     []string                    `json:"capabilities,omitempty"`
+	HostPID          int                         `json:"host_pid,omitempty"`
+	DisconnectReason string                      `json:"disconnect_reason,omitempty"`
 }
 
 type Registry struct {
@@ -65,6 +77,23 @@ type View struct {
 	driver      *automation.Driver
 	overlay     *viewOverlay
 	faults      map[string]*testFaultRule
+	hostMode    session.HostMode
+	host        *hostBackend
+	backend     ViewBackend
+}
+
+type hostBackend struct {
+	mu         sync.Mutex
+	socketPath string
+	identity   session.HostIdentity
+	protocol   int
+	last       studio.AutomationSnapshot
+	connected  bool
+	reason     string
+	stop       chan struct{}
+	done       chan struct{}
+	stopOnce   sync.Once
+	notify     func()
 }
 
 func NewRegistry() *Registry {
@@ -129,7 +158,7 @@ func (r *Registry) CloseProject(id string) error {
 	return nil
 }
 
-func (r *Registry) OpenView(projectID, file string) (ViewSummary, error) {
+func (r *Registry) OpenView(projectID, file string, modes ...string) (ViewSummary, error) {
 	project, err := r.project(projectID)
 	if err != nil {
 		return ViewSummary{}, err
@@ -138,9 +167,17 @@ func (r *Registry) OpenView(projectID, file string) (ViewSummary, error) {
 	if err != nil {
 		return ViewSummary{}, err
 	}
+	hostMode := session.HostModeHeadless
+	if len(modes) > 0 && modes[0] != "" {
+		hostMode = session.HostMode(modes[0])
+	}
+	if hostMode != session.HostModeHeadless && hostMode != session.HostModeApp && hostMode != session.HostModeStudio {
+		return ViewSummary{}, fmt.Errorf("unsupported host_mode %q", hostMode)
+	}
 	project.mu.Lock()
 	defer project.mu.Unlock()
-	if id := project.byEntry[entry]; id != "" {
+	key := viewKey(entry, hostMode)
+	if id := project.byEntry[key]; id != "" {
 		return project.views[id].summary(), nil
 	}
 	source, err := os.ReadFile(entry)
@@ -156,13 +193,30 @@ func (r *Registry) OpenView(projectID, file string) (ViewSummary, error) {
 	if doc != nil {
 		kind = doc.Kind
 	}
-	view := &View{id: opaqueID(), entry: entry, kind: kind, diagnostics: diagnostics, overlay: newViewOverlay(), faults: make(map[string]*testFaultRule)}
-	if kind != document.KindTokens {
+	view := &View{id: opaqueID(), entry: entry, kind: kind, hostMode: hostMode, diagnostics: diagnostics, overlay: newViewOverlay(), faults: make(map[string]*testFaultRule)}
+	if hostMode != session.HostModeHeadless {
+		if kind == document.KindTokens {
+			return ViewSummary{}, fmt.Errorf("token views cannot attach to %s host", hostMode)
+		}
+		host, err := attachHost(project.root, entry, hostMode)
+		if err != nil {
+			return ViewSummary{}, err
+		}
+		view.host = host
+		view.backend = host
+		host.startObserver(func() {
+			if project.notify != nil {
+				project.notify(project.id, []string{view.id})
+			}
+		})
+		view.kind = kind
+	} else if kind != document.KindTokens {
 		view.runtime = studio.NewRuntimeAllowInvalid(project.root, entry)
 		view.driver = newAutomationDriver(view.runtime)
+		view.backend = &headlessBackend{runtime: view.runtime, driver: view.driver}
 	}
 	project.views[view.id] = view
-	project.byEntry[entry] = view.id
+	project.byEntry[key] = view.id
 	project.sources[entry] = true
 	if view.runtime != nil {
 		for _, dependency := range view.runtime.Dependencies() {
@@ -223,10 +277,13 @@ func (r *Registry) CloseView(projectID, viewID string) error {
 		return fmt.Errorf("unknown view %q", viewID)
 	}
 	delete(project.views, viewID)
-	delete(project.byEntry, view.entry)
+	delete(project.byEntry, viewKey(view.entry, view.hostMode))
 	project.revision++
 	project.mu.Unlock()
 	view.closeOverlay()
+	if view.host != nil {
+		view.host.close()
+	}
 	if view.runtime != nil {
 		view.runtime.Close()
 	}
@@ -248,9 +305,26 @@ func (r *Registry) Runtime(projectID, viewID string) (*studio.Runtime, error) {
 		return nil, fmt.Errorf("unknown view %q", viewID)
 	}
 	if view.runtime == nil {
-		return nil, fmt.Errorf("view %q does not support runtime operations", viewID)
+		return nil, fmt.Errorf("unsupported capability: view %q runtime operations are owned by attached %s host", viewID, view.hostMode)
 	}
 	return view.runtime, nil
+}
+
+func (r *Registry) Backend(projectID, viewID string) (ViewBackend, error) {
+	project, err := r.project(projectID)
+	if err != nil {
+		return nil, err
+	}
+	project.mu.RLock()
+	view := project.views[viewID]
+	project.mu.RUnlock()
+	if view == nil {
+		return nil, fmt.Errorf("unknown view %q", viewID)
+	}
+	if view.backend == nil {
+		return nil, fmt.Errorf("view %q has no backend", viewID)
+	}
+	return view.backend, nil
 }
 
 // AutomationDriver returns the ordered input coordinator owned by one live
@@ -314,6 +388,219 @@ func (r *Registry) ViewSummary(projectID, viewID string) (ViewSummary, error) {
 	return view.summary(), nil
 }
 
+// AutomationSnapshot returns the latest immutable host publication for an
+// attached view or the in-process automation snapshot for a headless view.
+func (r *Registry) AutomationSnapshot(projectID, viewID string) (studio.AutomationSnapshot, error) {
+	project, err := r.project(projectID)
+	if err != nil {
+		return studio.AutomationSnapshot{}, err
+	}
+	project.mu.Lock()
+	defer project.mu.Unlock()
+	view := project.views[viewID]
+	if view == nil {
+		return studio.AutomationSnapshot{}, fmt.Errorf("unknown view %q", viewID)
+	}
+	if view.runtime != nil {
+		return view.runtime.AutomationSnapshot(), nil
+	}
+	if view.host == nil {
+		return studio.AutomationSnapshot{}, fmt.Errorf("view %q has no runtime backend", viewID)
+	}
+	view.host.refresh(view.entry)
+	view.host.mu.Lock()
+	reconnected := view.host.connected
+	notify := view.host.notify
+	view.host.mu.Unlock()
+	if reconnected {
+		view.host.startObserver(notify)
+	}
+	view.host.mu.Lock()
+	defer view.host.mu.Unlock()
+	if !view.host.connected {
+		return view.host.last, fmt.Errorf("attached host is disconnected: %s", view.host.reason)
+	}
+	return view.host.last, nil
+}
+
+func (r *Registry) AutomationTrace(ctx context.Context, projectID, viewID string) (automation.TraceSnapshot, error) {
+	backend, err := r.Backend(projectID, viewID)
+	if err != nil {
+		return automation.TraceSnapshot{}, err
+	}
+	return backend.Trace(ctx)
+}
+
+func (r *Registry) WaitForView(ctx context.Context, projectID, viewID string, request studio.WaitForViewRequest) (studio.AutomationSnapshot, error) {
+	project, err := r.project(projectID)
+	if err != nil {
+		return studio.AutomationSnapshot{}, err
+	}
+	project.mu.RLock()
+	view := project.views[viewID]
+	project.mu.RUnlock()
+	if view == nil {
+		return studio.AutomationSnapshot{}, fmt.Errorf("unknown view %q", viewID)
+	}
+	if view.runtime != nil {
+		return view.runtime.WaitForView(ctx, request)
+	}
+	if view.host == nil {
+		return studio.AutomationSnapshot{}, fmt.Errorf("view %q has no runtime backend", viewID)
+	}
+	view.host.mu.Lock()
+	socketPath := view.host.socketPath
+	view.host.mu.Unlock()
+	payload, _ := json.Marshal(struct {
+		AfterFrameRevision   uint64 `json:"after_frame_revision"`
+		AfterFrameSet        bool   `json:"after_frame_set"`
+		AfterRuntimeRevision uint64 `json:"after_runtime_revision"`
+		AfterRuntimeSet      bool   `json:"after_runtime_set"`
+		Condition            string `json:"condition"`
+		StableFrames         int    `json:"stable_frames"`
+		TimeoutMS            int    `json:"timeout_ms"`
+	}{request.AfterFrameRevision, request.AfterFrameSet, request.AfterRuntimeRevision, request.AfterRuntimeSet, request.Condition, request.StableFrames, int(request.Timeout / time.Millisecond)})
+	response, err := session.Send(socketPath, session.Request{Version: session.ProtocolVersion, RequestID: opaqueID(), Action: session.ActionWait, Payload: payload}, request.Timeout)
+	if err != nil {
+		view.host.mu.Lock()
+		defer view.host.mu.Unlock()
+		if response.Error != "" {
+			var snapshot studio.AutomationSnapshot
+			if len(response.Data) != 0 {
+				_ = json.Unmarshal(response.Data, &snapshot)
+				view.host.last = snapshot
+			}
+			return snapshot, err
+		}
+		view.host.connected = false
+		view.host.reason = err.Error()
+		return view.host.last, err
+	}
+	var snapshot studio.AutomationSnapshot
+	if len(response.Data) != 0 {
+		_ = json.Unmarshal(response.Data, &snapshot)
+	}
+	view.host.mu.Lock()
+	view.host.last = snapshot
+	view.host.mu.Unlock()
+	if !response.OK {
+		return snapshot, errors.New(response.Error)
+	}
+	return snapshot, nil
+}
+
+// InspectView returns the host's published inspection tree for an attached
+// view. Headless views retain the existing runtime inspection contract.
+func (r *Registry) InspectView(projectID, viewID string) ([]byte, error) {
+	project, err := r.project(projectID)
+	if err != nil {
+		return nil, err
+	}
+	project.mu.RLock()
+	view := project.views[viewID]
+	project.mu.RUnlock()
+	if view == nil {
+		return nil, fmt.Errorf("unknown view %q", viewID)
+	}
+	if view.runtime != nil {
+		data, _, err := view.runtime.Inspect("headless")
+		return data, err
+	}
+	if view.host == nil {
+		return nil, fmt.Errorf("view %q has no runtime backend", viewID)
+	}
+	view.host.mu.Lock()
+	socketPath := view.host.socketPath
+	view.host.mu.Unlock()
+	response, err := session.Send(socketPath, session.Request{Action: "inspect"}, 500*time.Millisecond)
+	if err != nil {
+		view.host.mu.Lock()
+		defer view.host.mu.Unlock()
+		view.host.connected = false
+		view.host.reason = err.Error()
+		return nil, fmt.Errorf("attached host is disconnected: %w", err)
+	}
+	if !response.OK {
+		return nil, errors.New(response.Error)
+	}
+	return response.Data, nil
+}
+
+// HostCommand forwards an attached-view mutation to the host event loop. It
+// is intentionally unavailable for headless views, whose existing handlers
+// retain direct in-process semantics.
+func (r *Registry) HostCommand(ctx context.Context, projectID, viewID, kind string, payload any) error {
+	_, err := r.HostCommandResult(ctx, projectID, viewID, kind, payload)
+	return err
+}
+
+func (r *Registry) HostCommandResult(ctx context.Context, projectID, viewID, kind string, payload any) (json.RawMessage, error) {
+	project, err := r.project(projectID)
+	if err != nil {
+		return nil, err
+	}
+	project.mu.RLock()
+	view := project.views[viewID]
+	project.mu.RUnlock()
+	if view == nil {
+		return nil, fmt.Errorf("unknown view %q", viewID)
+	}
+	if view.host == nil {
+		return nil, fmt.Errorf("view %q is not an attached host view", viewID)
+	}
+	host := view.host
+	host.mu.Lock()
+	capability := map[string]string{"set_viewport": "viewport", "select": "selection", "activate": "activation", "scroll": "scroll", "set_state": "state", "reset_state": "reset", "set_control_value": "state", "set_field_draft": "editing", "submit_form": "editing", "reset_form": "editing", "set_clock": "clock", "advance_clock": "clock", "run_until_idle": "clock", "set_clipboard": "editing", "get_clipboard": "editing", "dispatch": "input", "configure_trace": "trace", "clear_trace": "trace", "get_trace": "trace", "capture": "capture", "assert": "snapshot", "reload_overlay": "overlay", "configure_faults": "faults", "clear_faults": "faults"}[kind]
+	if capability != "" {
+		advertised := false
+		for _, value := range host.identity.Capabilities {
+			if value == capability {
+				advertised = true
+				break
+			}
+		}
+		if !advertised {
+			host.mu.Unlock()
+			return nil, fmt.Errorf("unsupported capability: host does not advertise %q", capability)
+		}
+	}
+	socketPath := host.socketPath
+	host.mu.Unlock()
+	body := map[string]any{"kind": kind}
+	if encoded, marshalErr := json.Marshal(payload); marshalErr == nil && len(encoded) > 0 && string(encoded) != "null" {
+		var fields map[string]any
+		if unmarshalErr := json.Unmarshal(encoded, &fields); unmarshalErr == nil {
+			for key, value := range fields {
+				body[key] = value
+			}
+		}
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	response, err := session.Send(socketPath, session.Request{Version: session.ProtocolVersion, RequestID: opaqueID(), Action: session.ActionCommand, Payload: data}, 5*time.Second)
+	if err != nil {
+		host.mu.Lock()
+		host.connected = false
+		host.reason = err.Error()
+		host.mu.Unlock()
+		return nil, fmt.Errorf("attached host disconnected: %w", err)
+	}
+	if !response.OK {
+		return nil, errors.New(response.Error)
+	}
+	view.host.refresh(view.entry)
+	view.host.mu.Lock()
+	reconnected := view.host.connected
+	notify := view.host.notify
+	view.host.mu.Unlock()
+	if reconnected {
+		view.host.startObserver(notify)
+	}
+	return response.Data, nil
+}
+
 func (r *Registry) ProjectRoot(projectID string) (string, error) {
 	project, err := r.project(projectID)
 	if err != nil {
@@ -371,6 +658,9 @@ func (p *Project) close() {
 	p.mu.Unlock()
 	for _, view := range views {
 		view.closeOverlay()
+		if view.host != nil {
+			view.host.close()
+		}
 		if view.driver != nil {
 			view.driver.Close()
 		}
@@ -393,7 +683,21 @@ func (v *View) closeOverlay() {
 }
 
 func (v *View) summary() ViewSummary {
-	result := ViewSummary{ID: v.id, File: v.entry, Kind: v.kind, Valid: len(v.diagnostics) == 0, RuntimeAvailable: v.runtime != nil, Diagnostics: append([]document.Diagnostic(nil), v.diagnostics...), Selections: []string{}}
+	if v.host != nil {
+		v.host.refresh(v.entry)
+		v.host.mu.Lock()
+		reconnected := v.host.connected
+		notify := v.host.notify
+		v.host.mu.Unlock()
+		if reconnected {
+			v.host.startObserver(notify)
+		}
+	}
+	mode := v.hostMode
+	if mode == "" {
+		mode = session.HostModeHeadless
+	}
+	result := ViewSummary{ID: v.id, File: v.entry, Kind: v.kind, HostMode: mode, ConnectionState: "connected", Valid: len(v.diagnostics) == 0, RuntimeAvailable: v.runtime != nil, Diagnostics: append([]document.Diagnostic(nil), v.diagnostics...), Selections: []string{}}
 	if v.runtime != nil {
 		snapshot := v.runtime.Snapshot()
 		result.Valid = !snapshot.Invalid
@@ -404,10 +708,99 @@ func (v *View) summary() ViewSummary {
 		result.Viewport.Height = snapshot.Viewport.Y
 		result.Revision = snapshot.RuntimeRevision
 	}
+	if v.host != nil {
+		v.host.mu.Lock()
+		result.RuntimeAvailable = true
+		result.ConnectionState = "disconnected"
+		if v.host.connected {
+			result.ConnectionState = "connected"
+		}
+		result.HostInstanceID = v.host.identity.InstanceID
+		result.ProtocolVersion = v.host.protocol
+		result.Capabilities = append([]string(nil), v.host.identity.Capabilities...)
+		result.HostPID = v.host.identity.PID
+		result.DisconnectReason = v.host.reason
+		result.Revision = v.host.last.FrameRevision
+		result.Valid = v.host.last.Valid
+		result.Viewport.Width = v.host.last.Viewport.X
+		result.Viewport.Height = v.host.last.Viewport.Y
+		result.Diagnostics = append([]document.Diagnostic(nil), v.host.last.Diagnostics...)
+		v.host.mu.Unlock()
+	}
 	if result.Diagnostics == nil {
 		result.Diagnostics = []document.Diagnostic{}
 	}
 	return result
+}
+
+func (host *hostBackend) refresh(entry string) {
+	if host == nil {
+		return
+	}
+	host.mu.Lock()
+	defer host.mu.Unlock()
+	payload, _ := json.Marshal(session.HandshakePayload{Root: host.identity.Root, Document: entry, Mode: host.identity.Mode, Protocol: session.ProtocolVersion})
+	response, err := session.Send(host.socketPath, session.Request{Version: session.ProtocolVersion, RequestID: opaqueID(), Action: session.ActionHandshake, Payload: payload}, 200*time.Millisecond)
+	if err != nil || !response.OK {
+		host.connected = false
+		if err != nil {
+			host.reason = err.Error()
+		} else {
+			host.reason = response.Error
+		}
+		return
+	}
+	var result session.HandshakeResult
+	if err := json.Unmarshal(response.Data, &result); err != nil {
+		host.connected = false
+		host.reason = err.Error()
+		return
+	}
+	if err := session.ValidateHandshake(session.HostIdentity{Root: host.identity.Root, Document: entry}, result.Host, result.Protocol, host.identity.Mode); err != nil {
+		host.connected = false
+		host.reason = err.Error()
+		return
+	}
+	host.identity = result.Host
+	host.protocol = result.Protocol
+	host.connected = true
+	host.reason = ""
+	data, err := session.Send(host.socketPath, session.Request{Version: session.ProtocolVersion, RequestID: opaqueID(), Action: session.ActionSnapshot}, 200*time.Millisecond)
+	if err != nil || !data.OK {
+		if err != nil {
+			host.reason = err.Error()
+		} else {
+			host.reason = data.Error
+		}
+		host.connected = false
+		return
+	}
+	_ = json.Unmarshal(data.Data, &host.last)
+}
+
+func viewKey(entry string, mode session.HostMode) string { return entry + "\x00" + string(mode) }
+
+func attachHost(root, entry string, mode session.HostMode) (*hostBackend, error) {
+	socketPath, err := session.SocketPath(root, entry, string(mode))
+	if err != nil {
+		return nil, err
+	}
+	requestPayload, _ := json.Marshal(session.HandshakePayload{Root: root, Document: entry, Mode: mode, Protocol: session.ProtocolVersion})
+	response, err := session.Send(socketPath, session.Request{Version: session.ProtocolVersion, RequestID: opaqueID(), Action: session.ActionHandshake, Payload: requestPayload}, 500*time.Millisecond)
+	if err != nil {
+		return nil, fmt.Errorf("no matching automation-enabled %s host: %w", mode, err)
+	}
+	if !response.OK {
+		return nil, fmt.Errorf("host handshake rejected: %s", response.Error)
+	}
+	var result session.HandshakeResult
+	if err := json.Unmarshal(response.Data, &result); err != nil {
+		return nil, fmt.Errorf("invalid host handshake response: %w", err)
+	}
+	if err := session.ValidateHandshake(session.HostIdentity{Root: root, Document: entry}, result.Host, result.Protocol, mode); err != nil {
+		return nil, err
+	}
+	return &hostBackend{socketPath: socketPath, identity: result.Host, protocol: result.Protocol, connected: true}, nil
 }
 
 func canonicalDirectory(root string) (string, error) {

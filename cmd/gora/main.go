@@ -19,13 +19,13 @@ func main() {
 	exit := cli.Run(os.Args[1:], os.Stdout, os.Stderr, func(config cli.LaunchConfig) error {
 		switch config.Mode {
 		case cli.LaunchApp:
-			if err := studio.StartApp(config.Root, config.Document, config.SocketPath); err != nil {
+			if err := studio.StartAppWithAutomation(config.Root, config.Document, config.SocketPath, config.Automation); err != nil {
 				return err
 			}
 			guiStarted = true
 			return nil
 		case cli.LaunchStudio:
-			if err := studio.Start(config.Root, config.Document, config.SocketPath); err != nil {
+			if err := studio.StartWithAutomation(config.Root, config.Document, config.SocketPath, config.Automation); err != nil {
 				return err
 			}
 			guiStarted = true

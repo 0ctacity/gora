@@ -2,6 +2,10 @@ package studio
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"image"
 	"math"
 	"os"
@@ -20,6 +24,7 @@ import (
 	"gioui.org/unit"
 	"gioui.org/widget/material"
 
+	"gora/internal/automation"
 	"gora/internal/interaction"
 	"gora/internal/session"
 )
@@ -30,6 +35,12 @@ func newAppUIState() *uiState {
 
 // StartApp opens a content-only native document window.
 func StartApp(root, entry, socketPath string) error {
+	return StartAppWithAutomation(root, entry, socketPath, false)
+}
+
+// StartAppWithAutomation opens a plain app host and optionally advertises the
+// versioned automation bridge to MCP clients.
+func StartAppWithAutomation(root, entry, socketPath string, automationEnabled bool) error {
 	runtime, err := NewRuntime(root, entry)
 	if err != nil {
 		return err
@@ -40,11 +51,25 @@ func StartApp(root, entry, socketPath string) error {
 		app.Title(filepath.Base(entry)),
 		app.Size(unit.Dp(snapshot.Viewport.X), unit.Dp(snapshot.Viewport.Y)),
 	)
-	server, err := session.Listen(socketPath, runtime.SessionHandler("app", func() {
+	controller := NewHostController(64)
+	driver := NewHostAutomationDriver(runtime)
+	identity := hostIdentity(root, entry, session.HostModeApp, automationEnabled)
+	go func() {
+		for {
+			select {
+			case <-controller.Wake():
+				window.Invalidate()
+			case <-controller.Done():
+				return
+			}
+		}
+	}()
+	server, err := session.Listen(socketPath, runtime.SessionHandlerWithController("app", identity, controller, func() {
 		window.Perform(system.ActionRaise)
 		window.Invalidate()
-	}))
+	}, driver))
 	if err != nil {
+		controller.Close()
 		return err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -60,18 +85,24 @@ func StartApp(root, entry, socketPath string) error {
 		}
 	}()
 	go func() {
-		_ = runtime.Watch(ctx, window.Invalidate)
+		_ = runtime.WatchWithReload(ctx, window.Invalidate, func() {
+			_ = controller.TrySubmit(HostCommand{RequestID: fmt.Sprintf("watch-%d", time.Now().UnixNano()), Apply: func() error {
+				runtime.Reload()
+				return nil
+			}})
+		})
 	}()
-	go appEventLoop(window, runtime, server, func() {
+	go appEventLoop(window, runtime, server, controller, driver, func() {
 		signal.Stop(signals)
 		cancel()
 	})
 	return nil
 }
 
-func appEventLoop(window *app.Window, runtime *Runtime, server *session.Server, cleanup func()) {
+func appEventLoop(window *app.Window, runtime *Runtime, server *session.Server, controller *HostController, driver *automation.Driver, cleanup func()) {
 	defer cleanup()
 	defer server.Close()
+	defer controller.Close()
 	theme := material.NewTheme()
 	state := newAppUIState()
 	var operations op.Ops
@@ -81,8 +112,33 @@ func appEventLoop(window *app.Window, runtime *Runtime, server *session.Server, 
 		case app.DestroyEvent:
 			return
 		case app.FrameEvent:
+			commands := controller.Drain()
+			applied := make([]struct {
+				command HostCommand
+				err     error
+			}, len(commands))
+			for index, command := range commands {
+				applied[index] = struct {
+					command HostCommand
+					err     error
+				}{command: command, err: command.Apply()}
+			}
 			gtx := app.NewContext(&operations, event)
 			layoutAppContent(gtx, theme, runtime, state, window)
+			if driver != nil {
+				if tree, treeErr := runtime.CurrentRuntimeTree(); treeErr == nil {
+					driver.Update(tree)
+				}
+			}
+			snapshot := runtime.Snapshot()
+			for _, item := range applied {
+				var data json.RawMessage
+				if item.err == nil && item.command.Result != nil {
+					data, item.err = item.command.Result()
+				}
+				controller.Complete(item.command.RequestID, item.err, data)
+			}
+			controller.Publish(HostPublication{RuntimeRevision: snapshot.PublishedRuntimeRevision, GeometryRevision: snapshot.PublishedGeometryRevision, FrameRevision: snapshot.FrameRevision})
 			event.Frame(gtx.Ops)
 		}
 	}
@@ -184,6 +240,20 @@ func runHeadless(ctx context.Context, root, entry, socketPath string) error {
 	case err := <-watchDone:
 		return err
 	}
+}
+
+func hostIdentity(root, entry string, mode session.HostMode, automationEnabled bool) session.HostIdentity {
+	if canonical, err := filepath.EvalSymlinks(root); err == nil {
+		root = canonical
+	}
+	if canonical, err := filepath.EvalSymlinks(entry); err == nil {
+		entry = canonical
+	}
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err != nil {
+		bytes = []byte(filepath.Base(entry) + time.Now().String())
+	}
+	return session.HostIdentity{InstanceID: hex.EncodeToString(bytes), Root: root, Document: entry, Mode: mode, PID: os.Getpid(), Automation: automationEnabled, Capabilities: []string{"activation", "capture", "clock", "command", "editing", "faults", "input", "overlay", "reset", "scroll", "selection", "snapshot", "state", "trace", "tree", "viewport", "wait"}}
 }
 
 func runtimeAllowInvalid(root, entry string) (*Runtime, error) {

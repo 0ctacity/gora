@@ -54,6 +54,40 @@ func (runtime *Runtime) SetAutomationClipboard(text string) {
 	runtime.mu.Unlock()
 }
 
+// ConfigureAutomationFaults installs bounded host-owned fault counters. The
+// host control service consumes these counters on the owning event loop.
+func (runtime *Runtime) ConfigureAutomationFaults(rules map[string]int) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	runtime.automationFaults = make(map[string]int, len(rules))
+	for kind, remaining := range rules {
+		if remaining > 0 {
+			runtime.automationFaults[kind] = remaining
+		}
+	}
+}
+
+func (runtime *Runtime) ClearAutomationFaults() {
+	runtime.mu.Lock()
+	runtime.automationFaults = make(map[string]int)
+	runtime.mu.Unlock()
+}
+
+func (runtime *Runtime) ConsumeAutomationFault(kind string) bool {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	remaining := runtime.automationFaults[kind]
+	if remaining <= 0 {
+		return false
+	}
+	if remaining == 1 {
+		delete(runtime.automationFaults, kind)
+	} else {
+		runtime.automationFaults[kind] = remaining - 1
+	}
+	return true
+}
+
 func (runtime *Runtime) focusedEditableField(tree *semantic.Node, expected string) (*semantic.Node, error) {
 	focused := runtime.routerSnapshot.FocusedID
 	if !runtime.routerSnapshotSet && runtime.router != nil {

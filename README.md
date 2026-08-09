@@ -56,6 +56,18 @@ Open the same document in Studio:
 ./gora run examples/dashboard/app.gora --root examples/dashboard --studio
 ```
 
+Windowed app and Studio hosts may opt into the versioned local MCP bridge:
+
+```sh
+./gora run examples/dashboard/app.gora --root examples/dashboard --automation
+./gora run examples/dashboard/app.gora --root examples/dashboard --studio --automation
+```
+
+With `gora mcp --automation`, open a matching live host using
+`gora_open_view` and `host_mode: "app"` or `"studio"`. Host attachment uses
+the real Gio-owned runtime and published frame; it does not create a shadow
+headless runtime. `--automation` is rejected with `--headless`.
+
 Run it without a visible window for the existing live-session CLI workflow:
 
 ```sh

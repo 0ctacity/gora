@@ -181,6 +181,7 @@ type Runtime struct {
 	closed                    bool
 	candidateReload           bool
 	overlay                   map[string]project.OverlayFile
+	automationFaults          map[string]int
 }
 
 func newRuntime(root, entry string) *Runtime {
@@ -188,7 +189,7 @@ func newRuntime(root, entry string) *Runtime {
 		root: root, entry: entry, scroll: make(map[string]image.Point),
 		scrollMetricScale: 1,
 		clockMode:         "real", clockTimeMS: time.Now().UnixMilli(), blinkVisible: true,
-		trace: automation.NewTraceRecorder(),
+		trace: automation.NewTraceRecorder(), automationFaults: make(map[string]int),
 		state: interaction.NewStore(), editing: interaction.NewEditingStore(),
 		router: interaction.NewRouter(), syncCh: make(chan struct{}), doneCh: make(chan struct{}),
 	}
@@ -2564,6 +2565,13 @@ func (runtime *Runtime) SessionHandler(hostMode string, focus func()) session.Ha
 }
 
 func (runtime *Runtime) Watch(ctx context.Context, changed func()) error {
+	return runtime.WatchWithReload(ctx, changed, nil)
+}
+
+// WatchWithReload keeps filesystem observation separate from runtime
+// mutation. Hosts pass a reload callback that enqueues the reload on their
+// owning Gio loop; headless callers can use Watch, which reloads inline.
+func (runtime *Runtime) WatchWithReload(ctx context.Context, changed func(), reload func()) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
@@ -2623,7 +2631,11 @@ func (runtime *Runtime) Watch(ctx context.Context, changed func()) error {
 			debounceC = debounce.C
 		case <-debounceC:
 			debounceC = nil
-			runtime.Reload()
+			if reload != nil {
+				reload()
+			} else {
+				runtime.Reload()
+			}
 			addDirectories()
 			if changed != nil {
 				changed()

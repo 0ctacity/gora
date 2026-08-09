@@ -17,6 +17,7 @@ import (
 	"gora/internal/automation"
 	"gora/internal/document"
 	"gora/internal/project"
+	"gora/internal/session"
 	"gora/internal/studio"
 )
 
@@ -305,6 +306,19 @@ func (p *Project) overlaySnapshotLocked(view *View) TestOverlaySnapshot {
 		result.PublishedRuntimeRevision = snapshot.PublishedRuntimeRevision
 		result.PublishedGeometryRevision = snapshot.PublishedGeometryRevision
 		result.LastGoodAvailable = snapshot.Root != nil || snapshot.PublishedValid
+	} else if view.host != nil {
+		view.host.refresh(view.entry)
+		view.host.mu.Lock()
+		snapshot := view.host.last
+		view.host.mu.Unlock()
+		result.Valid = snapshot.Valid
+		result.Diagnostics = append(result.Diagnostics, snapshot.Diagnostics...)
+		result.RuntimeRevision = snapshot.RuntimeRevision
+		result.FrameRevision = snapshot.FrameRevision
+		result.GeometryRevision = snapshot.GeometryRevision
+		result.PublishedRuntimeRevision = snapshot.PublishedRuntimeRevision
+		result.PublishedGeometryRevision = snapshot.PublishedGeometryRevision
+		result.LastGoodAvailable = snapshot.LastGoodAvailable
 	}
 	return result
 }
@@ -421,9 +435,15 @@ func validateOverlaySet(entries map[string]viewOverlayEntry) error {
 	return nil
 }
 
-func (p *Project) reloadViewOverlayLocked(view *View) {
+func (p *Project) reloadViewOverlayLocked(view *View) error {
 	if view.runtime == nil {
-		return
+		if view.host != nil {
+			provider, _ := p.providerForViewLocked(view)
+			if err := view.host.command(context.Background(), "reload_overlay", map[string]any{"overlay": provider}, nil); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	before := view.runtime.AutomationSnapshot()
 	traceEnabled := view.runtime.EventTrace().Enabled
@@ -497,6 +517,7 @@ func (p *Project) reloadViewOverlayLocked(view *View) {
 	} else {
 		record("publication", "installed", "", after)
 	}
+	return nil
 }
 
 func (r *Registry) ApplyTestOverlay(projectID, viewID, base string, entries []TestOverlayEntry, install bool) (TestOverlaySnapshot, error) {
@@ -556,7 +577,9 @@ func (r *Registry) ApplyTestOverlay(projectID, viewID, base string, entries []Te
 	if install {
 		view.overlay.installed = candidate
 		view.overlay.staged = nil
-		p.reloadViewOverlayLocked(view)
+		if err := p.reloadViewOverlayLocked(view); err != nil {
+			return TestOverlaySnapshot{}, err
+		}
 	} else {
 		view.overlay.staged = candidate
 	}
@@ -604,7 +627,9 @@ func (r *Registry) ClearTestOverlay(projectID, viewID, base string, paths []stri
 	view.overlay.pendingRevision = ""
 	view.overlay.installed = target
 	view.overlay.staged = nil
-	p.reloadViewOverlayLocked(view)
+	if err := p.reloadViewOverlayLocked(view); err != nil {
+		return TestOverlaySnapshot{}, err
+	}
 	return p.overlaySnapshotLocked(view), nil
 }
 
@@ -852,7 +877,9 @@ func (r *Registry) InjectReloadEvents(projectID, viewID, base, final string, eve
 	}
 	view.overlay.installed = candidate
 	view.overlay.staged = nil
-	p.reloadViewOverlayLocked(view)
+	if err := p.reloadViewOverlayLocked(view); err != nil {
+		return TestOverlaySnapshot{}, err
+	}
 	return p.overlaySnapshotLocked(view), nil
 }
 
@@ -872,9 +899,6 @@ func (s *Service) registerPhase6Tools() {
 			return nil
 		}
 		runtime, err := s.registry.Runtime(projectID, viewID)
-		if err != nil {
-			return err
-		}
 		timeout := 5 * time.Second
 		if timeoutMS != 0 {
 			if timeoutMS < 1 || timeoutMS > 60000 {
@@ -882,15 +906,25 @@ func (s *Service) registerPhase6Tools() {
 			}
 			timeout = time.Duration(timeoutMS) * time.Millisecond
 		}
-		_, err = runtime.WaitForView(ctx, studio.WaitForViewRequest{Condition: wait, StableFrames: 1, Timeout: timeout, AfterFrameSet: true, AfterFrameRevision: baseline, AllowAlreadySatisfied: true})
+		request := studio.WaitForViewRequest{Condition: wait, StableFrames: 1, Timeout: timeout, AfterFrameSet: true, AfterFrameRevision: baseline, AllowAlreadySatisfied: true}
+		if runtime != nil {
+			_, err = runtime.WaitForView(ctx, request)
+		} else {
+			_, err = s.registry.WaitForView(ctx, projectID, viewID, request)
+		}
 		return err
 	}
 	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_apply_test_overlay", Description: "Apply a bounded view-local source or asset overlay, optionally installing it atomically.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input ApplyTestOverlayInput) (*mcp.CallToolResult, TestOverlayOutput, error) {
 		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
-		if err != nil {
-			return nil, TestOverlayOutput{}, err
+		var before studio.AutomationSnapshot
+		if runtime != nil {
+			before = runtime.AutomationSnapshot()
+		} else {
+			before, err = s.registry.AutomationSnapshot(input.ProjectID, input.ViewID)
+			if err != nil {
+				return nil, TestOverlayOutput{}, err
+			}
 		}
-		before := runtime.AutomationSnapshot()
 		overlay, err := s.registry.ApplyTestOverlay(input.ProjectID, input.ViewID, input.BaseOverlayRevision, input.Entries, input.Install)
 		if err != nil {
 			return nil, TestOverlayOutput{}, err
@@ -904,14 +938,23 @@ func (s *Service) registerPhase6Tools() {
 			}
 		}
 		s.notifyView(input.ProjectID, input.ViewID)
-		return nil, TestOverlayOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Overlay: overlay, Snapshot: runtime.AutomationSnapshot()}, nil
+		snapshot, snapshotErr := s.registry.AutomationSnapshot(input.ProjectID, input.ViewID)
+		if snapshotErr != nil && runtime != nil {
+			return nil, TestOverlayOutput{}, snapshotErr
+		}
+		return nil, TestOverlayOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Overlay: overlay, Snapshot: snapshot}, nil
 	})
 	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_clear_test_overlay", Description: "Clear selected or all entries from one view-local test overlay.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input ClearTestOverlayInput) (*mcp.CallToolResult, TestOverlayOutput, error) {
 		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
-		if err != nil {
-			return nil, TestOverlayOutput{}, err
+		var before studio.AutomationSnapshot
+		if runtime != nil {
+			before = runtime.AutomationSnapshot()
+		} else {
+			before, err = s.registry.AutomationSnapshot(input.ProjectID, input.ViewID)
+			if err != nil {
+				return nil, TestOverlayOutput{}, err
+			}
 		}
-		before := runtime.AutomationSnapshot()
 		overlay, err := s.registry.ClearTestOverlay(input.ProjectID, input.ViewID, input.BaseOverlayRevision, input.Paths, input.All)
 		if err != nil {
 			return nil, TestOverlayOutput{}, err
@@ -922,14 +965,23 @@ func (s *Service) registerPhase6Tools() {
 			}
 		}
 		s.notifyView(input.ProjectID, input.ViewID)
-		return nil, TestOverlayOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Overlay: overlay, Snapshot: runtime.AutomationSnapshot()}, nil
+		snapshot, snapshotErr := s.registry.AutomationSnapshot(input.ProjectID, input.ViewID)
+		if snapshotErr != nil && runtime != nil {
+			return nil, TestOverlayOutput{}, snapshotErr
+		}
+		return nil, TestOverlayOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Overlay: overlay, Snapshot: snapshot}, nil
 	})
 	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_inject_reload_events", Description: "Inject an ordered, contained reload event batch into one view-local overlay.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input InjectReloadEventsInput) (*mcp.CallToolResult, TestOverlayOutput, error) {
 		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
-		if err != nil {
-			return nil, TestOverlayOutput{}, err
+		var before studio.AutomationSnapshot
+		if runtime != nil {
+			before = runtime.AutomationSnapshot()
+		} else {
+			before, err = s.registry.AutomationSnapshot(input.ProjectID, input.ViewID)
+			if err != nil {
+				return nil, TestOverlayOutput{}, err
+			}
 		}
-		before := runtime.AutomationSnapshot()
 		overlay, err := s.registry.InjectReloadEvents(input.ProjectID, input.ViewID, input.BaseOverlayRevision, input.FinalOverlayRevision, input.Events)
 		if err != nil {
 			return nil, TestOverlayOutput{}, err
@@ -959,44 +1011,70 @@ func (s *Service) registerPhase6Tools() {
 		sort.Strings(coalesced)
 		root, _ := s.registry.ProjectRoot(input.ProjectID)
 		dependencies := make([]string, 0)
-		for _, dependency := range runtime.Dependencies() {
+		dependenciesSource := []string{}
+		if runtime != nil {
+			dependenciesSource = runtime.Dependencies()
+		}
+		for _, dependency := range dependenciesSource {
 			relative, relErr := filepath.Rel(root, dependency)
 			if relErr == nil {
 				dependencies = append(dependencies, filepath.ToSlash(relative))
 			}
 		}
 		sort.Strings(dependencies)
-		return nil, TestOverlayOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Overlay: overlay, Snapshot: runtime.AutomationSnapshot(), CoalescedPaths: coalesced, Dependencies: dependencies}, nil
+		snapshot, snapshotErr := s.registry.AutomationSnapshot(input.ProjectID, input.ViewID)
+		if snapshotErr != nil && runtime != nil {
+			return nil, TestOverlayOutput{}, snapshotErr
+		}
+		return nil, TestOverlayOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Overlay: overlay, Snapshot: snapshot, CoalescedPaths: coalesced, Dependencies: dependencies}, nil
 	})
-	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_configure_test_faults", Description: "Configure finite counted, view-local automation reload faults.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input ConfigureTestFaultsInput) (*mcp.CallToolResult, TestOverlayOutput, error) {
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_configure_test_faults", Description: "Configure finite counted, view-local automation reload faults.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input ConfigureTestFaultsInput) (*mcp.CallToolResult, TestOverlayOutput, error) {
 		if err := s.registry.ConfigureTestFaults(input.ProjectID, input.ViewID, input.Rules); err != nil {
 			return nil, TestOverlayOutput{}, err
 		}
+		if backend, backendErr := s.registry.Backend(input.ProjectID, input.ViewID); backendErr == nil && backend.Mode() != session.HostModeHeadless {
+			faults := make(map[string]int)
+			for _, rule := range input.Rules {
+				if rule.Path == "" {
+					faults[rule.Kind] = rule.Remaining
+				}
+			}
+			if err := s.registry.HostCommand(ctx, input.ProjectID, input.ViewID, "configure_faults", map[string]any{"faults": faults}); err != nil {
+				return nil, TestOverlayOutput{}, err
+			}
+		}
 		overlay, err := s.registry.OverlaySnapshot(input.ProjectID, input.ViewID)
 		if err != nil {
 			return nil, TestOverlayOutput{}, err
 		}
 		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
-		if err != nil {
-			return nil, TestOverlayOutput{}, err
-		}
 		s.notifyView(input.ProjectID, input.ViewID)
-		return nil, TestOverlayOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Overlay: overlay, Snapshot: runtime.AutomationSnapshot()}, nil
+		snapshot, snapshotErr := s.registry.AutomationSnapshot(input.ProjectID, input.ViewID)
+		if snapshotErr != nil && runtime != nil {
+			return nil, TestOverlayOutput{}, snapshotErr
+		}
+		return nil, TestOverlayOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Overlay: overlay, Snapshot: snapshot}, nil
 	})
-	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_clear_test_faults", Description: "Clear finite counted automation faults for one view.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input ClearTestFaultsInput) (*mcp.CallToolResult, TestOverlayOutput, error) {
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_clear_test_faults", Description: "Clear finite counted automation faults for one view.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input ClearTestFaultsInput) (*mcp.CallToolResult, TestOverlayOutput, error) {
 		if err := s.registry.ClearTestFaults(input.ProjectID, input.ViewID, input.Kind, input.Path, input.All); err != nil {
 			return nil, TestOverlayOutput{}, err
 		}
+		if backend, backendErr := s.registry.Backend(input.ProjectID, input.ViewID); backendErr == nil && backend.Mode() != session.HostModeHeadless {
+			if err := s.registry.HostCommand(ctx, input.ProjectID, input.ViewID, "clear_faults", nil); err != nil {
+				return nil, TestOverlayOutput{}, err
+			}
+		}
 		overlay, err := s.registry.OverlaySnapshot(input.ProjectID, input.ViewID)
 		if err != nil {
 			return nil, TestOverlayOutput{}, err
 		}
 		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
-		if err != nil {
-			return nil, TestOverlayOutput{}, err
-		}
 		s.notifyView(input.ProjectID, input.ViewID)
-		return nil, TestOverlayOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Overlay: overlay, Snapshot: runtime.AutomationSnapshot()}, nil
+		snapshot, snapshotErr := s.registry.AutomationSnapshot(input.ProjectID, input.ViewID)
+		if snapshotErr != nil && runtime != nil {
+			return nil, TestOverlayOutput{}, snapshotErr
+		}
+		return nil, TestOverlayOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Overlay: overlay, Snapshot: snapshot}, nil
 	})
 }
 
