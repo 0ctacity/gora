@@ -112,7 +112,9 @@ func layoutAppContent(gtx layout.Context, theme *material.Theme, runtime *Runtim
 			hint = key.HintNumeric
 		}
 		key.InputHintOp{Tag: &state.interactionInput, Hint: hint}.Add(gtx.Ops)
-		gtx.Execute(op.InvalidateCmd{At: frameTime(gtx.Now).Add(500 * time.Millisecond)})
+		if snapshot.Clock.Mode != "frozen" {
+			gtx.Execute(op.InvalidateCmd{At: frameTime(gtx.Now).Add(500 * time.Millisecond)})
+		}
 	}
 	previewGtx := gtx
 	previewGtx.Constraints = layout.Exact(pixelSize)

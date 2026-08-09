@@ -225,7 +225,9 @@ func layoutStudioCanvas(gtx layout.Context, theme *material.Theme, runtime *Runt
 			hint = key.HintNumeric
 		}
 		key.InputHintOp{Tag: &state.interactionInput, Hint: hint}.Add(gtx.Ops)
-		gtx.Execute(op.InvalidateCmd{At: frameTime(gtx.Now).Add(500 * time.Millisecond)})
+		if snapshot.Clock.Mode != "frozen" {
+			gtx.Execute(op.InvalidateCmd{At: frameTime(gtx.Now).Add(500 * time.Millisecond)})
+		}
 	}
 	position := canvasPosition(viewport, size, state.canvasPan)
 	offset := op.Offset(position).Push(gtx.Ops)
@@ -297,6 +299,10 @@ func liveRenderState(snapshot Snapshot, now, caretBlinkStart time.Time) render.S
 	state := renderState(snapshot)
 	now = frameTime(now)
 	if snapshot.Transient.Focused == "" {
+		return state
+	}
+	if snapshot.Clock.Mode == "frozen" {
+		state.CaretHidden = !snapshot.BlinkVisible
 		return state
 	}
 	if !caretBlinkStart.IsZero() {

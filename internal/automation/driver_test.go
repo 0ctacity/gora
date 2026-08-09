@@ -1,6 +1,7 @@
 package automation
 
 import (
+	"fmt"
 	"image"
 	"testing"
 
@@ -21,6 +22,84 @@ func TestDriverRejectsAnInvalidBatchBeforeDeliveringEarlierEvents(t *testing.T) 
 	}
 	if got := driver.Router().Transient().Focused; got != "" {
 		t.Fatalf("invalid batch delivered event 1, focus=%q", got)
+	}
+}
+
+func TestDriverDispatchesGraphemeEditCommandsAndRejectsEvolvingRangeBeforeDelivery(t *testing.T) {
+	runtime := &fakeRuntime{tree: runtimeTree(), editDraft: "abc", editFocus: "field"}
+	driver := NewDriver(runtime)
+	results, err := driver.Dispatch([]Event{
+		{Type: "edit", Kind: "replace", SemanticID: "field", Range: &GraphemeRange{Start: 1, End: 2}, Text: "x"},
+		{Type: "edit", Kind: "selection", SemanticID: "field", Range: &GraphemeRange{Start: 0, End: 2}},
+	})
+	if err != nil || len(results) != 2 {
+		t.Fatalf("edit dispatch results=%+v err=%v", results, err)
+	}
+	if len(runtime.editCalls) != 2 || runtime.editCalls[0].Text != "x" {
+		t.Fatalf("edit calls=%+v", runtime.editCalls)
+	}
+	runtime.editCalls = nil
+	_, err = driver.Dispatch([]Event{
+		{Type: "edit", Kind: "replace", SemanticID: "field", Range: &GraphemeRange{Start: 0, End: 1}, Text: "long"},
+		{Type: "edit", Kind: "replace", SemanticID: "field", Range: &GraphemeRange{Start: 99, End: 100}, Text: "!"},
+	})
+	if err == nil || len(runtime.editCalls) != 0 {
+		t.Fatalf("invalid evolving range delivered prefix: err=%v calls=%+v", err, runtime.editCalls)
+	}
+}
+
+func TestDriverEditPreflightLeavesPointerStateUntouchedOnInvalidBatch(t *testing.T) {
+	button := interactiveNode("button", "button", "button", image.Rect(0, 0, 80, 30), image.Rect(0, 0, 100, 100), 0, 2)
+	runtime := &fakeRuntime{tree: runtimeTree(button), editDraft: "abc", editFocus: "field"}
+	driver := NewDriver(runtime)
+	_, err := driver.Dispatch([]Event{
+		{Type: "pointer", Kind: "press", PointerID: 1, Source: "mouse", X: 10, Y: 10, Button: "primary", TimeMS: 1},
+		{Type: "edit", Kind: "replace", SemanticID: "field", Range: &GraphemeRange{Start: 99, End: 100}, Text: "!", TimeMS: 2},
+	})
+	if err == nil {
+		t.Fatal("invalid mixed batch accepted")
+	}
+	if capture := driver.Router().Snapshot().PointerCapture; capture != nil {
+		t.Fatalf("invalid batch changed pointer capture=%+v", capture)
+	}
+}
+
+func TestDriverRejectsOmittedEditTargetAfterFocusChangingBatchBeforeDelivery(t *testing.T) {
+	field := interactiveNode("field", "field", "textbox", image.Rect(0, 0, 80, 30), image.Rect(0, 0, 100, 100), 1, 2)
+	runtime := &fakeRuntime{tree: runtimeTree(field), editDraft: "abc", editFocus: "field"}
+	driver := NewDriver(runtime)
+	_, err := driver.Dispatch([]Event{
+		{Type: "pointer", Kind: "press", PointerID: 1, Source: "mouse", X: 10, Y: 10, Button: "primary", TimeMS: 1},
+		{Type: "pointer", Kind: "release", PointerID: 1, Source: "mouse", X: 10, Y: 10, Button: "primary", TimeMS: 2},
+		{Type: "edit", Kind: "replace", Range: &GraphemeRange{Start: 99, End: 100}, Text: "!", TimeMS: 3},
+	})
+	if err == nil {
+		t.Fatal("omitted target after focus-changing events accepted")
+	}
+	snapshot := driver.Router().Snapshot()
+	if snapshot.FocusedID != "" || snapshot.PointerCapture != nil {
+		t.Fatalf("invalid batch changed router state=%+v", snapshot)
+	}
+	if len(runtime.editCalls) != 0 {
+		t.Fatalf("invalid batch delivered edit=%+v", runtime.editCalls)
+	}
+}
+
+func TestDriverEditEmitsEditingTraceStage(t *testing.T) {
+	runtime := &fakeRuntime{tree: runtimeTree(), editDraft: "abc", editFocus: "field"}
+	driver := NewDriver(runtime)
+	if _, err := driver.Dispatch([]Event{{Type: "edit", Kind: "replace", SemanticID: "field", Range: &GraphemeRange{Start: 0, End: 1}, Text: "x"}}); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, trace := range runtime.traces {
+		if trace.Stage == "editing" && trace.Outcome == string(interaction.EditReplace) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("editing trace missing: %+v", runtime.traces)
 	}
 }
 
@@ -529,6 +608,9 @@ type fakeRuntime struct {
 	scrollScale  float64
 	scrollInputs []scrollinput.Event
 	traces       []TraceEntry
+	editDraft    string
+	editFocus    string
+	editCalls    []interaction.EditCommand
 }
 
 func (f *fakeRuntime) RouteScroll(event scrollinput.Event) (scrollinput.Outcome, error) {
@@ -593,6 +675,26 @@ func (f *fakeRuntime) PublishRouterSnapshot(value interaction.RouterSnapshot) {
 }
 func (f *fakeRuntime) AutomationSnapshot() RevisionSnapshot    { return RevisionSnapshot{} }
 func (f *fakeRuntime) CurrentTransient() interaction.Transient { return f.transient }
+func (f *fakeRuntime) ValidateEditBatch(commands []interaction.EditCommand) error {
+	draft := f.editDraft
+	for _, command := range commands {
+		if command.FieldID != f.editFocus {
+			return fmt.Errorf("field is not focused")
+		}
+		if command.Kind == interaction.EditReplace {
+			if command.Start < 0 || command.End < command.Start || command.End > len([]rune(draft)) {
+				return fmt.Errorf("range out of bounds")
+			}
+			runes := []rune(draft)
+			draft = string(append(append(append([]rune(nil), runes[:command.Start]...), []rune(command.Text)...), runes[command.End:]...))
+		}
+	}
+	return nil
+}
+func (f *fakeRuntime) ApplyEditCommand(command interaction.EditCommand) error {
+	f.editCalls = append(f.editCalls, command)
+	return nil
+}
 
 var _ = image.Point{}
 

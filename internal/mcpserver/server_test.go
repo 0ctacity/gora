@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -976,6 +977,83 @@ func TestMCPAutomationTraceConfigureDispatchReadAndClear(t *testing.T) {
 	}
 	if got := stringField(cleared.StructuredContent, "view_id"); got != viewID {
 		t.Fatalf("clear output=%+v", cleared.StructuredContent)
+	}
+}
+
+func TestMCPAutomationClipboardAndClockToolsInMemory(t *testing.T) {
+	root := t.TempDir()
+	entry := filepath.Join(root, "app.gora")
+	if err := os.WriteFile(entry, []byte("gora: 1\nkind: app\nviewport: { width: 100, height: 80 }\nentry: main\nscreens:\n  main: { type: spacer }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service := NewServiceWithOptions(NewRegistry(), ServiceOptions{Automation: true})
+	defer service.Close()
+	ctx := context.Background()
+	clientTransport, serverTransport := mcp.NewInMemoryTransports()
+	if _, err := service.server.Connect(ctx, serverTransport, nil); err != nil {
+		t.Fatal(err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "phase4-test", Version: "1"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	opened, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_open_project", Arguments: map[string]any{"root": root}})
+	if err != nil || opened.IsError {
+		t.Fatalf("open project: %v %+v", err, opened)
+	}
+	projectID := stringField(opened.StructuredContent, "project_id")
+	view, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_open_view", Arguments: map[string]any{"project_id": projectID, "file": "app.gora"}})
+	if err != nil || view.IsError {
+		t.Fatalf("open view: %v %+v", err, view)
+	}
+	viewID := stringField(view.StructuredContent, "view_id")
+	if _, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_configure_event_trace", Arguments: map[string]any{"project_id": projectID, "view_id": viewID, "enabled": true, "capacity": 32}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_set_automation_clipboard", Arguments: map[string]any{"project_id": projectID, "view_id": viewID, "text": "secret"}}); err != nil {
+		t.Fatal(err)
+	}
+	read, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_read_automation_clipboard", Arguments: map[string]any{"project_id": projectID, "view_id": viewID}})
+	if err != nil || read.IsError || stringField(read.StructuredContent, "text") != "secret" {
+		t.Fatalf("read clipboard: %v %+v", err, read)
+	}
+	setClock, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_set_view_clock", Arguments: map[string]any{"project_id": projectID, "view_id": viewID, "mode": "frozen"}})
+	if err != nil || setClock.IsError {
+		t.Fatalf("freeze clock: %v %+v", err, setClock)
+	}
+	advanced, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "gora_advance_view_clock", Arguments: map[string]any{"project_id": projectID, "view_id": viewID, "delta_ms": 500}})
+	if err != nil || advanced.IsError {
+		t.Fatalf("advance clock: %v %+v", err, advanced)
+	}
+	if advanced.StructuredContent == nil {
+		t.Fatalf("clock output=%#v", advanced.StructuredContent)
+	}
+	automationURI := "gora://project/" + projectID + "/views/" + viewID + "/automation"
+	resource, err := session.ReadResource(ctx, &mcp.ReadResourceParams{URI: automationURI})
+	if err != nil || len(resource.Contents) != 1 {
+		t.Fatalf("automation resource: %v %+v", err, resource)
+	}
+	if strings.Contains(resource.Contents[0].Text, "secret") {
+		t.Fatal("automation resource leaked clipboard contents")
+	}
+	var snapshot struct {
+		ClockMode       string `json:"clock_mode"`
+		ClockTimeMS     int64  `json:"clock_time_ms"`
+		ClipboardLength int    `json:"clipboard_length"`
+		BlinkVisible    bool   `json:"blink_visible"`
+		EditingHistory  any    `json:"editing_history"`
+	}
+	if err := json.Unmarshal([]byte(resource.Contents[0].Text), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.ClockMode != "frozen" || snapshot.ClockTimeMS == 0 || snapshot.ClipboardLength != len("secret") || snapshot.EditingHistory == nil {
+		t.Fatalf("automation snapshot=%+v", snapshot)
+	}
+	traceResource, err := session.ReadResource(ctx, &mcp.ReadResourceParams{URI: automationURI + "/trace"})
+	if err != nil || len(traceResource.Contents) != 1 || !strings.Contains(traceResource.Contents[0].Text, `"stage":"clock"`) {
+		t.Fatalf("clock trace resource: %v %+v", err, traceResource)
 	}
 }
 

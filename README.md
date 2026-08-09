@@ -84,6 +84,10 @@ wheel/trackpad event batches, `gora_wait_for_view` for publication/idle
 barriers, and the opt-in bounded event trace tools/resources. This does not
 inject events into a visible native window.
 
+Automation batches also support focused grapheme-indexed editing, composition,
+view-local clipboard copy/cut/paste, undo/redo, and deterministic frozen view
+clocks (`gora_set_view_clock`, `gora_advance_view_clock`).
+
 To exercise percentage sizing, aspect ratios, intrinsic containers, and
 wrapping stacks, open the web-layout conformance example from the repository
 root:

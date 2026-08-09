@@ -995,6 +995,200 @@ screens:
 	}
 }
 
+func TestRuntimeAutomationEditCommandsRequireFocusAndIsolateClipboard(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "automation-edit.gora")
+	source := []byte(`
+gora: 1
+kind: app
+viewport: { width: 240, height: 100 }
+state:
+  name: { type: text, default: Ada }
+entry: main
+screens:
+  main:
+    type: text_field
+    name: name-field
+    props: { label: Name, bind: name, required: true }
+    children: [{ type: field_box }]
+`)
+	if err := os.WriteFile(path, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := runtime.RuntimeTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	field := namedSemanticNode(tree, "name-field")
+	if err := runtime.ApplyEditCommand(interaction.EditCommand{Kind: interaction.EditReplace, FieldID: field.ID, Start: 0, End: 3, Text: "Grace"}); err == nil {
+		t.Fatal("unfocused edit was accepted")
+	}
+	runtime.SetTransient(interaction.Transient{Focused: field.Handle})
+	if err := runtime.ValidateEditBatch([]interaction.EditCommand{{Kind: interaction.EditReplace, FieldID: field.ID, Start: 0, End: 3, Text: "Grace"}, {Kind: interaction.EditReplace, FieldID: field.ID, Start: 99, End: 100, Text: "!"}}); err == nil {
+		t.Fatal("evolving invalid range was accepted")
+	}
+	if err := runtime.ApplyEditCommand(interaction.EditCommand{Kind: interaction.EditReplace, Start: 0, End: 3, Text: "Grace"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.ApplyEditCommand(interaction.EditCommand{Kind: interaction.EditSelection, FieldID: field.ID, Start: 0, End: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.ApplyEditCommand(interaction.EditCommand{Kind: interaction.EditClipboardCopy, FieldID: field.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.AutomationClipboard() != "Grace" {
+		t.Fatalf("clipboard=%q", runtime.AutomationClipboard())
+	}
+	if err := runtime.ApplyEditCommand(interaction.EditCommand{Kind: interaction.EditClipboardPaste, FieldID: field.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if draft, _ := runtime.FieldDraft(field.ID); draft != "Grace" {
+		t.Fatalf("pasted draft=%q", draft)
+	}
+}
+
+func TestRuntimeFrozenAutomationClockAdvancesBlinkWithoutGeometryRebuild(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "clock.gora")
+	if err := os.WriteFile(path, []byte("gora: 1\nkind: app\nviewport: { width: 100, height: 60 }\nentry: main\nscreens:\n  main: { type: spacer }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := runtime.AutomationSnapshot()
+	if initial.Clock.Mode != "real" || initial.Clock.NextTimerMS == nil {
+		t.Fatalf("initial clock=%+v", initial.Clock)
+	}
+	if _, err := runtime.SetViewClock("frozen"); err != nil {
+		t.Fatal(err)
+	}
+	frozen := runtime.AutomationSnapshot()
+	if frozen.Clock.Mode != "frozen" || frozen.Clock.TimeMS < initial.Clock.TimeMS {
+		t.Fatalf("frozen clock=%+v initial=%+v", frozen.Clock, initial.Clock)
+	}
+	geometry := frozen.GeometryRevision
+	if _, err := runtime.AdvanceViewClock(500, false); err != nil {
+		t.Fatal(err)
+	}
+	advanced := runtime.AutomationSnapshot()
+	if advanced.Clock.TimeMS != frozen.Clock.TimeMS+500 || advanced.BlinkVisible == frozen.BlinkVisible {
+		t.Fatalf("advanced clock=%+v frozen=%+v", advanced.Clock, frozen.Clock)
+	}
+	if advanced.GeometryRevision != geometry {
+		t.Fatalf("clock advance rebuilt geometry: %d -> %d", geometry, advanced.GeometryRevision)
+	}
+	if _, err := runtime.AdvanceViewClock(0, false); err == nil {
+		t.Fatal("zero clock advance accepted")
+	}
+}
+
+func TestNativeEditingWrappersShareRendererNeutralCommandPath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "parity.gora")
+	source := []byte("gora: 1\nkind: app\nviewport: { width: 240, height: 100 }\nstate:\n  name: { type: text, default: Ada }\nentry: main\nscreens:\n  main:\n    type: text_field\n    name: name-field\n    props: { label: Name, bind: name }\n    children: [{ type: field_box }]\n")
+	if err := os.WriteFile(path, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	native, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	direct, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nativeTree, _ := native.RuntimeTree()
+	directTree, _ := direct.RuntimeTree()
+	nativeField := namedSemanticNode(nativeTree, "name-field")
+	directField := namedSemanticNode(directTree, "name-field")
+	native.SetTransient(interaction.Transient{Focused: nativeField.Handle})
+	direct.SetTransient(interaction.Transient{Focused: directField.Handle})
+	if err := native.SetFieldSelection(nativeField.ID, 0, 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := native.ApplyFieldEdit(nativeField.ID, 0, 3, "Grace"); err != nil {
+		t.Fatal(err)
+	}
+	if err := native.SetFieldComposition(nativeField.ID, 1, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := native.ApplyFieldEdit(nativeField.ID, 1, 2, "x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := native.SetFieldComposition(nativeField.ID, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !native.UndoField(nativeField.ID) || !native.RedoField(nativeField.ID) {
+		t.Fatal("native undo/redo sequence failed")
+	}
+	commands := []interaction.EditCommand{
+		{Kind: interaction.EditSelection, FieldID: directField.ID, Start: 0, End: 3},
+		{Kind: interaction.EditReplace, FieldID: directField.ID, Start: 0, End: 3, Text: "Grace"},
+		{Kind: interaction.EditCompositionStart, FieldID: directField.ID, Start: 1, End: 2},
+		{Kind: interaction.EditReplace, FieldID: directField.ID, Start: 1, End: 2, Text: "x"},
+		{Kind: interaction.EditCompositionCommit, FieldID: directField.ID},
+		{Kind: interaction.EditUndo, FieldID: directField.ID},
+		{Kind: interaction.EditRedo, FieldID: directField.ID},
+	}
+	for _, command := range commands {
+		if err := direct.ApplyEditCommand(command); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nativeSnapshot := native.editing.Snapshot()
+	directSnapshot := direct.editing.Snapshot()
+	if !reflect.DeepEqual(nativeSnapshot, directSnapshot) {
+		t.Fatalf("native/direct editing snapshots differ:\nnative=%+v\ndirect=%+v", nativeSnapshot, directSnapshot)
+	}
+	if native.Snapshot().RuntimeRevision != direct.Snapshot().RuntimeRevision {
+		t.Fatalf("native/direct revisions differ: %d vs %d", native.Snapshot().RuntimeRevision, direct.Snapshot().RuntimeRevision)
+	}
+}
+
+func TestNativeEqualRangeCompositionOnIdleFieldIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "idle-composition.gora")
+	source := []byte("gora: 1\nkind: app\nviewport: { width: 240, height: 100 }\nstate:\n  name: { type: text, default: Ada }\nentry: main\nscreens:\n  main:\n    type: text_field\n    name: name-field\n    props: { label: Name, bind: name }\n    children: [{ type: field_box }]\n")
+	if err := os.WriteFile(path, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntime(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, _ := runtime.RuntimeTree()
+	field := namedSemanticNode(tree, "name-field")
+	runtime.SetTransient(interaction.Transient{Focused: field.Handle})
+	if err := runtime.SetFieldComposition(field.ID, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	state, ok := runtime.editing.State(field.ID)
+	if !ok {
+		t.Fatal("missing field state")
+	}
+	if state.Composing {
+		t.Fatal("native equal-range composition started an IME transaction")
+	}
+	if err := runtime.ApplyFieldEdit(field.ID, 3, 3, "!"); err != nil {
+		t.Fatal(err)
+	}
+	if draft, _ := runtime.FieldDraft(field.ID); draft != "Ada!" {
+		t.Fatalf("draft after ordinary edit = %q", draft)
+	}
+	if !runtime.UndoField(field.ID) {
+		t.Fatal("ordinary edit did not create a normal undo unit")
+	}
+	if draft, _ := runtime.FieldDraft(field.ID); draft != "Ada" {
+		t.Fatalf("draft after undo = %q", draft)
+	}
+}
+
 func TestValidDraftSynchronizesRepeatedBindingsWithoutReplacingItsOwnEdit(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "repeated-binding.gora")

@@ -483,3 +483,114 @@ func TestEditingStoreExternalWritesAndCommitsClearCompleteCompositionState(t *te
 }
 
 func intPointer(value int) *int { return &value }
+
+func TestEditingStoreApplyEditCommandUsesGraphemeRangesAndComposition(t *testing.T) {
+	store := NewEditingStore()
+	store.Reconcile([]FieldSpec{{ID: "field", Type: "text", Value: "a👩‍👩‍👧‍👦c"}})
+	if err := store.ApplyEditCommand(EditCommand{Kind: EditReplace, FieldID: "field", Start: 1, End: 2, Text: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	if draft, _ := store.Draft("field"); draft != "axc" {
+		t.Fatalf("draft=%q", draft)
+	}
+	if err := store.ApplyEditCommand(EditCommand{Kind: EditSelection, FieldID: "field", Start: 0, End: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if start, end, _ := store.GraphemeSelection("field"); start != 0 || end != 2 {
+		t.Fatalf("selection=(%d,%d)", start, end)
+	}
+	if err := store.ApplyEditCommand(EditCommand{Kind: EditCompositionStart, FieldID: "field", Start: 0, End: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if state, _ := store.State("field"); !state.Composing {
+		t.Fatal("composition did not start")
+	}
+}
+
+func TestEditingStoreHistoryRemainsBoundedAcrossThousandCommands(t *testing.T) {
+	store := NewEditingStore()
+	store.Reconcile([]FieldSpec{{ID: "field", Type: "text", Value: ""}})
+	for i := 0; i < 1000; i++ {
+		state, _ := store.State("field")
+		at := graphemeCount(state.Draft)
+		if err := store.ApplyEditCommand(EditCommand{Kind: EditReplace, FieldID: "field", Start: at, End: at, Text: "x"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	undo, redo, ok := store.HistoryDepth("field")
+	if !ok || undo > maxFieldUndo || redo != 0 {
+		t.Fatalf("history depth=(%d,%d), want undo<=%d redo=0", undo, redo, maxFieldUndo)
+	}
+}
+
+func TestEditingStorePreflightSimulatesClipboardHistoryAndComposition(t *testing.T) {
+	store := NewEditingStore()
+	store.Reconcile([]FieldSpec{{ID: "field", Type: "text", Value: "abc"}})
+	cases := []struct {
+		name      string
+		clipboard string
+		commands  []EditCommand
+	}{
+		{name: "cut", commands: []EditCommand{{Kind: EditSelection, FieldID: "field", Start: 0, End: 1}, {Kind: EditClipboardCut, FieldID: "field"}, {Kind: EditReplace, FieldID: "field", Start: 99, End: 100, Text: "!"}}},
+		{name: "paste", clipboard: "z", commands: []EditCommand{{Kind: EditSelection, FieldID: "field", Start: 0, End: 1}, {Kind: EditClipboardPaste, FieldID: "field"}, {Kind: EditReplace, FieldID: "field", Start: 99, End: 100, Text: "!"}}},
+		{name: "undo", commands: []EditCommand{{Kind: EditReplace, FieldID: "field", Start: 0, End: 1, Text: "x"}, {Kind: EditUndo, FieldID: "field"}, {Kind: EditReplace, FieldID: "field", Start: 99, End: 100, Text: "!"}}},
+		{name: "redo", commands: []EditCommand{{Kind: EditReplace, FieldID: "field", Start: 0, End: 1, Text: "x"}, {Kind: EditUndo, FieldID: "field"}, {Kind: EditRedo, FieldID: "field"}, {Kind: EditReplace, FieldID: "field", Start: 99, End: 100, Text: "!"}}},
+		{name: "composition", commands: []EditCommand{{Kind: EditCompositionStart, FieldID: "field", Start: 1, End: 1}, {Kind: EditCompositionUpdate, FieldID: "field", Start: 1, End: 1, Text: "x"}, {Kind: EditCompositionCancel, FieldID: "field"}, {Kind: EditReplace, FieldID: "field", Start: 99, End: 100, Text: "!"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before, _ := store.Draft("field")
+			if err := store.ValidateEditCommandsWithClipboard(tc.commands, tc.clipboard); err == nil {
+				t.Fatal("invalid evolving batch accepted")
+			}
+			after, _ := store.Draft("field")
+			if after != before {
+				t.Fatalf("preflight mutated draft=%q before=%q", after, before)
+			}
+		})
+	}
+}
+
+func TestEditingStoreZeroLengthCompositionGroupsUpdatesAndCancels(t *testing.T) {
+	store := NewEditingStore()
+	store.Reconcile([]FieldSpec{{ID: "field", Type: "text", Value: "abc"}})
+	if err := store.ApplyEditCommand(EditCommand{Kind: EditCompositionStart, FieldID: "field", Start: 1, End: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if state, _ := store.State("field"); !state.Composing {
+		t.Fatal("zero-length composition did not start")
+	}
+	if err := store.ApplyEditCommand(EditCommand{Kind: EditCompositionUpdate, FieldID: "field", Start: 1, End: 1, Text: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApplyEditCommand(EditCommand{Kind: EditCompositionCancel, FieldID: "field"}); err != nil {
+		t.Fatal(err)
+	}
+	if draft, _ := store.Draft("field"); draft != "abc" {
+		t.Fatalf("cancel draft=%q", draft)
+	}
+	if store.Undo("field") {
+		t.Fatal("cancelled composition created undo unit")
+	}
+	if err := store.ApplyEditCommand(EditCommand{Kind: EditCompositionStart, FieldID: "field", Start: 1, End: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApplyEditCommand(EditCommand{Kind: EditCompositionUpdate, FieldID: "field", Start: 1, End: 1, Text: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApplyEditCommand(EditCommand{Kind: EditCompositionCommit, FieldID: "field"}); err != nil {
+		t.Fatal(err)
+	}
+	if draft, _ := store.Draft("field"); draft != "axbc" {
+		t.Fatalf("commit draft=%q", draft)
+	}
+	if !store.Undo("field") {
+		t.Fatal("committed composition did not create one undo unit")
+	}
+	if draft, _ := store.Draft("field"); draft != "abc" {
+		t.Fatalf("composition undo draft=%q", draft)
+	}
+	if store.Undo("field") {
+		t.Fatal("composition created more than one undo unit")
+	}
+}

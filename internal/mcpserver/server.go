@@ -207,6 +207,43 @@ type EventTraceOutput struct {
 	Trace     automation.TraceSnapshot `json:"trace"`
 }
 
+type SetAutomationClipboardInput struct {
+	ProjectID string `json:"project_id"`
+	ViewID    string `json:"view_id"`
+	Text      string `json:"text"`
+}
+
+type ReadAutomationClipboardInput struct {
+	ProjectID string `json:"project_id"`
+	ViewID    string `json:"view_id"`
+}
+
+type AutomationClipboardOutput struct {
+	ProjectID string `json:"project_id"`
+	ViewID    string `json:"view_id"`
+	Text      string `json:"text,omitempty"`
+}
+
+type SetViewClockInput struct {
+	ProjectID string `json:"project_id"`
+	ViewID    string `json:"view_id"`
+	Mode      string `json:"mode" jsonschema:"real or frozen"`
+}
+
+type AdvanceViewClockInput struct {
+	ProjectID    string `json:"project_id"`
+	ViewID       string `json:"view_id"`
+	DeltaMS      int64  `json:"delta_ms"`
+	RunUntilIdle bool   `json:"run_until_idle,omitempty"`
+}
+
+type ViewClockOutput struct {
+	ProjectID string                    `json:"project_id"`
+	ViewID    string                    `json:"view_id"`
+	Clock     studio.ViewClockSnapshot  `json:"clock"`
+	Snapshot  studio.AutomationSnapshot `json:"snapshot"`
+}
+
 type ApplyChangesInput struct {
 	ProjectID string           `json:"project_id"`
 	Changes   []DocumentChange `json:"changes"`
@@ -581,7 +618,7 @@ func (s *Service) registerAutomationTools() {
 		return nil, output, waitErr
 	})
 	mutation := &mcp.ToolAnnotations{ReadOnlyHint: false, IdempotentHint: false, OpenWorldHint: boolPointer(false), DestructiveHint: boolPointer(false)}
-	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_dispatch_input", Description: "Dispatch an ordered, renderer-neutral pointer or keyboard batch to one MCP view.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input DispatchInput) (*mcp.CallToolResult, DispatchOutput, error) {
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_dispatch_input", Description: "Dispatch an ordered, renderer-neutral pointer, keyboard, scroll, or editing batch to one MCP view.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input DispatchInput) (*mcp.CallToolResult, DispatchOutput, error) {
 		if input.Wait == "" {
 			input.Wait = "published"
 		}
@@ -657,6 +694,74 @@ func (s *Service) registerAutomationTools() {
 		if !output.Trace.Enabled {
 			s.notifyTrace(input.ProjectID, input.ViewID)
 		}
+		return nil, output, nil
+	})
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_set_automation_clipboard", Description: "Set the isolated clipboard for one automation view.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input SetAutomationClipboardInput) (*mcp.CallToolResult, AutomationClipboardOutput, error) {
+		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
+		if err != nil {
+			return nil, AutomationClipboardOutput{}, err
+		}
+		runtime.SetAutomationClipboard(input.Text)
+		output := AutomationClipboardOutput{ProjectID: input.ProjectID, ViewID: input.ViewID}
+		s.notifyView(input.ProjectID, input.ViewID)
+		return nil, output, nil
+	})
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_read_automation_clipboard", Description: "Read the isolated clipboard for one automation view.", Annotations: readOnly}, func(_ context.Context, _ *mcp.CallToolRequest, input ReadAutomationClipboardInput) (*mcp.CallToolResult, AutomationClipboardOutput, error) {
+		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
+		if err != nil {
+			return nil, AutomationClipboardOutput{}, err
+		}
+		return nil, AutomationClipboardOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Text: runtime.AutomationClipboard()}, nil
+	})
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_set_view_clock", Description: "Set one automation view's interaction clock to real or frozen mode.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input SetViewClockInput) (*mcp.CallToolResult, ViewClockOutput, error) {
+		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
+		if err != nil {
+			return nil, ViewClockOutput{}, err
+		}
+		before := runtime.AutomationSnapshot()
+		beforeTrace := runtime.EventTrace().Revision
+		clock, err := runtime.SetViewClock(input.Mode)
+		if err != nil {
+			return nil, ViewClockOutput{}, err
+		}
+		output := ViewClockOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Clock: clock, Snapshot: runtime.AutomationSnapshot()}
+		after := output.Snapshot
+		runtime.RecordEventTrace(automation.TraceEntry{Stage: "clock", Type: "clock", Outcome: input.Mode, RuntimeBefore: before.RuntimeRevision, RuntimeAfter: after.RuntimeRevision, GeometryBefore: before.GeometryRevision, GeometryAfter: after.GeometryRevision, FrameBefore: before.FrameRevision, FrameAfter: after.FrameRevision, TraceBefore: beforeTrace, TraceAfter: beforeTrace + 1})
+		s.notifyView(input.ProjectID, input.ViewID)
+		return nil, output, nil
+	})
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_advance_view_clock", Description: "Advance a frozen automation view clock by a positive duration.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input AdvanceViewClockInput) (*mcp.CallToolResult, ViewClockOutput, error) {
+		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
+		if err != nil {
+			return nil, ViewClockOutput{}, err
+		}
+		before := runtime.AutomationSnapshot()
+		beforeTrace := runtime.EventTrace().Revision
+		clock, err := runtime.AdvanceViewClock(input.DeltaMS, input.RunUntilIdle)
+		if err != nil {
+			return nil, ViewClockOutput{}, err
+		}
+		output := ViewClockOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Clock: clock, Snapshot: runtime.AutomationSnapshot()}
+		after := output.Snapshot
+		runtime.RecordEventTrace(automation.TraceEntry{Stage: "clock", Type: "clock", Outcome: fmt.Sprintf("advance:%d", input.DeltaMS), RuntimeBefore: before.RuntimeRevision, RuntimeAfter: after.RuntimeRevision, GeometryBefore: before.GeometryRevision, GeometryAfter: after.GeometryRevision, FrameBefore: before.FrameRevision, FrameAfter: after.FrameRevision, TraceBefore: beforeTrace, TraceAfter: beforeTrace + 1})
+		s.notifyView(input.ProjectID, input.ViewID)
+		return nil, output, nil
+	})
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_run_until_idle", Description: "Drain due timers for a frozen automation view.", Annotations: mutation}, func(_ context.Context, _ *mcp.CallToolRequest, input ReadAutomationClipboardInput) (*mcp.CallToolResult, ViewClockOutput, error) {
+		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
+		if err != nil {
+			return nil, ViewClockOutput{}, err
+		}
+		before := runtime.AutomationSnapshot()
+		beforeTrace := runtime.EventTrace().Revision
+		clock, err := runtime.RunUntilIdle()
+		if err != nil {
+			return nil, ViewClockOutput{}, err
+		}
+		output := ViewClockOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Clock: clock, Snapshot: runtime.AutomationSnapshot()}
+		after := output.Snapshot
+		runtime.RecordEventTrace(automation.TraceEntry{Stage: "clock", Type: "clock", Outcome: "run_until_idle", RuntimeBefore: before.RuntimeRevision, RuntimeAfter: after.RuntimeRevision, GeometryBefore: before.GeometryRevision, GeometryAfter: after.GeometryRevision, FrameBefore: before.FrameRevision, FrameAfter: after.FrameRevision, TraceBefore: beforeTrace, TraceAfter: beforeTrace + 1})
+		s.notifyView(input.ProjectID, input.ViewID)
 		return nil, output, nil
 	})
 }

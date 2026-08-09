@@ -117,6 +117,23 @@ the deepest topmost clipped scroll candidate; each axis reports ordered
 consumers, consumed amount, residual, containment, and final offsets. Command-
 modified scroll is reported unconsumed for ordinary headless views.
 
+Editing events use `type:"edit"` with `kind` `replace`, `selection`,
+`composition_start`/`update`/`commit`/`cancel`, `clipboard_copy`/`cut`/`paste`,
+`undo`, or `redo`. Replace, selection, and composition start/update ranges are
+grapheme indexes into the draft immediately before that event; the complete
+batch is validated before delivery and an omitted `semantic_id` targets the
+already-focused visible enabled field. If an earlier event in the same batch
+may change focus, the edit must provide `semantic_id` so the complete batch can
+be rejected atomically before delivery. Clipboard contents are isolated per view. The
+automation-only `gora_set_automation_clipboard` and
+`gora_read_automation_clipboard` tools never access the OS clipboard.
+
+`gora_set_view_clock` selects `real` or `frozen` interaction time;
+`gora_advance_view_clock` accepts only positive deltas while frozen and can
+`run_until_idle`. Snapshots expose clock mode/time, next timer, clipboard
+length, caret blink, and bounded editing history. Frozen time controls caret
+blink and interaction timers without rebuilding persistent geometry.
+
 Each app/component view owns one bounded automation router. It uses the same
 canonical clipped hit testing, pointer capture, focus traversal, control
 activation, scroll metrics, and state/value reducers as the runtime. A valid

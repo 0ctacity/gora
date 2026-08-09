@@ -36,6 +36,19 @@ type ScrollRuntime interface {
 	RouteScroll(scrollinput.Event) (scrollinput.Outcome, error)
 }
 
+// EditRuntime applies renderer-neutral editing commands to the focused field.
+// It is optional so pointer/keyboard-only fakes and hosts remain compatible.
+type EditRuntime interface {
+	ApplyEditCommand(interaction.EditCommand) error
+}
+
+// EditBatchValidator validates all edit ranges against an evolving draft
+// before any command is delivered. Implementations must leave state unchanged
+// when validation fails.
+type EditBatchValidator interface {
+	ValidateEditBatch([]interaction.EditCommand) error
+}
+
 type TraceRuntime interface {
 	RecordEventTrace(TraceEntry)
 }
@@ -61,22 +74,32 @@ type SnapshotFunc func() RevisionSnapshot
 // Event is the flat JSON union accepted by gora_dispatch_input. Fields that do
 // not apply to the selected type/kind are ignored only after validation.
 type Event struct {
-	Type      string   `json:"type"`
-	Kind      string   `json:"kind,omitempty"`
-	PointerID int      `json:"pointer_id,omitempty"`
-	Source    string   `json:"source,omitempty"`
-	X         float64  `json:"x,omitempty"`
-	Y         float64  `json:"y,omitempty"`
-	Button    string   `json:"button,omitempty"`
-	Modifiers []string `json:"modifiers,omitempty"`
-	TimeMS    float64  `json:"time_ms,omitempty"`
-	Name      string   `json:"name,omitempty"`
-	Repeat    bool     `json:"repeat,omitempty"`
-	DeltaX    float64  `json:"delta_x,omitempty"`
-	DeltaY    float64  `json:"delta_y,omitempty"`
-	Units     string   `json:"units,omitempty"`
-	Phase     string   `json:"phase,omitempty"`
-	Momentum  string   `json:"momentum,omitempty"`
+	Type       string         `json:"type"`
+	Kind       string         `json:"kind,omitempty"`
+	PointerID  int            `json:"pointer_id,omitempty"`
+	Source     string         `json:"source,omitempty"`
+	X          float64        `json:"x,omitempty"`
+	Y          float64        `json:"y,omitempty"`
+	Button     string         `json:"button,omitempty"`
+	Modifiers  []string       `json:"modifiers,omitempty"`
+	TimeMS     float64        `json:"time_ms,omitempty"`
+	Name       string         `json:"name,omitempty"`
+	Repeat     bool           `json:"repeat,omitempty"`
+	DeltaX     float64        `json:"delta_x,omitempty"`
+	DeltaY     float64        `json:"delta_y,omitempty"`
+	Units      string         `json:"units,omitempty"`
+	Phase      string         `json:"phase,omitempty"`
+	Momentum   string         `json:"momentum,omitempty"`
+	Text       string         `json:"text,omitempty"`
+	SemanticID string         `json:"semantic_id,omitempty"`
+	Range      *GraphemeRange `json:"range,omitempty"`
+	RangeStart *int           `json:"range_start,omitempty"`
+	RangeEnd   *int           `json:"range_end,omitempty"`
+}
+
+type GraphemeRange struct {
+	Start int `json:"start"`
+	End   int `json:"end"`
 }
 
 // Result is one deterministic per-event outcome. Revision fields are filled
@@ -222,6 +245,18 @@ func (d *Driver) Dispatch(events []Event) ([]Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	editCommands, err := collectEditCommands(events)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateEditTargets(events); err != nil {
+		return nil, err
+	}
+	if validator, ok := d.runtime.(EditBatchValidator); ok && len(editCommands) != 0 {
+		if err := validator.ValidateEditBatch(editCommands); err != nil {
+			return nil, err
+		}
+	}
 	if d.tree == nil && d.runtime != nil {
 		tree, err := d.runtime.CurrentRuntimeTree()
 		if err != nil {
@@ -240,6 +275,73 @@ func (d *Driver) Dispatch(events []Event) ([]Result, error) {
 	}
 	d.scrollPhase, d.scrollMomentum = phase, momentum
 	return results, nil
+}
+
+func validateEditTargets(events []Event) error {
+	focusMayChange := false
+	for index, event := range events {
+		if event.Type == "pointer" && (event.Kind == "press" || event.Kind == "release" || event.Kind == "cancel") {
+			focusMayChange = true
+		}
+		if event.Type == "key" && event.Kind == "down" && event.Name == "Tab" {
+			focusMayChange = true
+		}
+		if (event.Type == "edit" || event.Type == "editing") && event.SemanticID == "" && focusMayChange {
+			return fmt.Errorf("event %d: semantic_id is required when an earlier batch event may change focus", index)
+		}
+	}
+	return nil
+}
+
+func collectEditCommands(events []Event) ([]interaction.EditCommand, error) {
+	commands := make([]interaction.EditCommand, 0)
+	for index, event := range events {
+		if event.Type != "edit" && event.Type != "editing" {
+			continue
+		}
+		command, err := editCommand(event)
+		if err != nil {
+			return nil, fmt.Errorf("event %d: %w", index, err)
+		}
+		commands = append(commands, command)
+	}
+	return commands, nil
+}
+
+func editCommand(event Event) (interaction.EditCommand, error) {
+	kind := strings.ToLower(strings.TrimSpace(event.Kind))
+	kind = strings.ReplaceAll(kind, "-", "_")
+	switch kind {
+	case "copy":
+		kind = string(interaction.EditClipboardCopy)
+	case "cut":
+		kind = string(interaction.EditClipboardCut)
+	case "paste":
+		kind = string(interaction.EditClipboardPaste)
+	case "compose_start":
+		kind = string(interaction.EditCompositionStart)
+	case "compose_update":
+		kind = string(interaction.EditCompositionUpdate)
+	case "compose_commit":
+		kind = string(interaction.EditCompositionCommit)
+	case "compose_cancel":
+		kind = string(interaction.EditCompositionCancel)
+	}
+	command := interaction.EditCommand{Kind: interaction.EditCommandKind(kind), FieldID: event.SemanticID, Text: event.Text}
+	switch command.Kind {
+	case interaction.EditReplace, interaction.EditSelection, interaction.EditCompositionStart, interaction.EditCompositionUpdate:
+		if event.Range == nil && event.RangeStart != nil && event.RangeEnd != nil {
+			event.Range = &GraphemeRange{Start: *event.RangeStart, End: *event.RangeEnd}
+		}
+		if event.Range == nil {
+			return interaction.EditCommand{}, fmt.Errorf("edit %q requires range", command.Kind)
+		}
+		command.Start, command.End = event.Range.Start, event.Range.End
+	case interaction.EditCompositionCommit, interaction.EditCompositionCancel, interaction.EditClipboardCopy, interaction.EditClipboardCut, interaction.EditClipboardPaste, interaction.EditUndo, interaction.EditRedo:
+	default:
+		return interaction.EditCommand{}, fmt.Errorf("unsupported edit kind %q", event.Kind)
+	}
+	return command, nil
 }
 
 func (d *Driver) dispatchOne(index int, event Event) (Result, error) {
@@ -328,11 +430,45 @@ func (d *Driver) dispatchOne(index int, event Event) (Result, error) {
 		} else {
 			return Result{}, fmt.Errorf("automation runtime does not support scroll input")
 		}
+	case "edit", "editing":
+		editRuntime, ok := d.runtime.(EditRuntime)
+		if !ok {
+			return Result{}, fmt.Errorf("automation runtime does not support editing")
+		}
+		command, err := editCommand(event)
+		if err != nil {
+			return Result{}, err
+		}
+		result.TargetID = command.FieldID
+		if result.TargetID == "" {
+			result.TargetID = before.FocusedID
+			if result.TargetID == "" {
+				if focused, ok := d.runtime.(interface{ FocusedFieldID() string }); ok {
+					result.TargetID = focused.FocusedFieldID()
+				}
+			}
+			command.FieldID = result.TargetID
+		}
+		d.recordTrace(TraceEntry{Stage: "editing", EventIndex: index, Type: event.Type, TargetID: result.TargetID, Outcome: string(command.Kind), IDs: []string{result.TargetID}})
+		if err := editRuntime.ApplyEditCommand(command); err != nil {
+			return Result{}, err
+		}
+		result.Consumed = true
+		changed = true
 	case "key":
 		result.TargetID = before.FocusedID
 		focusedField := semanticNodeByID(d.tree, before.FocusedID)
 		fieldTextKey := focusedField != nil && focusedField.Role == "textbox" && (isTextKey(event.Name) || event.Name == "Space")
-		if fieldTextKey {
+		if shortcut, ok := editShortcut(event, before.FocusedID, focusedField); ok {
+			if editRuntime, supportsEdit := d.runtime.(EditRuntime); supportsEdit {
+				d.recordTrace(TraceEntry{Stage: "editing", EventIndex: index, Type: event.Type, TargetID: shortcut.FieldID, Outcome: string(shortcut.Kind), IDs: []string{shortcut.FieldID}})
+				if err := editRuntime.ApplyEditCommand(shortcut); err != nil {
+					return Result{}, err
+				}
+				result.Consumed = true
+				changed = true
+			}
+		} else if fieldTextKey {
 			// Text insertion/editing is deliberately deferred to the later
 			// automation phase; these keys remain observable but unconsumed.
 			result.Consumed = false
@@ -437,6 +573,9 @@ func (d *Driver) dispatchOne(index int, event Event) (Result, error) {
 		if event.Type == "key" && result.FocusAfter != "" {
 			candidateIDs = []string{result.FocusAfter}
 		}
+		if event.Type == "edit" || event.Type == "editing" {
+			candidateIDs = []string{result.TargetID}
+		}
 		d.recordTrace(TraceEntry{Stage: "candidates", EventIndex: index, Type: event.Type, TargetID: result.TargetID, IDs: candidateIDs})
 		owner := result.TargetID
 		if event.Type == "key" {
@@ -503,6 +642,31 @@ func (d *Driver) dispatchOne(index int, event Event) (Result, error) {
 		d.recordTrace(TraceEntry{Stage: "publication", EventIndex: index, Type: event.Type, Outcome: reason, RuntimeBefore: beforeRevisions.RuntimeRevision, RuntimeAfter: afterRevisions.RuntimeRevision, GeometryBefore: beforeRevisions.GeometryRevision, GeometryAfter: afterRevisions.GeometryRevision, FrameBefore: beforeRevisions.FrameRevision, FrameAfter: afterRevisions.FrameRevision, TraceBefore: beforeTrace, TraceAfter: afterTrace})
 	}
 	return result, nil
+}
+
+func editShortcut(event Event, focusedID string, field *semantic.Node) (interaction.EditCommand, bool) {
+	if event.Kind != "down" || focusedID == "" || field == nil || field.Role != "textbox" || !field.Visible || !field.InViewport || !field.Enabled || field.ReadOnly {
+		return interaction.EditCommand{}, false
+	}
+	if !hasModifier(event.Modifiers, "command") && !hasModifier(event.Modifiers, "control") {
+		return interaction.EditCommand{}, false
+	}
+	command := interaction.EditCommand{FieldID: focusedID}
+	switch strings.ToUpper(event.Name) {
+	case "C":
+		command.Kind = interaction.EditClipboardCopy
+	case "X":
+		command.Kind = interaction.EditClipboardCut
+	case "V":
+		command.Kind = interaction.EditClipboardPaste
+	case "Z":
+		command.Kind = interaction.EditUndo
+	case "Y":
+		command.Kind = interaction.EditRedo
+	default:
+		return interaction.EditCommand{}, false
+	}
+	return command, true
 }
 
 func captureChanged(before, after *interaction.PointerCaptureSnapshot) bool {
@@ -652,7 +816,7 @@ func validateBatchWithPointers(events []Event, initial map[int]pointerState) err
 	}
 	lastTime := float64(0)
 	for index, event := range events {
-		if event.Type != "pointer" && event.Type != "key" && event.Type != "scroll" {
+		if event.Type != "pointer" && event.Type != "key" && event.Type != "scroll" && event.Type != "edit" && event.Type != "editing" {
 			return fmt.Errorf("event %d has unsupported type %q", index, event.Type)
 		}
 		if !finiteNonNegative(event.TimeMS) || (index > 0 && event.TimeMS < lastTime) {
@@ -722,6 +886,10 @@ func validateBatchWithPointers(events []Event, initial map[int]pointerState) err
 			}
 			if !finite(event.DeltaX) || !finite(event.DeltaY) {
 				return fmt.Errorf("event %d scroll deltas must be finite", index)
+			}
+		} else if event.Type == "edit" || event.Type == "editing" {
+			if _, err := editCommand(event); err != nil {
+				return fmt.Errorf("event %d: %w", index, err)
 			}
 		} else {
 			if event.Kind != "down" && event.Kind != "up" {

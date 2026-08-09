@@ -55,6 +55,9 @@ type Snapshot struct {
 	ReloadRevision            uint64
 	AutomationInputRevision   uint64
 	PublishedValid            bool
+	Clock                     ViewClockSnapshot
+	ClipboardLength           int
+	BlinkVisible              bool
 	publicationStreak         uint64
 }
 
@@ -94,6 +97,13 @@ type AutomationSnapshot struct {
 	StateValues               map[string]map[string]any        `json:"state_values"`
 	Scroll                    map[string]image.Point           `json:"scroll"`
 	QueueSizes                interaction.RouterQueueSizes     `json:"queue_sizes"`
+	Clock                     ViewClockSnapshot                `json:"clock"`
+	ClockMode                 string                           `json:"clock_mode"`
+	ClockTimeMS               int64                            `json:"clock_time_ms"`
+	NextTimerMS               *int64                           `json:"next_timer_ms,omitempty"`
+	ClipboardLength           int                              `json:"clipboard_length"`
+	BlinkVisible              bool                             `json:"blink_visible"`
+	EditingHistory            map[string][2]int                `json:"editing_history"`
 	publicationStartFrame     uint64
 }
 
@@ -143,6 +153,14 @@ type Runtime struct {
 	publishedScroll           map[string]render.ScrollMetrics
 	scrollMetricScale         float64
 	trace                     *automation.TraceRecorder
+	automationClipboard       string
+	clockMode                 string
+	clockTimeMS               int64
+	nextTimer                 *viewTimer
+	timerQueue                []viewTimer
+	timerDispatchLog          []string
+	timerOrder                uint64
+	blinkVisible              bool
 	router                    *interaction.Router
 	routerSnapshot            interaction.RouterSnapshot
 	routerSnapshotSet         bool
@@ -162,13 +180,16 @@ type Runtime struct {
 }
 
 func newRuntime(root, entry string) *Runtime {
-	return &Runtime{
+	runtime := &Runtime{
 		root: root, entry: entry, scroll: make(map[string]image.Point),
 		scrollMetricScale: 1,
-		trace:             automation.NewTraceRecorder(),
-		state:             interaction.NewStore(), editing: interaction.NewEditingStore(),
+		clockMode:         "real", clockTimeMS: time.Now().UnixMilli(), blinkVisible: true,
+		trace: automation.NewTraceRecorder(),
+		state: interaction.NewStore(), editing: interaction.NewEditingStore(),
 		router: interaction.NewRouter(), syncCh: make(chan struct{}), doneCh: make(chan struct{}),
 	}
+	runtime.scheduleBlinkLocked()
+	return runtime
 }
 
 func NewRuntime(root, entry string) (*Runtime, error) {
@@ -221,6 +242,10 @@ func (runtime *Runtime) Close() {
 		return
 	}
 	runtime.closed = true
+	runtime.automationClipboard = ""
+	runtime.nextTimer = nil
+	runtime.timerQueue = nil
+	runtime.timerDispatchLog = nil
 	if runtime.trace != nil {
 		runtime.trace.Close()
 	}
@@ -378,6 +403,9 @@ func (runtime *Runtime) Snapshot() Snapshot {
 		ReloadRevision:            runtime.reloadRevision,
 		AutomationInputRevision:   runtime.automationInputRevision,
 		PublishedValid:            runtime.publishedValid,
+		Clock:                     runtime.clockSnapshotLocked(),
+		ClipboardLength:           len([]rune(runtime.automationClipboard)),
+		BlinkVisible:              runtime.blinkVisible,
 		publicationStreak:         runtime.publicationStreak,
 	}
 	if runtime.editing != nil {
@@ -466,8 +494,20 @@ func (runtime *Runtime) AutomationSnapshot() AutomationSnapshot {
 		StateValues:           cloneStateValues(snapshot.StateValues),
 		Scroll:                cloneScroll(snapshot.Scroll),
 		QueueSizes:            routerSnapshot.QueueSizes,
+		Clock:                 runtime.clockSnapshotLocked(),
+		ClockMode:             runtime.clockMode,
+		ClockTimeMS:           runtime.clockTimeMS,
+		ClipboardLength:       len([]rune(runtime.automationClipboard)),
+		BlinkVisible:          runtime.blinkVisible,
+		EditingHistory:        map[string][2]int{},
 		IdleReasons:           []string{},
 		publicationStartFrame: runtime.publicationStartFrame,
+	}
+	result.NextTimerMS = result.Clock.NextTimerMS
+	for id := range editingSnapshot.Fields {
+		if undo, redo, ok := runtime.editing.HistoryDepth(id); ok {
+			result.EditingHistory[id] = [2]int{undo, redo}
+		}
 	}
 	if len(routerSnapshot.HoveredIDs) != 0 {
 		result.Transient.Hovered = routerSnapshot.HoveredIDs[0]
@@ -1394,66 +1434,66 @@ func (runtime *Runtime) ApplyFieldEdit(id string, start, end int, text string) e
 	if runtime.editing == nil {
 		return fmt.Errorf("field editing is unavailable")
 	}
-	before := runtime.editing.Revision()
-	if err := runtime.editing.ApplyRuneEdit(id, start, end, text); err != nil {
+	start, end, err := runeRangeToGraphemeLocked(runtime.editing, id, start, end)
+	if err != nil {
 		return err
 	}
-	if runtime.editing.Revision() == before {
-		return nil
+	return runtime.applyEditCommandLocked(interaction.EditCommand{Kind: interaction.EditReplace, FieldID: id, Start: start, End: end, Text: text})
+}
+
+func runeRangeToGraphemeLocked(store *interaction.EditingStore, id string, start, end int) (int, int, error) {
+	draft, ok := store.Draft(id)
+	if !ok {
+		return 0, 0, fmt.Errorf("unknown field %q", id)
 	}
-	if err := runtime.publishValidFieldDraftLocked(id); err != nil {
-		return err
-	}
-	runtime.effectiveRoot = nil
-	runtime.runtimeRevision++
-	return nil
+	return interaction.GraphemeIndexAtRune(draft, start), interaction.GraphemeIndexAtRune(draft, end), nil
 }
 
 func (runtime *Runtime) SetFieldSelection(id string, start, end int) error {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	before := runtime.editing.Revision()
-	if err := runtime.editing.SetRuneSelection(id, start, end); err != nil {
+	if runtime.editing == nil {
+		return fmt.Errorf("field editing is unavailable")
+	}
+	start, end, err := runeRangeToGraphemeLocked(runtime.editing, id, start, end)
+	if err != nil {
 		return err
 	}
-	if runtime.editing.Revision() == before {
-		return nil
-	}
-	runtime.effectiveRoot = nil
-	runtime.runtimeRevision++
-	return nil
+	return runtime.applyEditCommandLocked(interaction.EditCommand{Kind: interaction.EditSelection, FieldID: id, Start: start, End: end})
 }
 
 func (runtime *Runtime) SetFieldComposition(id string, start, end int) error {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	before := runtime.editing.Revision()
-	if err := runtime.editing.SetComposition(id, start, end); err != nil {
+	if runtime.editing == nil {
+		return fmt.Errorf("field editing is unavailable")
+	}
+	start, end, err := runeRangeToGraphemeLocked(runtime.editing, id, start, end)
+	if err != nil {
 		return err
 	}
-	if runtime.editing.Revision() == before {
-		return nil
+	kind := interaction.EditCompositionStart
+	// Gio's native SetComposition treats an equal range on an idle field as
+	// the end/no-op signal. Keep that behavior while routing through the shared
+	// command path; explicit automation composition_start still supports an
+	// empty caret range via its distinct command kind.
+	if start == end {
+		kind = interaction.EditCompositionCommit
 	}
-	if err := runtime.publishValidFieldDraftLocked(id); err != nil {
-		return err
-	}
-	runtime.effectiveRoot = nil
-	runtime.runtimeRevision++
-	return nil
+	return runtime.applyEditCommandLocked(interaction.EditCommand{Kind: kind, FieldID: id, Start: start, End: end})
 }
 
 func (runtime *Runtime) CancelFieldComposition(id string) bool {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	if !runtime.editing.CancelComposition(id) {
+	if runtime.editing == nil {
 		return false
 	}
-	if err := runtime.publishValidFieldDraftLocked(id); err != nil {
+	before := runtime.editing.Revision()
+	if err := runtime.applyEditCommandLocked(interaction.EditCommand{Kind: interaction.EditCompositionCancel, FieldID: id}); err != nil {
 		return false
 	}
-	runtime.effectiveRoot = nil
-	runtime.runtimeRevision++
-	return true
+	return runtime.editing.Revision() != before
 }
 
 func (runtime *Runtime) MoveFieldSelection(id, movement string, extend bool) bool {
@@ -1582,29 +1622,27 @@ func (runtime *Runtime) FieldDraft(id string) (string, bool) {
 func (runtime *Runtime) UndoField(id string) bool {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	changed := runtime.editing.Undo(id)
-	if changed {
-		if err := runtime.publishValidFieldDraftLocked(id); err != nil {
-			return false
-		}
-		runtime.effectiveRoot = nil
-		runtime.runtimeRevision++
+	if runtime.editing == nil {
+		return false
 	}
-	return changed
+	before := runtime.editing.Revision()
+	if err := runtime.applyEditCommandLocked(interaction.EditCommand{Kind: interaction.EditUndo, FieldID: id}); err != nil {
+		return false
+	}
+	return runtime.editing.Revision() != before
 }
 
 func (runtime *Runtime) RedoField(id string) bool {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	changed := runtime.editing.Redo(id)
-	if changed {
-		if err := runtime.publishValidFieldDraftLocked(id); err != nil {
-			return false
-		}
-		runtime.effectiveRoot = nil
-		runtime.runtimeRevision++
+	if runtime.editing == nil {
+		return false
 	}
-	return changed
+	before := runtime.editing.Revision()
+	if err := runtime.applyEditCommandLocked(interaction.EditCommand{Kind: interaction.EditRedo, FieldID: id}); err != nil {
+		return false
+	}
+	return runtime.editing.Revision() != before
 }
 
 // SubmitForm validates all enabled descendant fields, publishes their drafts,
