@@ -88,6 +88,13 @@ Automation batches also support focused grapheme-indexed editing, composition,
 view-local clipboard copy/cut/paste, undo/redo, and deterministic frozen view
 clocks (`gora_set_view_clock`, `gora_advance_view_clock`).
 
+For deterministic acceptance checks, `gora_assert_view` evaluates finite
+semantic, state, scroll, transient, and trace assertions against one published
+snapshot. `gora_compare_capture` compares the overlay-free PNG with a
+root-contained reference using masks, channel tolerance, and a changed-pixel
+threshold; failed comparisons include an actionable diff image without
+modifying the reference.
+
 To exercise percentage sizing, aspect ratios, intrinsic containers, and
 wrapping stacks, open the web-layout conformance example from the repository
 root:

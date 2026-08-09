@@ -42,7 +42,8 @@ asset work across its views; it does not recursively discover the root.
   `gora_capture`. Runtime calls require matching project and view IDs.
 - Automation (enabled only with `gora mcp --automation`):
   `gora_wait_for_view`, `gora_dispatch_input`, `gora_configure_event_trace`,
-  and `gora_clear_event_trace`. Dispatch accepts one fully validated ordered
+  `gora_clear_event_trace`, `gora_assert_view`, and `gora_compare_capture`.
+  Dispatch accepts one fully validated ordered
   batch of renderer-neutral pointer, keyboard, or wheel/trackpad scroll events
   and returns one result per event with canonical target, focus/capture,
   consumed state, effects, scroll-axis routing, and resulting revisions. A malformed event
@@ -133,6 +134,25 @@ automation-only `gora_set_automation_clipboard` and
 `run_until_idle`. Snapshots expose clock mode/time, next timer, clipboard
 length, caret blink, and bounded editing history. Frozen time controls caret
 blink and interaction timers without rebuilding persistent geometry.
+
+`gora_assert_view` evaluates finite view, semantic-node, scroll, transient,
+state-scope, and trace assertions in source order against one immutable
+published snapshot. The v1 fields are validity/last-good/selection/viewport,
+all runtime/frame/geometry/reload/input revisions, navigation, idle and
+diagnostics; node state and logical bounds/clip/nullness; parent/child,
+focus/paint, point and clipping relations; scroll offset/maximum/
+viewport/content/enabled axes; focus/capture/popup/editing/caret/selection/
+composition/queue/clock transient state; visible scoped values; and ordered
+trace stage/owner/axis/consumed/residual subsequences. Mismatches return every
+expected/actual result with `passed:false`; unknown or malformed assertion
+fields are rejected by the finite MCP input schema; valid mismatches remain
+ordered failed results while later assertions continue.
+`gora_compare_capture`
+compares the overlay-free current PNG with a root-contained reference using
+exact non-premultiplied NRGBA pixels, logical masks, channel tolerance, and a
+changed-pixel threshold. Failed comparisons return changed bounds and inline
+current/diff PNGs; optional diffs are created only at new contained paths and
+references are never modified.
 
 Each app/component view owns one bounded automation router. It uses the same
 canonical clipped hit testing, pointer capture, focus traversal, control

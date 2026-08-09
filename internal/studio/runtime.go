@@ -84,6 +84,8 @@ type AutomationSnapshot struct {
 	UnpublishedGeometry       bool                             `json:"unpublished_geometry"`
 	Selection                 string                           `json:"selection,omitempty"`
 	Selections                []string                         `json:"selections"`
+	CanBack                   bool                             `json:"can_back"`
+	CanForward                bool                             `json:"can_forward"`
 	FocusOrder                []string                         `json:"focus_order"`
 	Viewport                  image.Point                      `json:"viewport"`
 	Diagnostics               []document.Diagnostic            `json:"diagnostics"`
@@ -384,6 +386,10 @@ func (runtime *Runtime) Reload() {
 func (runtime *Runtime) Snapshot() Snapshot {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
+	return runtime.snapshotLocked()
+}
+
+func (runtime *Runtime) snapshotLocked() Snapshot {
 	runtime.ensureSyncLocked()
 	if runtime.state == nil {
 		runtime.state = interaction.NewStore()
@@ -458,9 +464,12 @@ func (runtime *Runtime) Snapshot() Snapshot {
 // AutomationSnapshot returns the latest immutable synchronization and
 // transient-state view. It never consumes router or editing queues.
 func (runtime *Runtime) AutomationSnapshot() AutomationSnapshot {
-	snapshot := runtime.Snapshot()
-	runtime.mu.RLock()
-	defer runtime.mu.RUnlock()
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	return runtime.automationSnapshotLocked(runtime.snapshotLocked())
+}
+
+func (runtime *Runtime) automationSnapshotLocked(snapshot Snapshot) AutomationSnapshot {
 	routerSnapshot := runtime.routerSnapshot
 	if !runtime.routerSnapshotSet {
 		routerSnapshot = runtime.router.Snapshot()
@@ -481,6 +490,8 @@ func (runtime *Runtime) AutomationSnapshot() AutomationSnapshot {
 		publicationStreak:         snapshot.publicationStreak,
 		Selection:                 snapshot.Screen,
 		Selections:                append([]string(nil), snapshot.Screens...),
+		CanBack:                   snapshot.CanBack,
+		CanForward:                snapshot.CanForward,
 		FocusOrder:                focusOrderIDs(runtime.publishedTree),
 		Viewport:                  snapshot.Viewport,
 		Diagnostics:               append([]document.Diagnostic(nil), snapshot.Diagnostics...),
@@ -1273,6 +1284,41 @@ func (runtime *Runtime) CapturePNG(scale int) ([]byte, string, error) {
 		return data, "source is invalid; captured the last-good frame", nil
 	}
 	return data, "", nil
+}
+
+// CapturePNGReadOnly captures the already-published overlay-free frame without
+// rendering or publishing a stale candidate. The returned identity is copied
+// under the same read lock as the immutable render snapshot, so later runtime
+// mutations cannot make metadata describe a different set of pixels.
+func (runtime *Runtime) CapturePNGReadOnly(scale int) ([]byte, string, automation.CaptureIdentity, error) {
+	if scale <= 0 {
+		return nil, "", automation.CaptureIdentity{}, fmt.Errorf("scale must be a positive integer")
+	}
+	runtime.mu.RLock()
+	root := runtime.effectiveRoot
+	if root == nil {
+		runtime.mu.RUnlock()
+		return nil, "", automation.CaptureIdentity{}, fmt.Errorf("no valid published frame is available")
+	}
+	stateValues := map[string]map[string]any{}
+	if runtime.state != nil {
+		stateValues = cloneStateValues(runtime.state.AllValues())
+	}
+	snapshot := Snapshot{
+		Root: root, Viewport: runtime.viewport, Screen: runtime.selected,
+		Scroll: cloneScroll(runtime.scroll), StateValues: stateValues,
+		Transient: runtime.effectiveTransient, Invalid: runtime.invalid,
+	}
+	identity := automation.CaptureIdentity{Selection: runtime.selected, ViewportWidth: runtime.viewport.X, ViewportHeight: runtime.viewport.Y, RuntimeRevision: runtime.runtimeRevision, FrameRevision: runtime.frameRevision, GeometryRevision: runtime.geometryRevision, PublishedRuntimeRevision: runtime.publishedRuntimeRevision, PublishedGeometryRevision: runtime.publishedGeometryRevision, Width: runtime.viewport.X, Height: runtime.viewport.Y, Valid: runtime.publishedTree != nil && runtime.publishedValid}
+	runtime.mu.RUnlock()
+	data, err := render.CapturePNG(snapshot.Root, snapshot.Viewport, renderState(snapshot), scale)
+	if err != nil {
+		return nil, "", identity, err
+	}
+	if snapshot.Invalid {
+		return data, "source is invalid; captured the last-good frame", identity, nil
+	}
+	return data, "", identity, nil
 }
 
 func (runtime *Runtime) ensurePublishedFrame() error {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
 	"io"
 	"net"
 	"net/http"
@@ -27,6 +28,9 @@ type Service struct {
 	server     *mcp.Server
 	handler    http.Handler
 	automation bool
+	// capturePNG is nil in production and permits renderer-independent MCP
+	// comparison tests to supply an immutable PNG/identity pair.
+	capturePNG func(*studio.Runtime, int) ([]byte, string, automation.CaptureIdentity, error)
 }
 
 type ServiceOptions struct {
@@ -154,6 +158,75 @@ type CaptureOutput struct {
 	Height    int         `json:"height"`
 	Warning   string      `json:"warning,omitempty"`
 	Output    string      `json:"output,omitempty"`
+}
+
+type AssertViewInput struct {
+	ProjectID          string                 `json:"project_id"`
+	ViewID             string                 `json:"view_id"`
+	AfterFrameRevision *uint64                `json:"after_frame_revision,omitempty"`
+	TimeoutMS          int                    `json:"timeout_ms,omitempty"`
+	Assertions         []automation.Assertion `json:"assertions"`
+}
+
+type AssertViewOutput struct {
+	ProjectID                 string                       `json:"project_id"`
+	ViewID                    string                       `json:"view_id"`
+	Passed                    bool                         `json:"passed"`
+	Results                   []automation.AssertionResult `json:"results"`
+	RuntimeRevision           uint64                       `json:"runtime_revision"`
+	FrameRevision             uint64                       `json:"frame_revision"`
+	GeometryRevision          uint64                       `json:"geometry_revision"`
+	PublishedRuntimeRevision  uint64                       `json:"published_runtime_revision"`
+	PublishedGeometryRevision uint64                       `json:"published_geometry_revision"`
+	Snapshot                  studio.AutomationSnapshot    `json:"snapshot"`
+	Resources                 []string                     `json:"resources"`
+}
+
+type CaptureMask struct {
+	X      int `json:"x"`
+	Y      int `json:"y"`
+	Width  int `json:"width"`
+	Height int `json:"height"`
+}
+
+type CompareCaptureInput struct {
+	ProjectID        string        `json:"project_id"`
+	ViewID           string        `json:"view_id"`
+	Reference        string        `json:"reference"`
+	Scale            int           `json:"scale"`
+	ChannelTolerance int           `json:"channel_tolerance,omitempty"`
+	MaxChangedPixels int           `json:"max_changed_pixels,omitempty"`
+	Masks            []CaptureMask `json:"masks,omitempty"`
+	SaveDiff         string        `json:"save_diff,omitempty"`
+}
+
+type CompareCaptureOutput struct {
+	ProjectID                 string       `json:"project_id"`
+	ViewID                    string       `json:"view_id"`
+	Passed                    bool         `json:"passed"`
+	Width                     int          `json:"width"`
+	Height                    int          `json:"height"`
+	ReferenceWidth            int          `json:"reference_width"`
+	ReferenceHeight           int          `json:"reference_height"`
+	DimensionMismatch         bool         `json:"dimension_mismatch"`
+	ChangedPixels             int          `json:"changed_pixels"`
+	ChangedRatio              float64      `json:"changed_ratio"`
+	MaximumDelta              int          `json:"maximum_delta"`
+	ChangedBounds             *CaptureMask `json:"changed_bounds,omitempty"`
+	Scale                     int          `json:"scale"`
+	Warning                   string       `json:"warning,omitempty"`
+	Reference                 string       `json:"reference"`
+	SavedDiff                 string       `json:"saved_diff,omitempty"`
+	RuntimeRevision           uint64       `json:"runtime_revision"`
+	FrameRevision             uint64       `json:"frame_revision"`
+	GeometryRevision          uint64       `json:"geometry_revision"`
+	Selection                 string       `json:"selection,omitempty"`
+	CaptureFrameRevision      uint64       `json:"capture_frame_revision"`
+	CaptureGeometryRevision   uint64       `json:"capture_geometry_revision"`
+	PublishedRuntimeRevision  uint64       `json:"published_runtime_revision"`
+	PublishedGeometryRevision uint64       `json:"published_geometry_revision"`
+	CaptureValid              bool         `json:"capture_valid"`
+	Resources                 []string     `json:"resources,omitempty"`
 }
 
 type WaitForViewInput struct {
@@ -575,6 +648,119 @@ func (s *Service) registerRuntimeTools() {
 
 func (s *Service) registerAutomationTools() {
 	readOnly := &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true, OpenWorldHint: boolPointer(false)}
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_assert_view", Description: "Evaluate finite deterministic assertions against one immutable published view snapshot.", Annotations: readOnly}, func(ctx context.Context, _ *mcp.CallToolRequest, input AssertViewInput) (*mcp.CallToolResult, AssertViewOutput, error) {
+		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
+		if err != nil {
+			return nil, AssertViewOutput{}, err
+		}
+		timeout := 5 * time.Second
+		if input.TimeoutMS != 0 {
+			if input.TimeoutMS < 1 || input.TimeoutMS > 60000 {
+				return nil, AssertViewOutput{}, fmt.Errorf("timeout_ms must be between 1 and 60000")
+			}
+			timeout = time.Duration(input.TimeoutMS) * time.Millisecond
+		}
+		if input.AfterFrameRevision != nil {
+			request := studio.WaitForViewRequest{Condition: "published", StableFrames: 1, Timeout: timeout, AfterFrameSet: true, AfterFrameRevision: *input.AfterFrameRevision, AllowAlreadySatisfied: true}
+			if _, waitErr := runtime.WaitForView(ctx, request); waitErr != nil {
+				output := AssertViewOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Snapshot: runtime.AutomationSnapshot(), Resources: automationResources(input.ProjectID, input.ViewID)}
+				var timeoutErr *studio.WaitTimeoutError
+				if errors.As(waitErr, &timeoutErr) {
+					return &mcp.CallToolResult{IsError: true, StructuredContent: output, Content: []mcp.Content{&mcp.TextContent{Text: waitErr.Error()}}}, output, nil
+				}
+				return nil, output, waitErr
+			}
+		}
+		assertionSnapshot := runtime.AutomationAssertionSnapshot()
+		report, err := automation.EvaluateAssertions(assertionSnapshot, input.Assertions)
+		output := AssertViewOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Passed: report.Passed, Results: report.Results, RuntimeRevision: report.RuntimeRevision, FrameRevision: report.FrameRevision, GeometryRevision: report.GeometryRevision, PublishedRuntimeRevision: report.PublishedRuntimeRevision, PublishedGeometryRevision: report.PublishedGeometryRevision, Snapshot: runtime.AutomationSnapshot(), Resources: automationResources(input.ProjectID, input.ViewID)}
+		if err != nil {
+			return nil, AssertViewOutput{}, err
+		}
+		return nil, output, nil
+	})
+	captureMutation := &mcp.ToolAnnotations{ReadOnlyHint: false, IdempotentHint: false, OpenWorldHint: boolPointer(false), DestructiveHint: boolPointer(false)}
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_compare_capture", Description: "Compare an overlay-free current view PNG with a contained reference image using deterministic NRGBA pixels.", Annotations: captureMutation}, func(_ context.Context, _ *mcp.CallToolRequest, input CompareCaptureInput) (*mcp.CallToolResult, CompareCaptureOutput, error) {
+		if input.Scale <= 0 {
+			return nil, CompareCaptureOutput{}, fmt.Errorf("scale must be a positive integer")
+		}
+		if input.ChannelTolerance < 0 || input.ChannelTolerance > 255 {
+			return nil, CompareCaptureOutput{}, fmt.Errorf("channel_tolerance must be between 0 and 255")
+		}
+		if input.MaxChangedPixels < 0 {
+			return nil, CompareCaptureOutput{}, fmt.Errorf("max_changed_pixels must be non-negative")
+		}
+		for _, mask := range input.Masks {
+			if mask.X < 0 || mask.Y < 0 || mask.Width < 0 || mask.Height < 0 {
+				return nil, CompareCaptureOutput{}, fmt.Errorf("mask coordinates and dimensions must be non-negative")
+			}
+		}
+		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
+		if err != nil {
+			return nil, CompareCaptureOutput{}, err
+		}
+		root, err := s.registry.ProjectRoot(input.ProjectID)
+		if err != nil {
+			return nil, CompareCaptureOutput{}, err
+		}
+		referencePath, err := containedExistingCapturePath(root, input.Reference)
+		if err != nil {
+			return nil, CompareCaptureOutput{}, err
+		}
+		reference, err := os.ReadFile(referencePath)
+		if err != nil {
+			return nil, CompareCaptureOutput{}, err
+		}
+		var savePath string
+		if input.SaveDiff != "" {
+			savePath, err = containedCapturePath(root, input.SaveDiff)
+			if err != nil {
+				return nil, CompareCaptureOutput{}, err
+			}
+			if _, statErr := os.Lstat(savePath); statErr == nil {
+				return nil, CompareCaptureOutput{}, fmt.Errorf("diff output already exists")
+			} else if !os.IsNotExist(statErr) {
+				return nil, CompareCaptureOutput{}, statErr
+			}
+		}
+		capture := s.capturePNG
+		if capture == nil {
+			capture = func(runtime *studio.Runtime, scale int) ([]byte, string, automation.CaptureIdentity, error) {
+				return runtime.CapturePNGReadOnly(scale)
+			}
+		}
+		current, warning, captureIdentity, err := capture(runtime, input.Scale)
+		if err != nil {
+			return nil, CompareCaptureOutput{}, err
+		}
+		masks := make([]image.Rectangle, 0, len(input.Masks))
+		for _, mask := range input.Masks {
+			masks = append(masks, image.Rect(mask.X*input.Scale, mask.Y*input.Scale, (mask.X+mask.Width)*input.Scale, (mask.Y+mask.Height)*input.Scale))
+		}
+		comparison, err := automation.ComparePNG(reference, current, automation.CompareOptions{ChannelTolerance: input.ChannelTolerance, MaxChangedPixels: input.MaxChangedPixels, Masks: masks})
+		if err != nil {
+			return nil, CompareCaptureOutput{}, err
+		}
+		if savePath != "" && !comparison.Passed {
+			if err := writeNewFile(savePath, comparison.DiffPNG); err != nil {
+				return nil, CompareCaptureOutput{}, err
+			}
+		}
+		output := CompareCaptureOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Passed: comparison.Passed, Width: comparison.Width, Height: comparison.Height, ReferenceWidth: comparison.ReferenceWidth, ReferenceHeight: comparison.ReferenceHeight, DimensionMismatch: comparison.DimensionMismatch, ChangedPixels: comparison.ChangedPixels, ChangedRatio: comparison.ChangedRatio, MaximumDelta: comparison.MaximumDelta, Scale: input.Scale, Warning: warning, Reference: input.Reference, SavedDiff: func() string {
+			if comparison.Passed {
+				return ""
+			}
+			return input.SaveDiff
+		}(), RuntimeRevision: captureIdentity.RuntimeRevision, FrameRevision: captureIdentity.FrameRevision, GeometryRevision: captureIdentity.GeometryRevision, Selection: captureIdentity.Selection, CaptureFrameRevision: captureIdentity.FrameRevision, CaptureGeometryRevision: captureIdentity.GeometryRevision, PublishedRuntimeRevision: captureIdentity.PublishedRuntimeRevision, PublishedGeometryRevision: captureIdentity.PublishedGeometryRevision, CaptureValid: captureIdentity.Valid, Resources: automationResources(input.ProjectID, input.ViewID)}
+		if !comparison.ChangedBounds.Empty() {
+			bounds := comparison.ChangedBounds
+			output.ChangedBounds = &CaptureMask{X: bounds.Min.X, Y: bounds.Min.Y, Width: bounds.Dx(), Height: bounds.Dy()}
+		}
+		if comparison.Passed {
+			return nil, output, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.ImageContent{Data: comparison.CurrentPNG, MIMEType: "image/png"}, &mcp.ImageContent{Data: comparison.DiffPNG, MIMEType: "image/png"}}, StructuredContent: output}, output, nil
+	})
 	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_wait_for_view", Description: "Wait for a deterministic published or idle view frame and return its automation snapshot.", Annotations: readOnly}, func(ctx context.Context, _ *mcp.CallToolRequest, input WaitForViewInput) (*mcp.CallToolResult, WaitForViewOutput, error) {
 		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
 		if err != nil {
@@ -1186,6 +1372,28 @@ func containedCapturePath(root, output string) (string, error) {
 		return "", fmt.Errorf("capture output is outside project root")
 	}
 	return output, nil
+}
+
+func containedExistingCapturePath(root, reference string) (string, error) {
+	if !filepath.IsAbs(reference) {
+		reference = filepath.Join(root, reference)
+	}
+	if !strings.EqualFold(filepath.Ext(reference), ".png") {
+		return "", fmt.Errorf("reference must use the .png extension")
+	}
+	canonical, err := filepath.EvalSymlinks(reference)
+	if err != nil {
+		return "", err
+	}
+	canonical, err = filepath.Abs(canonical)
+	if err != nil {
+		return "", err
+	}
+	relative, err := filepath.Rel(root, canonical)
+	if err != nil || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("reference is outside project root")
+	}
+	return canonical, nil
 }
 
 func writeNewFile(path string, data []byte) error {
