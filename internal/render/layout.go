@@ -429,7 +429,7 @@ func fieldTextShaper(node *project.Node) (*text.Shaper, giofont.Font) {
 	if !filepath.IsAbs(fontPath) {
 		fontPath = filepath.Join(filepath.Dir(node.Source.File), fontPath)
 	}
-	shaper, typeface, err := loadNativeFont(nil, fontPath)
+	shaper, typeface, err := loadNativeFont(nil, fontPath, nil)
 	if err != nil {
 		return fieldShapeState.fallback, descriptor
 	}

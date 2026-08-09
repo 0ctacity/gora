@@ -1,6 +1,7 @@
 package render
 
 import (
+	"fmt"
 	"image"
 	"image/color"
 	"math"
@@ -817,7 +818,7 @@ func (r *gioRenderer) label(node *project.Node) material.LabelStyle {
 		if !filepath.IsAbs(fontPath) {
 			fontPath = filepath.Join(filepath.Dir(node.Source.File), fontPath)
 		}
-		if shaper, typeface, err := loadNativeFont(r.theme, fontPath); err == nil {
+		if shaper, typeface, err := loadNativeFont(r.theme, fontPath, r.state.AssetBytes); err == nil {
 			label.Shaper = shaper
 			label.Font.Typeface = typeface
 		}
@@ -844,7 +845,21 @@ func (r *gioRenderer) label(node *project.Node) material.LabelStyle {
 	return label
 }
 
-func loadNativeFont(theme *material.Theme, path string) (*text.Shaper, font.Typeface, error) {
+func loadNativeFont(theme *material.Theme, path string, assets map[string][]byte) (*text.Shaper, font.Typeface, error) {
+	if data, ok := assets[path]; ok {
+		faces, err := gioopentype.ParseCollection(data)
+		if err != nil {
+			return nil, "", err
+		}
+		if len(faces) == 0 {
+			return nil, "", fmt.Errorf("font collection is empty")
+		}
+		collection := make([]font.FontFace, 0, len(faces)+len(gofont.Collection()))
+		collection = append(collection, faces...)
+		collection = append(collection, gofont.Collection()...)
+		shaper := text.NewShaper(text.NoSystemFonts(), text.WithCollection(collection))
+		return shaper, faces[0].Font.Typeface, nil
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, "", err
@@ -923,7 +938,7 @@ func (r *gioRenderer) intrinsicLeafSize(node *project.Node, limit image.Point) i
 			if !filepath.IsAbs(source) {
 				source = filepath.Join(filepath.Dir(node.Source.File), source)
 			}
-			if decoded, err := loadImage(source); err == nil {
+			if decoded, err := loadImageAsset(source, r.state.AssetBytes); err == nil {
 				return decoded.Bounds().Size()
 			}
 		}
@@ -941,7 +956,7 @@ func (r *gioRenderer) paintImageGio(node *project.Node, bounds, currentClip imag
 	if !filepath.IsAbs(source) {
 		source = filepath.Join(filepath.Dir(node.Source.File), source)
 	}
-	decoded, err := loadImage(source)
+	decoded, err := loadImageAsset(source, r.state.AssetBytes)
 	if err != nil {
 		return
 	}

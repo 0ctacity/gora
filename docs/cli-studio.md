@@ -208,7 +208,10 @@ and structured document editing. Add `--automation` to register the
 renderer-neutral `gora_dispatch_input` batch tool, the
 `gora_wait_for_view`/automation resource, bounded scroll/edit event tracing,
 view-local clipboard tools, deterministic view-clock controls, finite
-`gora_assert_view` checks, and overlay-free `gora_compare_capture` controls;
+`gora_assert_view` checks, overlay-free `gora_compare_capture` controls, and
+view-local test-overlay/reload controls (`gora_apply_test_overlay`,
+`gora_clear_test_overlay`, `gora_inject_reload_events`, and finite counted
+fault configuration);
 without it, ordinary project/view tools remain unchanged. This input boundary
 proves canonical pointer/keyboard/scroll routing and publication, not delivery
 through a visible Gio/OS window. See

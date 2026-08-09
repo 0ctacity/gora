@@ -290,7 +290,8 @@ func layoutPreview(gtx layout.Context, theme *material.Theme, snapshot Snapshot)
 func renderState(snapshot Snapshot) render.State {
 	return render.State{
 		Screen: snapshot.Screen, Scroll: snapshot.Scroll, Values: snapshot.StateValues,
-		Hovered: snapshot.Transient.Hovered, Pressed: snapshot.Transient.Pressed, Focused: snapshot.Transient.Focused,
+		AssetBytes: snapshot.AssetBytes,
+		Hovered:    snapshot.Transient.Hovered, Pressed: snapshot.Transient.Pressed, Focused: snapshot.Transient.Focused,
 		OpenSelect: snapshot.Transient.OpenSelect, ActiveOption: snapshot.Transient.ActiveOption,
 	}
 }

@@ -42,6 +42,7 @@ type State struct {
 	CaretHidden  bool
 	OpenSelect   string
 	ActiveOption string
+	AssetBytes   map[string][]byte
 }
 
 type Result struct {
@@ -934,7 +935,7 @@ func (r *renderer) text(node *project.Node, bounds, clip image.Rectangle) {
 		if !filepath.IsAbs(path) {
 			path = filepath.Join(filepath.Dir(node.Source.File), path)
 		}
-		if loaded, err := loadFont(path); err == nil {
+		if loaded, err := loadFontAsset(path, r.state.AssetBytes); err == nil {
 			parsed = loaded
 		}
 	}
@@ -1045,7 +1046,7 @@ func (r *renderer) image(node *project.Node, bounds, clip image.Rectangle) {
 	if !filepath.IsAbs(source) {
 		source = filepath.Join(filepath.Dir(node.Source.File), source)
 	}
-	decoded, err := loadImage(source)
+	decoded, err := loadImageAsset(source, r.state.AssetBytes)
 	if err != nil {
 		return
 	}
@@ -1064,6 +1065,14 @@ func (r *renderer) image(node *project.Node, bounds, clip image.Rectangle) {
 	}
 	mask := image.NewUniform(color.Alpha{A: uint8(255 * r.opacity)})
 	draw.DrawMask(r.result.Image, paintArea, layer, paintArea.Min, mask, image.Point{}, draw.Over)
+}
+
+func loadImageAsset(path string, assets map[string][]byte) (image.Image, error) {
+	if data, ok := assets[path]; ok {
+		decoded, _, err := image.Decode(bytes.NewReader(data))
+		return decoded, err
+	}
+	return loadImage(path)
 }
 
 func loadImage(path string) (image.Image, error) {
@@ -1093,6 +1102,13 @@ func loadImage(path string) (image.Image, error) {
 	assetCache.images[path] = cachedImage{modified: info.ModTime(), size: info.Size(), image: decoded}
 	assetCache.Unlock()
 	return decoded, nil
+}
+
+func loadFontAsset(path string, assets map[string][]byte) (*opentype.Font, error) {
+	if data, ok := assets[path]; ok {
+		return opentype.Parse(data)
+	}
+	return loadFont(path)
 }
 
 func loadFont(path string) (*opentype.Font, error) {

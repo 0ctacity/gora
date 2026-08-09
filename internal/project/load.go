@@ -1,6 +1,7 @@
 package project
 
 import (
+	"bytes"
 	"fmt"
 	"image"
 	_ "image/jpeg"
@@ -28,6 +29,29 @@ type Loaded struct {
 	Dependencies []string
 	Viewport     document.Viewport
 	StateScopes  []StateScope
+}
+
+// OverlayFile is a renderer-neutral provider entry. Missing deliberately
+// shadows a disk path and returns os.ErrNotExist; zero-length bytes remain a
+// valid file.
+type OverlayFile struct {
+	Kind       string
+	Data       []byte
+	Delegate   bool
+	FaultKinds []string
+	Usage      *OverlayUsage
+}
+
+// OverlayUsage is an internal, renderer-neutral read/decode receipt. The
+// loader marks it only when the corresponding path is actually requested;
+// callers use it to consume counted automation faults deterministically.
+type OverlayUsage struct {
+	Accesses []OverlayAccess
+}
+
+type OverlayAccess struct {
+	Index uint64
+	Kind  string
 }
 
 type StateReference struct {
@@ -69,9 +93,10 @@ type loader struct {
 	dependencies map[string]struct{}
 	diagnostics  []document.Diagnostic
 	nextHandle   int
+	nextAccess   uint64
 	stateScopes  map[string]StateScope
 	appScreens   map[string]*document.Node
-	overlay      map[string][]byte
+	overlayFiles map[string]OverlayFile
 }
 
 type resolveContext struct {
@@ -106,10 +131,18 @@ func LoadSelection(root, entry string, viewportWidth int, selection string) (*Lo
 
 // LoadSelectionOverlay resolves a project against in-memory source replacements.
 func LoadSelectionOverlay(root, entry string, viewportWidth int, selection string, overlay map[string][]byte) (*Loaded, []document.Diagnostic) {
+	files := make(map[string]OverlayFile, len(overlay))
+	for path, data := range overlay {
+		files[path] = OverlayFile{Kind: "bytes", Data: append([]byte(nil), data...)}
+	}
+	return LoadSelectionOverlayFiles(root, entry, viewportWidth, selection, files)
+}
+
+func LoadSelectionOverlayFiles(root, entry string, viewportWidth int, selection string, overlay map[string]OverlayFile) (*Loaded, []document.Diagnostic) {
 	return loadSelection(root, entry, viewportWidth, selection, overlay)
 }
 
-func loadSelection(root, entry string, viewportWidth int, selection string, overlay map[string][]byte) (*Loaded, []document.Diagnostic) {
+func loadSelection(root, entry string, viewportWidth int, selection string, overlay map[string]OverlayFile) (*Loaded, []document.Diagnostic) {
 	canonicalRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		return nil, []document.Diagnostic{loadDiagnostic(root, "project.root", err.Error())}
@@ -133,7 +166,7 @@ func loadSelection(root, entry string, viewportWidth int, selection string, over
 		loading:      make(map[string]bool),
 		dependencies: make(map[string]struct{}),
 		stateScopes:  make(map[string]StateScope),
-		overlay:      overlay,
+		overlayFiles: overlay,
 	}
 	doc := l.loadDocument(canonicalEntry)
 	if doc == nil || len(l.diagnostics) != 0 {
@@ -306,7 +339,7 @@ func (l *loader) trackAssets(node *Node) {
 			l.add(node.Source.File, node.Source.Line, node.Source.Column, "asset.path", fmt.Sprintf("%s requires %s", node.Type, key))
 			continue
 		}
-		path, err := canonicalPathOverlay(l.root, filepath.Join(filepath.Dir(node.Source.File), raw), l.overlay)
+		path, err := canonicalPathOverlay(l.root, filepath.Join(filepath.Dir(node.Source.File), raw), l.overlayFiles)
 		if err != nil {
 			l.add(node.Source.File, node.Source.Line, node.Source.Column, "asset.path", err.Error())
 			continue
@@ -317,21 +350,30 @@ func (l *loader) trackAssets(node *Node) {
 			continue
 		}
 		if key == "src" {
-			file, openErr := os.Open(path)
-			if openErr != nil {
-				l.add(node.Source.File, node.Source.Line, node.Source.Column, "asset.decode", openErr.Error())
+			data, readErr := l.readFile(path, "asset_read")
+			if readErr != nil {
+				l.add(node.Source.File, node.Source.Line, node.Source.Column, "asset.decode", readErr.Error())
 				continue
 			}
-			_, _, decodeErr := image.DecodeConfig(file)
-			_ = file.Close()
+			// Decode faults are injected after bytes are obtained and before the
+			// concrete decoder runs, preserving source bytes for recovery.
+			if l.decodeFault(path, "image_decode") {
+				l.add(node.Source.File, node.Source.Line, node.Source.Column, "asset.decode", "injected decode error")
+				continue
+			}
+			_, _, decodeErr := image.DecodeConfig(bytes.NewReader(data))
 			if decodeErr != nil {
 				l.add(node.Source.File, node.Source.Line, node.Source.Column, "asset.decode", decodeErr.Error())
 				continue
 			}
 		} else {
-			data, readErr := os.ReadFile(path)
+			data, readErr := l.readFile(path, "asset_read")
 			if readErr != nil {
 				l.add(node.Source.File, node.Source.Line, node.Source.Column, "asset.decode", readErr.Error())
+				continue
+			}
+			if l.decodeFault(path, "font_decode") {
+				l.add(node.Source.File, node.Source.Line, node.Source.Column, "asset.decode", "injected decode error")
 				continue
 			}
 			if _, parseErr := opentype.Parse(data); parseErr != nil {
@@ -500,11 +542,7 @@ func (l *loader) loadDocument(path string) *document.Document {
 	l.loading[path] = true
 	defer delete(l.loading, path)
 
-	src, ok := l.overlay[filepath.Clean(path)]
-	var err error
-	if !ok {
-		src, err = os.ReadFile(path)
-	}
+	src, err := l.readFile(path, "source_read")
 	if err != nil {
 		l.add(path, 1, 1, "import.read", err.Error())
 		return nil
@@ -523,7 +561,7 @@ func (l *loader) loadDocument(path string) *document.Document {
 			l.add(path, 1, 1, "import.extension", fmt.Sprintf("component import %q must use the .gora extension", alias))
 			continue
 		}
-		resolved, err := canonicalPathOverlay(l.root, filepath.Join(filepath.Dir(path), importPath), l.overlay)
+		resolved, err := canonicalPathOverlay(l.root, filepath.Join(filepath.Dir(path), importPath), l.overlayFiles)
 		if err != nil {
 			l.add(path, 1, 1, "import.path", fmt.Sprintf("component import %q: %v", alias, err))
 			continue
@@ -538,7 +576,7 @@ func (l *loader) loadDocument(path string) *document.Document {
 			l.add(path, 1, 1, "import.extension", fmt.Sprintf("token import %q must use the .gora extension", alias))
 			continue
 		}
-		resolved, err := canonicalPathOverlay(l.root, filepath.Join(filepath.Dir(path), importPath), l.overlay)
+		resolved, err := canonicalPathOverlay(l.root, filepath.Join(filepath.Dir(path), importPath), l.overlayFiles)
 		if err != nil {
 			l.add(path, 1, 1, "import.path", fmt.Sprintf("token import %q: %v", alias, err))
 			continue
@@ -562,7 +600,7 @@ func (l *loader) trackTokenAssets(doc *document.Document) {
 			l.add(doc.File, 1, 1, "asset.path", fmt.Sprintf("font_face token %q requires src", name))
 			continue
 		}
-		path, err := canonicalPathOverlay(l.root, filepath.Join(filepath.Dir(doc.File), source), l.overlay)
+		path, err := canonicalPathOverlay(l.root, filepath.Join(filepath.Dir(doc.File), source), l.overlayFiles)
 		if err != nil {
 			l.add(doc.File, 1, 1, "asset.path", err.Error())
 			continue
@@ -572,9 +610,13 @@ func (l *loader) trackTokenAssets(doc *document.Document) {
 			l.add(doc.File, 1, 1, "asset.type", "font faces must be TTF or OTF")
 			continue
 		}
-		data, err := os.ReadFile(path)
+		data, err := l.readFile(path, "asset_read")
 		if err != nil {
 			l.add(doc.File, 1, 1, "asset.decode", err.Error())
+			continue
+		}
+		if l.decodeFault(path, "font_decode") {
+			l.add(doc.File, 1, 1, "asset.decode", "injected decode error")
 			continue
 		}
 		if _, err := opentype.Parse(data); err != nil {
@@ -586,17 +628,62 @@ func (l *loader) trackTokenAssets(doc *document.Document) {
 	}
 }
 
+func (l *loader) markAccess(path, kind string) {
+	file, ok := l.overlayFiles[filepath.Clean(path)]
+	if !ok || file.Usage == nil {
+		return
+	}
+	l.nextAccess++
+	file.Usage.Accesses = append(file.Usage.Accesses, OverlayAccess{Index: l.nextAccess, Kind: kind})
+	l.overlayFiles[filepath.Clean(path)] = file
+}
+
+func containsFault(kinds []string, want string) bool {
+	for _, kind := range kinds {
+		if kind == want {
+			return true
+		}
+	}
+	return false
+}
+
+func (l *loader) readFile(path, accessKind string) ([]byte, error) {
+	if file, ok := l.overlayFiles[filepath.Clean(path)]; ok {
+		l.markAccess(path, accessKind)
+		if containsFault(file.FaultKinds, accessKind) {
+			return nil, fmt.Errorf("injected read error")
+		}
+		if file.Delegate {
+			return os.ReadFile(path)
+		}
+		if file.Kind == "missing" {
+			return nil, os.ErrNotExist
+		}
+		return append([]byte(nil), file.Data...), nil
+	}
+	return os.ReadFile(path)
+}
+
+func (l *loader) decodeFault(path, decodeKind string) bool {
+	file, ok := l.overlayFiles[filepath.Clean(path)]
+	if !ok {
+		return false
+	}
+	l.markAccess(path, decodeKind)
+	return containsFault(file.FaultKinds, decodeKind)
+}
+
 func (l *loader) importsFor(doc *document.Document) (map[string]*document.Document, map[string]*document.Document) {
 	components := make(map[string]*document.Document)
 	tokens := make(map[string]*document.Document)
 	for alias, importPath := range doc.Imports.Components {
-		path, err := canonicalPathOverlay(l.root, filepath.Join(filepath.Dir(doc.File), importPath), l.overlay)
+		path, err := canonicalPathOverlay(l.root, filepath.Join(filepath.Dir(doc.File), importPath), l.overlayFiles)
 		if err == nil {
 			components[alias] = l.cache[path]
 		}
 	}
 	for alias, importPath := range doc.Imports.Tokens {
-		path, err := canonicalPathOverlay(l.root, filepath.Join(filepath.Dir(doc.File), importPath), l.overlay)
+		path, err := canonicalPathOverlay(l.root, filepath.Join(filepath.Dir(doc.File), importPath), l.overlayFiles)
 		if err == nil {
 			tokens[alias] = l.cache[path]
 		}
@@ -1762,7 +1849,7 @@ func canonicalPath(root, path string) (string, error) {
 	return canonicalPathOverlay(root, path, nil)
 }
 
-func canonicalPathOverlay(root, path string, overlay map[string][]byte) (string, error) {
+func canonicalPathOverlay(root, path string, overlay map[string]OverlayFile) (string, error) {
 	absolute, err := filepath.Abs(path)
 	if err != nil {
 		return "", err
@@ -1772,11 +1859,23 @@ func canonicalPathOverlay(root, path string, overlay map[string][]byte) (string,
 		if _, ok := overlay[filepath.Clean(absolute)]; !ok || !os.IsNotExist(err) {
 			return "", err
 		}
-		parent, parentErr := filepath.EvalSymlinks(filepath.Dir(absolute))
-		if parentErr != nil {
-			return "", parentErr
+		parts := []string{filepath.Base(absolute)}
+		probe := filepath.Dir(absolute)
+		for {
+			parent, parentErr := filepath.EvalSymlinks(probe)
+			if parentErr == nil {
+				for index := len(parts) - 1; index >= 0; index-- {
+					parent = filepath.Join(parent, parts[index])
+				}
+				resolved = parent
+				break
+			}
+			if !os.IsNotExist(parentErr) || filepath.Dir(probe) == probe {
+				return "", parentErr
+			}
+			parts = append(parts, filepath.Base(probe))
+			probe = filepath.Dir(probe)
 		}
-		resolved = filepath.Join(parent, filepath.Base(absolute))
 	}
 	relative, err := filepath.Rel(root, resolved)
 	if err != nil {

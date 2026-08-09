@@ -63,6 +63,8 @@ type View struct {
 	diagnostics []document.Diagnostic
 	runtime     *studio.Runtime
 	driver      *automation.Driver
+	overlay     *viewOverlay
+	faults      map[string]*testFaultRule
 }
 
 func NewRegistry() *Registry {
@@ -154,7 +156,7 @@ func (r *Registry) OpenView(projectID, file string) (ViewSummary, error) {
 	if doc != nil {
 		kind = doc.Kind
 	}
-	view := &View{id: opaqueID(), entry: entry, kind: kind, diagnostics: diagnostics}
+	view := &View{id: opaqueID(), entry: entry, kind: kind, diagnostics: diagnostics, overlay: newViewOverlay(), faults: make(map[string]*testFaultRule)}
 	if kind != document.KindTokens {
 		view.runtime = studio.NewRuntimeAllowInvalid(project.root, entry)
 		view.driver = newAutomationDriver(view.runtime)
@@ -224,6 +226,7 @@ func (r *Registry) CloseView(projectID, viewID string) error {
 	delete(project.byEntry, view.entry)
 	project.revision++
 	project.mu.Unlock()
+	view.closeOverlay()
 	if view.runtime != nil {
 		view.runtime.Close()
 	}
@@ -367,6 +370,7 @@ func (p *Project) close() {
 	p.sources = make(map[string]bool)
 	p.mu.Unlock()
 	for _, view := range views {
+		view.closeOverlay()
 		if view.driver != nil {
 			view.driver.Close()
 		}
@@ -374,6 +378,18 @@ func (p *Project) close() {
 			view.runtime.Close()
 		}
 	}
+}
+
+func (v *View) closeOverlay() {
+	if v.overlay != nil {
+		v.overlay.staged = nil
+		v.overlay.installed = nil
+		v.overlay.pending = nil
+		v.overlay.pendingSet = false
+		v.overlay.pendingInstall = false
+		v.overlay.pendingRevision = ""
+	}
+	v.faults = nil
 }
 
 func (v *View) summary() ViewSummary {

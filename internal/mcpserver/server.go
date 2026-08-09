@@ -381,6 +381,8 @@ func NewServiceWithOptions(registry *Registry, options ServiceOptions) *Service 
 	if options.Automation {
 		service.registerAutomationTools()
 		service.registerAutomationResources()
+		service.registerPhase6Tools()
+		service.registerPhase6Resources()
 	}
 	for _, project := range registry.ListProjects() {
 		service.addProjectResources(project.ID)
@@ -453,7 +455,11 @@ func (s *Service) registerLifecycleTools() {
 		err := s.registry.CloseView(input.ProjectID, input.ViewID)
 		if err == nil {
 			base := "gora://project/" + input.ProjectID + "/views/" + input.ViewID
-			s.server.RemoveResources(base, base+"/tree")
+			resources := []string{base, base + "/tree"}
+			if s.automation {
+				resources = append(resources, base+"/automation", base+"/automation/trace", base+"/automation/overlay")
+			}
+			s.server.RemoveResources(resources...)
 			s.notifyProject(input.ProjectID)
 		}
 		return nil, ClosedOutput{Closed: err == nil, ID: input.ViewID}, err
@@ -610,6 +616,9 @@ func (s *Service) registerRuntimeTools() {
 		if err != nil {
 			return nil, CaptureOutput{}, err
 		}
+		if s.automation && s.registry.ConsumeTestFault(input.ProjectID, input.ViewID, "capture_failure") {
+			return nil, CaptureOutput{}, fmt.Errorf("injected capture failure")
+		}
 		before := runtime.AutomationSnapshot()
 		data, warning, err := runtime.CapturePNG(input.Scale)
 		if err != nil {
@@ -698,6 +707,9 @@ func (s *Service) registerAutomationTools() {
 		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
 		if err != nil {
 			return nil, CompareCaptureOutput{}, err
+		}
+		if s.automation && s.registry.ConsumeTestFault(input.ProjectID, input.ViewID, "capture_failure") {
+			return nil, CompareCaptureOutput{}, fmt.Errorf("injected capture failure")
 		}
 		root, err := s.registry.ProjectRoot(input.ProjectID)
 		if err != nil {
@@ -927,6 +939,9 @@ func (s *Service) registerAutomationTools() {
 		if err != nil {
 			return nil, ViewClockOutput{}, err
 		}
+		if s.automation {
+			s.registry.ReleaseDelayedTestFaults(input.ProjectID, input.ViewID)
+		}
 		output := ViewClockOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Clock: clock, Snapshot: runtime.AutomationSnapshot()}
 		after := output.Snapshot
 		runtime.RecordEventTrace(automation.TraceEntry{Stage: "clock", Type: "clock", Outcome: fmt.Sprintf("advance:%d", input.DeltaMS), RuntimeBefore: before.RuntimeRevision, RuntimeAfter: after.RuntimeRevision, GeometryBefore: before.GeometryRevision, GeometryAfter: after.GeometryRevision, FrameBefore: before.FrameRevision, FrameAfter: after.FrameRevision, TraceBefore: beforeTrace, TraceAfter: beforeTrace + 1})
@@ -954,7 +969,7 @@ func (s *Service) registerAutomationTools() {
 
 func automationResources(projectID, viewID string) []string {
 	base := "gora://project/" + projectID + "/views/" + viewID
-	return []string{base + "/tree", base + "/automation", base + "/automation/trace"}
+	return []string{base + "/tree", base + "/automation", base + "/automation/trace", base + "/automation/overlay"}
 }
 
 func (s *Service) registerAutomationResources() {
@@ -1077,6 +1092,19 @@ func (s *Service) validateSubscription(_ context.Context, request *mcp.Subscribe
 		return nil
 	}
 	if projectID, viewID, ok := parseTraceURI(uri); ok {
+		if !s.automation {
+			return fmt.Errorf("automation resources are disabled")
+		}
+		view, err := s.registry.ViewSummary(projectID, viewID)
+		if err != nil {
+			return fmt.Errorf("unknown project or view: %w", err)
+		}
+		if !view.RuntimeAvailable {
+			return fmt.Errorf("automation is unavailable for token views")
+		}
+		return nil
+	}
+	if projectID, viewID, ok := parseOverlayURI(uri); ok {
 		if !s.automation {
 			return fmt.Errorf("automation resources are disabled")
 		}
@@ -1219,6 +1247,14 @@ func (s *Service) addViewResources(projectID, viewID string) {
 			}
 			return jsonResource(request.Params.URI, runtime.EventTrace())
 		})
+		overlayURI := viewURI + "/automation/overlay"
+		s.server.AddResource(&mcp.Resource{URI: overlayURI, Name: "gora-view-automation-overlay", MIMEType: "application/json"}, func(_ context.Context, request *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+			overlay, err := s.registry.OverlaySnapshot(projectID, viewID)
+			if err != nil {
+				return nil, mcp.ResourceNotFoundError(request.Params.URI)
+			}
+			return jsonResource(request.Params.URI, overlay)
+		})
 	}
 	s.server.AddResource(&mcp.Resource{URI: treeURI, Name: "gora-runtime-tree", MIMEType: "application/json"}, func(_ context.Context, request *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
 		runtime, err := s.registry.Runtime(projectID, viewID)
@@ -1267,6 +1303,7 @@ func (s *Service) notifyView(projectID, viewID string) {
 	_ = s.server.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: base + "/tree"})
 	if s.automation {
 		_ = s.server.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: base + "/automation"})
+		_ = s.server.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: base + "/automation/overlay"})
 		runtime, err := s.registry.Runtime(projectID, viewID)
 		if err == nil && runtime.EventTrace().Enabled {
 			_ = s.server.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: base + "/automation/trace"})
@@ -1289,7 +1326,7 @@ func (s *Service) removeProjectResources(projectID string, views []ViewSummary, 
 		viewBase := base + "/views/" + view.ID
 		uris = append(uris, viewBase, viewBase+"/tree")
 		if s.automation {
-			uris = append(uris, viewBase+"/automation", viewBase+"/automation/trace")
+			uris = append(uris, viewBase+"/automation", viewBase+"/automation/trace", viewBase+"/automation/overlay")
 		}
 	}
 	for _, source := range sources {

@@ -127,6 +127,11 @@ func (r *Registry) DocumentSummaries(projectID string) ([]DocumentSummary, []str
 			continue
 		}
 		for _, dependency := range view.runtime.Dependencies() {
+			if view.overlay != nil {
+				if _, shadowed := view.overlay.installed[filepath.Clean(dependency)]; shadowed {
+					continue
+				}
+			}
 			if filepath.Ext(dependency) != ".gora" {
 				relative, _ := filepath.Rel(project.root, dependency)
 				assetSet[filepath.ToSlash(relative)] = true
@@ -311,6 +316,11 @@ func (p *Project) knownPathsLocked() map[string]bool {
 		if view.runtime != nil {
 			for _, dependency := range view.runtime.Dependencies() {
 				if filepath.Ext(dependency) == ".gora" {
+					if view.overlay != nil {
+						if _, shadowed := view.overlay.installed[filepath.Clean(dependency)]; shadowed {
+							continue
+						}
+					}
 					known[filepath.Clean(dependency)] = true
 				}
 			}
@@ -378,7 +388,13 @@ func (p *Project) reloadAffectedViewsLocked(changed map[string]bool) {
 			view.runtime = studio.NewRuntimeAllowInvalid(p.root, view.entry)
 			view.driver = newAutomationDriver(view.runtime)
 		} else {
-			view.runtime.Reload()
+			if view.overlay != nil && (len(view.overlay.installed) != 0 || len(view.faults) != 0) {
+				provider, usages := p.providerForViewLocked(view)
+				view.runtime.ReloadOverlay(provider)
+				consumeProviderFaultsLocked(view, usages)
+			} else {
+				view.runtime.Reload()
+			}
 			if view.driver == nil {
 				view.driver = newAutomationDriver(view.runtime)
 			}
@@ -401,6 +417,11 @@ func (p *Project) reloadAffectedViewsLocked(changed map[string]bool) {
 		view.diagnostics = snapshot.Diagnostics
 		for _, dependency := range view.runtime.Dependencies() {
 			if filepath.Ext(dependency) == ".gora" {
+				if view.overlay != nil {
+					if _, shadowed := view.overlay.installed[filepath.Clean(dependency)]; shadowed {
+						continue
+					}
+				}
 				p.sources[filepath.Clean(dependency)] = true
 			}
 		}

@@ -95,6 +95,15 @@ root-contained reference using masks, channel tolerance, and a changed-pixel
 threshold; failed comparisons include an actionable diff image without
 modifying the reference.
 
+Automation can also install bounded, view-local test overlays and inject
+ordered reload events (`gora_apply_test_overlay`, `gora_clear_test_overlay`,
+`gora_inject_reload_events`). Overlay entries are root-contained `source`,
+`bytes`, or `missing` values (maximum 256 entries, 16 MiB per entry, 64 MiB
+total), identified by opaque SHA-256 revisions and never written to disk.
+Finite counted read/decode, candidate, capture, delayed, and stale-revision
+faults are available through the test-fault tools; the overlay resource
+publishes metadata only.
+
 To exercise percentage sizing, aspect ratios, intrinsic containers, and
 wrapping stacks, open the web-layout conformance example from the repository
 root:

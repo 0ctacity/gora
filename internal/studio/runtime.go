@@ -58,6 +58,7 @@ type Snapshot struct {
 	Clock                     ViewClockSnapshot
 	ClipboardLength           int
 	BlinkVisible              bool
+	AssetBytes                map[string][]byte
 	publicationStreak         uint64
 }
 
@@ -179,6 +180,7 @@ type Runtime struct {
 	doneCh                    chan struct{}
 	closed                    bool
 	candidateReload           bool
+	overlay                   map[string]project.OverlayFile
 }
 
 func newRuntime(root, entry string) *Runtime {
@@ -245,6 +247,7 @@ func (runtime *Runtime) Close() {
 	}
 	runtime.closed = true
 	runtime.automationClipboard = ""
+	runtime.overlay = nil
 	runtime.nextTimer = nil
 	runtime.timerQueue = nil
 	runtime.timerDispatchLog = nil
@@ -296,6 +299,17 @@ func (runtime *Runtime) RecordEventTrace(entry automation.TraceEntry) {
 }
 
 func (runtime *Runtime) Reload() {
+	runtime.reload(nil)
+}
+
+// ReloadOverlay reloads one view from a view-local in-memory source provider.
+// The map is intentionally copied by callers and is never written to disk or
+// shared with the project watcher.
+func (runtime *Runtime) ReloadOverlay(overlay map[string]project.OverlayFile) {
+	runtime.reload(overlay)
+}
+
+func (runtime *Runtime) reload(overlay map[string]project.OverlayFile) {
 	runtime.reloadMu.Lock()
 	defer runtime.reloadMu.Unlock()
 	runtime.mu.Lock()
@@ -316,9 +330,19 @@ func (runtime *Runtime) Reload() {
 	runtime.mu.RLock()
 	selection := runtime.selected
 	runtime.mu.RUnlock()
-	loaded, diagnostics := project.LoadSelection(runtime.root, runtime.entry, width, selection)
+	var loaded *project.Loaded
+	var diagnostics []document.Diagnostic
+	if overlay == nil {
+		loaded, diagnostics = project.LoadSelection(runtime.root, runtime.entry, width, selection)
+	} else {
+		loaded, diagnostics = project.LoadSelectionOverlayFiles(runtime.root, runtime.entry, width, selection, overlay)
+	}
 	if loaded != nil && len(diagnostics) == 0 && !viewportExplicit && loaded.Viewport.Width > 0 && loaded.Viewport.Width != width {
-		loaded, diagnostics = project.LoadSelection(runtime.root, runtime.entry, loaded.Viewport.Width, selection)
+		if overlay == nil {
+			loaded, diagnostics = project.LoadSelection(runtime.root, runtime.entry, loaded.Viewport.Width, selection)
+		} else {
+			loaded, diagnostics = project.LoadSelectionOverlayFiles(runtime.root, runtime.entry, loaded.Viewport.Width, selection, overlay)
+		}
 	}
 
 	runtime.mu.Lock()
@@ -326,12 +350,17 @@ func (runtime *Runtime) Reload() {
 	runtime.candidateReload = false
 	runtime.reloadRevision++
 	if loaded == nil || len(diagnostics) != 0 {
+		// Keep the last-good provider bytes alongside the last-good tree. A
+		// corrupt candidate must not leak replacement image/font bytes into a
+		// capture of that frame; a later valid candidate installs its provider
+		// atomically below.
 		runtime.diagnostics = append([]document.Diagnostic(nil), diagnostics...)
 		runtime.invalid = true
 		runtime.runtimeRevision++
 		runtime.signalLocked()
 		return
 	}
+	runtime.overlay = cloneOverlayFiles(overlay)
 	previousScreen := runtime.selected
 	previousScroll := cloneScroll(runtime.scroll)
 	runtime.loaded = loaded
@@ -412,6 +441,7 @@ func (runtime *Runtime) snapshotLocked() Snapshot {
 		Clock:                     runtime.clockSnapshotLocked(),
 		ClipboardLength:           len([]rune(runtime.automationClipboard)),
 		BlinkVisible:              runtime.blinkVisible,
+		AssetBytes:                assetBytesFromOverlay(runtime.overlay),
 		publicationStreak:         runtime.publicationStreak,
 	}
 	if runtime.editing != nil {
@@ -459,6 +489,33 @@ func (runtime *Runtime) snapshotLocked() Snapshot {
 	snapshot.Root = runtime.effectiveRoot
 	snapshot.GeometryRevision = runtime.geometryRevision
 	return snapshot
+}
+
+func cloneOverlayFiles(input map[string]project.OverlayFile) map[string]project.OverlayFile {
+	if len(input) == 0 {
+		return nil
+	}
+	output := make(map[string]project.OverlayFile, len(input))
+	for path, data := range input {
+		output[path] = project.OverlayFile{Kind: data.Kind, Data: append([]byte(nil), data.Data...), Delegate: data.Delegate, FaultKinds: append([]string(nil), data.FaultKinds...)}
+	}
+	return output
+}
+
+func assetBytesFromOverlay(input map[string]project.OverlayFile) map[string][]byte {
+	if len(input) == 0 {
+		return nil
+	}
+	output := make(map[string][]byte)
+	for path, file := range input {
+		if file.Kind != "missing" && !file.Delegate && file.Kind != "disk" {
+			output[path] = append([]byte(nil), file.Data...)
+		}
+	}
+	if len(output) == 0 {
+		return nil
+	}
+	return output
 }
 
 // AutomationSnapshot returns the latest immutable synchronization and

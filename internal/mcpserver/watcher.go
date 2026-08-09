@@ -163,7 +163,14 @@ func (p *Project) refreshWatchLocked() {
 	}
 	for _, view := range p.views {
 		if view.runtime != nil {
-			paths = append(paths, view.runtime.Dependencies()...)
+			for _, dependency := range view.runtime.Dependencies() {
+				if view.overlay != nil {
+					if _, shadowed := view.overlay.installed[filepath.Clean(dependency)]; shadowed {
+						continue
+					}
+				}
+				paths = append(paths, dependency)
+			}
 		}
 	}
 	p.watch.SetFiles(paths)

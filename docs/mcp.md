@@ -43,6 +43,10 @@ asset work across its views; it does not recursively discover the root.
 - Automation (enabled only with `gora mcp --automation`):
   `gora_wait_for_view`, `gora_dispatch_input`, `gora_configure_event_trace`,
   `gora_clear_event_trace`, `gora_assert_view`, and `gora_compare_capture`.
+  Automation also exposes the gated view-local test controls
+  `gora_apply_test_overlay`, `gora_clear_test_overlay`,
+  `gora_inject_reload_events`, `gora_configure_test_faults`, and
+  `gora_clear_test_faults`.
   Dispatch accepts one fully validated ordered
   batch of renderer-neutral pointer, keyboard, or wheel/trackpad scroll events
   and returns one result per event with canonical target, focus/capture,
@@ -153,6 +157,33 @@ exact non-premultiplied NRGBA pixels, logical masks, channel tolerance, and a
 changed-pixel threshold. Failed comparisons return changed bounds and inline
 current/diff PNGs; optional diffs are created only at new contained paths and
 references are never modified.
+
+Test overlays and controlled reloads
+
+The automation-only `gora://project/{project-id}/views/{view-id}/automation/overlay`
+resource exposes bounded overlay metadata without source or asset bytes. An
+overlay generation contains at most 256 root-contained entries, with a 16 MiB
+per-entry and 64 MiB decoded total limit. Entries are `source` (`text`),
+`bytes` (`data_base64`), or `missing`; installs are atomic and use opaque
+SHA-256 revisions. `install:false` stages a generation until a subsequent
+install or ordered reload event. Injected write/create/remove/rename events are
+view-local, coalesced in order, and never write the project or enter fsnotify.
+
+The finite counted fault rules cover exact source/asset reads and image/font
+decodes, candidate cancellation, capture failure before output writes, delayed
+candidates released by clearing the rule, and stale-overlay conflicts. Rules
+are bounded and deterministic. Invalid candidates retain the normal last-good
+publication and diagnostics until a valid recovery is installed; clearing an
+overlay rebuilds from disk and preserves compatible navigation, state, scroll,
+and editing state.
+
+Overlay mutations use an exact `base_overlay_revision` for every installed or
+staged generation, including the first creation (use the exposed canonical
+empty SHA revision).
+Reload events may select a staged generation with `final_overlay_revision`;
+without a final generation, watcher-like events are coalesced without reading
+disk into the view overlay. Pending delayed candidates and remaining fault
+counts are reported as bounded metadata in the overlay result/resource.
 
 Each app/component view owns one bounded automation router. It uses the same
 canonical clipped hit testing, pointer capture, focus traversal, control
