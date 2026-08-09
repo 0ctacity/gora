@@ -1,0 +1,329 @@
+gora: 1
+kind: app
+name: Layout Observatory
+imports:
+  tokens:
+    theme: theme.gora
+viewport: { width: 1280, height: 900, background: { ref: theme.color.shell } }
+breakpoints:
+  narrow: { max_width: 720 }
+  wide: { min_width: 721 }
+state:
+  mode: { type: enum, values: [overview, detail], default: overview }
+  query: { type: text, default: "Search specimen" }
+  notes: { type: text, default: "Compare normal and final geometry." }
+entry: observatory
+screens:
+  observatory:
+    type: scroll
+    name: observatory-scroll
+    props:
+      axis: both
+      scrollbar_x: auto
+      scrollbar_y: always
+      scroll_chain: auto
+    children:
+      - type: surface
+        name: observatory-page
+        props:
+          width: 1520
+          height: 1240
+          background: { ref: theme.color.shell }
+          padding: { top: 28, right: 32, bottom: 48, left: 32 }
+        responsive:
+          narrow:
+            props:
+              width: 820
+              height: 1540
+              padding: { top: 18, right: 18, bottom: 40, left: 18 }
+        children:
+          - type: stack
+            name: observatory-flow
+            props: { direction: vertical, gap: 24, alignment: start }
+            responsive:
+              narrow: { props: { gap: 16 } }
+            children:
+              - type: surface
+                name: sticky-ruler
+                place:
+                  position: sticky
+                  z_index: 4
+                  inset: { top: 0, right: null, bottom: null, left: 0 }
+                props:
+                  width: 1216
+                  height: 184
+                  padding: { top: 20, right: 24, bottom: 18, left: 24 }
+                  background: { ref: theme.color.ink }
+                  radius: { top_left: 16, top_right: 16, bottom_right: 16, bottom_left: 16 }
+                  clip: true
+                responsive:
+                  narrow:
+                    props:
+                      height: 320
+                      width: 384
+                      padding: { top: 16, right: 16, bottom: 16, left: 16 }
+                children:
+                  - type: stack
+                    props: { direction: vertical, gap: 14 }
+                    children:
+                      - type: stack
+                        props: { direction: horizontal, alignment: center, gap: 14 }
+                        responsive:
+                          narrow: { props: { direction: vertical, alignment: stretch, gap: 10 } }
+                        children:
+                          - type: stack
+                            props: { direction: vertical, gap: 2 }
+                            children:
+                              - type: text
+                                props: { text: LAYOUT OBSERVATORY, size: 11, weight: 700, letter_spacing: 1.6, color: { ref: theme.color.accent }, font: assets/StudioSans.ttf }
+                              - type: text
+                                props: { text: Normal flow under pressure, size: 26, weight: 700, color: "#FFFFFF", font: assets/StudioSans.ttf }
+                          - type: spacer
+                            place: { grow: 1 }
+                            responsive:
+                              narrow: { place: { grow: 0 } }
+                          - type: select
+                            name: specimen-mode
+                            props: { label: Specimen mode, bind: mode, width: 180, height: 42 }
+                            responsive:
+                              narrow: { props: { width: { percent: 100 } } }
+                            children:
+                              - type: select_trigger
+                                children:
+                                  - type: surface
+                                    props: { width: 180, height: 42, padding: { top: 10, right: 14, bottom: 10, left: 14 }, background: { ref: theme.color.ink_soft }, border: { thickness: 1, color: { ref: theme.color.blue } }, radius: 9 }
+                                    responsive:
+                                      narrow: { props: { width: { percent: 100 } } }
+                                    children: [{ type: text, props: { text: { ref: state.mode }, size: 13, weight: 600, color: "#FFFFFF", font: assets/StudioSans.ttf } }]
+                              - type: select_popup
+                                props: { max_height: 120, match_trigger_width: true, padding: { top: 6, right: 6, bottom: 6, left: 6 }, gap: 4, background: { ref: theme.color.ink_soft }, radius: 9, shadow: { ref: theme.shadow.lift } }
+                                children:
+                                  - type: option
+                                    name: overview-option
+                                    props: { label: Overview, value: overview, padding: { top: 9, right: 10, bottom: 9, left: 10 }, background: { ref: theme.color.ink_soft }, radius: 7 }
+                                    variants: [{ when: { interaction: selected }, props: { background: { ref: theme.color.accent } } }]
+                                    children: [{ type: text, props: { text: Overview, size: 13, color: "#FFFFFF", font: assets/StudioSans.ttf } }]
+                                  - type: option
+                                    name: detail-option
+                                    props: { label: Detail, value: detail, padding: { top: 9, right: 10, bottom: 9, left: 10 }, background: { ref: theme.color.ink_soft }, radius: 7 }
+                                    variants: [{ when: { interaction: selected }, props: { background: { ref: theme.color.accent } } }]
+                                    children: [{ type: text, props: { text: Detail, size: 13, color: "#FFFFFF", font: assets/StudioSans.ttf } }]
+                      - type: surface
+                        name: sticky-field-strip
+                        props: { width: { percent: 100 }, padding: { top: 10, right: 10, bottom: 10, left: 10 }, background: { ref: theme.color.blue_soft }, radius: 10 }
+                        children:
+                          - type: stack
+                            props: { direction: horizontal, wrap: true, gap: 12, alignment: stretch }
+                            children:
+                              - type: text_field
+                                name: specimen-query
+                                props: { label: Query, bind: query, width: 300 }
+                                responsive:
+                                  narrow: { props: { width: { percent: 100 } } }
+                                children:
+                                  - type: field_box
+                                    props: { width: 300, height: 38, padding: { top: 9, right: 12, bottom: 9, left: 12 }, background: { ref: theme.color.ink_soft }, border: { thickness: 1, color: { ref: theme.color.blue } }, radius: 8, size: 13, color: "#FFFFFF", selection_color: { ref: theme.color.accent_soft }, caret_color: { ref: theme.color.accent } }
+                                    responsive:
+                                      narrow: { props: { width: { percent: 100 } } }
+                              - type: text_area
+                                name: specimen-notes
+                                props: { label: Notes, bind: notes, width: 440, min_lines: 1, max_lines: 2 }
+                                responsive:
+                                  narrow: { props: { width: { percent: 100 } } }
+                                children:
+                                  - type: field_box
+                                    props: { width: 440, height: 38, padding: { top: 9, right: 12, bottom: 9, left: 12 }, background: { ref: theme.color.ink_soft }, border: { thickness: 1, color: { ref: theme.color.blue } }, radius: 8, size: 13, color: "#FFFFFF", selection_color: { ref: theme.color.accent_soft }, caret_color: { ref: theme.color.accent } }
+                                    responsive:
+                                      narrow: { props: { width: { percent: 100 } } }
+                              - type: text
+                                props: { text: "Scroll = transform; sticky = constraint; fixed = viewport.", size: 12, color: { ref: theme.color.ink_soft }, font: assets/StudioSans.ttf }
+                                place: { alignment: center }
+
+              - type: stack
+                name: workbench
+                props: { direction: horizontal, gap: 20, alignment: stretch }
+                responsive:
+                  narrow: { props: { gap: 14 } }
+                children:
+                  - type: surface
+                    name: frozen-lane
+                    place:
+                      position: sticky
+                      z_index: 3
+                      inset: { top: null, right: null, bottom: null, left: 0 }
+                    props:
+                      width: 236
+                      height: 820
+                      padding: { top: 22, right: 18, bottom: 22, left: 18 }
+                      background: { ref: theme.color.ink }
+                      radius: 16
+                    responsive:
+                      narrow:
+                        props: { width: 174, height: 980, padding: { top: 16, right: 12, bottom: 16, left: 12 } }
+                    children:
+                      - type: stack
+                        props: { direction: vertical, gap: 16 }
+                        children:
+                          - type: text
+                            props: { text: FROZEN LANE, size: 11, weight: 700, letter_spacing: 1.5, color: { ref: theme.color.accent }, font: assets/StudioSans.ttf }
+                          - type: text
+                            props: { text: "Scrollport pinned.", size: 15, line_height: 21, wrap: true, color: "#FFFFFF", font: assets/StudioSans.ttf }
+                          - type: surface
+                            props: { width: { percent: 100 }, height: 1, background: { ref: theme.color.blue } }
+                          - type: stack
+                            props: { direction: vertical, gap: 10 }
+                            children:
+                              - type: text
+                                props: { text: X / Y, size: 12, weight: 700, color: { ref: theme.color.line }, font: assets/StudioSans.ttf }
+                              - type: text
+                                props: { text: "0 → viewport width", size: 13, color: "#FFFFFF", font: assets/StudioSans.ttf }
+                              - type: text
+                                props: { text: "0 → content height", size: 13, color: "#FFFFFF", font: assets/StudioSans.ttf }
+                          - type: spacer
+                            place: { grow: 1 }
+                          - type: text
+                            props: { text: "Named scrollport\nobservatory-scroll", size: 12, line_height: 18, color: { ref: theme.color.line }, font: assets/StudioSans.ttf }
+
+                  - type: scroll
+                    name: canvas-scroll
+                    props:
+                      width: 1160
+                      height: 820
+                      axis: both
+                      scrollbar_x: always
+                      scrollbar_y: hidden
+                      scroll_chain: contain
+                    responsive:
+                      narrow:
+                        props: { width: 620, height: 980 }
+                    children:
+                      - type: surface
+                        name: specimen-canvas
+                        props: { width: 1460, height: 1080, background: { ref: theme.color.paper }, padding: { top: 26, right: 26, bottom: 26, left: 26 } }
+                        responsive:
+                          narrow: { props: { width: 760, height: 1280, padding: { top: 18, right: 18, bottom: 18, left: 18 } } }
+                        children:
+                          - type: stack
+                            props: { direction: vertical, gap: 20 }
+                            children:
+                              - type: stack
+                                props: { direction: horizontal, alignment: center, gap: 12 }
+                                children:
+                                  - type: text
+                                    props: { text: BOTH-AXIS, width: 130, size: 11, weight: 700, letter_spacing: 1.3, color: { ref: theme.color.blue }, font: assets/StudioSans.ttf }
+                                  - type: spacer
+                                    place: { grow: 1 }
+                                  - type: text
+                                    props: { text: "scroll_chain: contain", size: 12, color: { ref: theme.color.muted }, font: assets/StudioSans.ttf }
+                              - type: overlay
+                                name: stacking-specimen
+                                props: { width: 820, height: 250 }
+                                children:
+                                  - type: surface
+                                    name: negative-context
+                                    place: { position: sticky, z_index: -2, inset: { top: 0, right: 0, bottom: 0, left: 0 } }
+                                    props: { width: 820, height: 250, background: { ref: theme.color.blue_soft }, radius: 14 }
+                                    children: [{ type: text, props: { text: "−2  negative context", size: 13, color: { ref: theme.color.blue }, font: assets/StudioSans.ttf }, place: { x: 20, y: 18 } }]
+                                  - type: surface
+                                    name: zero-context
+                                    place: { position: sticky, z_index: 0, inset: { top: 28, right: 28, bottom: 28, left: 28 } }
+                                    props: { width: 760, height: 194, background: { ref: theme.color.paper }, border: { thickness: 1, color: { ref: theme.color.line } }, radius: 12 }
+                                    children:
+                                      - type: stack
+                                        props: { direction: vertical, gap: 8, padding: { top: 18, right: 18, bottom: 18, left: 18 } }
+                                        children:
+                                          - type: text
+                                            props: { text: "0  normal flow context", size: 16, weight: 700, color: { ref: theme.color.ink }, font: assets/StudioSans.ttf }
+                                          - type: text
+                                            props: { text: "The context owner paints first; its descendants stay atomic.", size: 13, color: { ref: theme.color.muted }, font: assets/StudioSans.ttf }
+                                  - type: surface
+                                    name: positive-context
+                                    props: { width: 260, height: 54, background: { ref: theme.color.accent_soft }, radius: 10 }
+                                    place: { position: sticky, z_index: 3, inset: { top: 18, right: null, bottom: null, left: 540 } }
+                                    responsive:
+                                      narrow:
+                                        place: { inset: { top: 18, right: null, bottom: null, left: 420 } }
+                                    children: [{ type: text, props: { text: "+3  positive context", size: 14, weight: 700, color: { ref: theme.color.accent }, font: assets/StudioSans.ttf }, place: { alignment: center } }]
+                                  - type: surface
+                                    name: atomic-wrapper
+                                    place: { position: sticky, z_index: 1, inset: { top: 180, right: null, bottom: null, left: 120 } }
+                                    props: { width: 580, height: 46, background: { ref: theme.color.ink_soft }, radius: 8 }
+                                    children:
+                                      - type: surface
+                                        name: atomic-descendant
+                                        place: { position: sticky, z_index: 99, inset: { top: 0, right: 0, bottom: 0, left: 0 } }
+                                        props: { width: 580, height: 46, padding: { top: 0, right: 18, bottom: 0, left: 18 }, background: { ref: theme.color.ink_soft }, radius: 8 }
+                                        children: [{ type: text, props: { text: Nested z-index stays inside its owner, size: 12, color: "#FFFFFF", font: assets/StudioSans.ttf }, place: { alignment: center } }]
+
+                              - type: stack
+                                props: { direction: horizontal, gap: 18, alignment: stretch, wrap: true }
+                                children:
+                                  - type: surface
+                                    name: coordinate-card
+                                    props: { width: 420, height: 270, padding: { top: 18, right: 18, bottom: 18, left: 18 }, background: { ref: theme.color.ink }, radius: 14 }
+                                    children:
+                                      - type: stack
+                                        props: { direction: vertical, gap: 12 }
+                                        children:
+                                          - type: text
+                                            props: { text: COORDINATE RULER, size: 11, weight: 700, letter_spacing: 1.3, color: { ref: theme.color.accent }, font: assets/StudioSans.ttf }
+                                          - type: text
+                                            props: { text: Every translation is visible., size: 20, weight: 700, color: "#FFFFFF", font: assets/StudioSans.ttf }
+                                          - type: stack
+                                            props: { direction: horizontal, gap: 12 }
+                                            children:
+                                              - type: surface
+                                                props: { width: 100, height: 100, background: { ref: theme.color.blue_soft }, radius: 10 }
+                                              - type: surface
+                                                props: { width: 100, height: 100, background: { ref: theme.color.accent }, radius: 10 }
+                                          - type: text
+                                            props: { text: "blue = viewport\ncoral = final translated content", size: 12, line_height: 18, color: { ref: theme.color.line }, font: assets/StudioSans.ttf }
+                                  - type: surface
+                                    name: measurement-card
+                                    props: { width: 560, height: 270, padding: { top: 18, right: 18, bottom: 18, left: 18 }, background: { ref: theme.color.paper }, border: { thickness: 1, color: { ref: theme.color.line_soft } }, radius: 14 }
+                                    children:
+                                      - type: stack
+                                        props: { direction: vertical, gap: 10 }
+                                        children:
+                                          - type: text
+                                            props: { text: MEASUREMENT NOTES, size: 11, weight: 700, letter_spacing: 1.3, color: { ref: theme.color.blue }, font: assets/StudioSans.ttf }
+                                          - type: text
+                                            props: { text: Intrinsic size is resolved before scroll extents., size: 20, weight: 700, color: { ref: theme.color.ink }, font: assets/StudioSans.ttf }
+                                          - type: text
+                                            props: { text: "The inner canvas is intentionally larger than its viewport. The outer chain is auto; this canvas is contain, so its residual delta stops here.", size: 14, line_height: 21, wrap: true, color: { ref: theme.color.muted }, font: assets/StudioSans.ttf }
+                                          - type: surface
+                                            props: { width: { percent: 100 }, height: 1, background: { ref: theme.color.line_soft } }
+                                          - type: text
+                                            props: { text: "x  1460 logical units\ny  1080 logical units", size: 13, line_height: 20, color: { ref: theme.color.ink_soft }, font: assets/StudioSans.ttf }
+
+                              - type: stack
+                                props: { direction: horizontal, gap: 18, alignment: stretch, wrap: true }
+                                children:
+                                  - type: surface
+                                    name: policy-auto
+                                    props: { width: 300, height: 150, padding: { top: 16, right: 16, bottom: 16, left: 16 }, background: { ref: theme.color.blue_soft }, radius: 12 }
+                                    children: [{ type: text, props: { text: "AUTO\nbar appears only with overflow", size: 14, line_height: 21, weight: 700, color: { ref: theme.color.ink }, font: assets/StudioSans.ttf } }]
+                                  - type: surface
+                                    name: policy-always
+                                    props: { width: 300, height: 150, padding: { top: 16, right: 16, bottom: 16, left: 16 }, background: { ref: theme.color.accent_soft }, radius: 12 }
+                                    children: [{ type: text, props: { text: "ALWAYS\ntrack stays visible", size: 14, line_height: 21, weight: 700, color: { ref: theme.color.accent }, font: assets/StudioSans.ttf } }]
+                                  - type: surface
+                                    name: policy-hidden
+                                    props: { width: 300, height: 150, padding: { top: 16, right: 16, bottom: 16, left: 16 }, background: { ref: theme.color.ink }, radius: 12 }
+                                    children: [{ type: text, props: { text: "HIDDEN\ncontent still scrolls", size: 14, line_height: 21, weight: 700, color: "#FFFFFF", font: assets/StudioSans.ttf } }]
+
+              - type: text
+                props: { text: "The fixed action stays attached to the viewport while every other specimen follows normal flow or its nearest scrollport.", size: 13, color: { ref: theme.color.muted }, font: assets/StudioSans.ttf }
+
+              - type: button
+                name: fixed-status-action
+                props: { label: "Capture current frame", width: 190, height: 42, padding: { top: 10, right: 14, bottom: 10, left: 14 }, background: { ref: theme.color.accent }, radius: 10, shadow: { ref: theme.shadow.lift } }
+                place: { position: fixed, z_index: 8, inset: { top: null, right: 24, bottom: 24, left: null } }
+                responsive:
+                  narrow:
+                    props: { width: 166, height: 32, padding: { top: 6, right: 12, bottom: 6, left: 12 } }
+                    place: { inset: { top: null, right: 16, bottom: 16, left: null } }
+                variants:
+                  - { when: { interaction: hovered }, props: { background: "#D9573D" } }
+                  - { when: { interaction: focused }, props: { border: { thickness: 2, color: "#FFFFFF" } } }
+                children: [{ type: text, props: { text: Capture current frame, size: 12, weight: 700, color: "#FFFFFF", font: assets/StudioSans.ttf }, place: { alignment: center } }]

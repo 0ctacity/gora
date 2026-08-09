@@ -1,0 +1,27 @@
+gora: 1
+kind: tokens
+tokens:
+  color:
+    shell: "#F7F1E8"
+    paper: "#FFFDF8"
+    ink: "#17212B"
+    ink_soft: "#273746"
+    muted: "#687481"
+    line: "#B8C7D5"
+    line_soft: "#DCE4EA"
+    accent: "#F26B4F"
+    accent_soft: "#FFD8CC"
+    blue: "#6D93B5"
+    blue_soft: "#DDEAF3"
+    green: "#4E9272"
+  dimension:
+    gutter: 28
+    radius: 14
+  font_face:
+    studio: { src: assets/StudioSans.ttf }
+  text_style:
+    display: { font: studio, size: 32, weight: 700, line_height: 38 }
+    body: { font: studio, size: 14, weight: 400, line_height: 20 }
+    label: { font: studio, size: 11, weight: 700, line_height: 14, letter_spacing: 1.2 }
+  shadow:
+    lift: { x: 0, y: 10, blur: 28, color: "#17212B18" }
