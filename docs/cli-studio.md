@@ -192,7 +192,7 @@ diagnostics, a warning on standard error, and exit status `0`.
 ## `gora mcp`
 
 ```text
-gora mcp [--listen 127.0.0.1:8787]
+gora mcp [--listen 127.0.0.1:8787] [--automation]
 ```
 
 This starts one persistent, project-oriented MCP 2026-07-28 server using
@@ -204,7 +204,12 @@ view state. Only `127.0.0.1` listeners are accepted.
 The MCP server is distinct from `gora run --headless`: the latter owns one
 document and the existing Unix-socket CLI session, while `gora mcp` owns
 multiple explicit projects and views for agent inspection, control, capture,
-and structured document editing. See [MCP server](mcp.md).
+and structured document editing. Add `--automation` to register the
+renderer-neutral `gora_dispatch_input` batch tool and the
+`gora_wait_for_view`/automation resource; without it, ordinary project/view
+tools remain unchanged. This input boundary proves canonical pointer/keyboard
+routing and publication, not delivery through a visible Gio/OS window. See
+[MCP server](mcp.md).
 
 ## Session security
 

@@ -17,6 +17,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"gora/internal/automation"
 	"gora/internal/semantic"
 	"gora/internal/studio"
 )
@@ -168,6 +169,22 @@ type WaitForViewInput struct {
 type WaitForViewOutput struct {
 	ProjectID string                    `json:"project_id"`
 	ViewID    string                    `json:"view_id"`
+	Snapshot  studio.AutomationSnapshot `json:"snapshot"`
+	Resources []string                  `json:"resources"`
+}
+
+type DispatchInput struct {
+	ProjectID string             `json:"project_id"`
+	ViewID    string             `json:"view_id"`
+	Events    []automation.Event `json:"events"`
+	Wait      string             `json:"wait,omitempty" jsonschema:"none, published, or idle"`
+	TimeoutMS int                `json:"timeout_ms,omitempty"`
+}
+
+type DispatchOutput struct {
+	ProjectID string                    `json:"project_id"`
+	ViewID    string                    `json:"view_id"`
+	Results   []automation.Result       `json:"results"`
 	Snapshot  studio.AutomationSnapshot `json:"snapshot"`
 	Resources []string                  `json:"resources"`
 }
@@ -380,6 +397,11 @@ func (s *Service) registerRuntimeTools() {
 		if _, err := runtime.RuntimeTree(); err != nil {
 			return nil, ControlValueOutput{}, err
 		}
+		if s.automation {
+			if err := s.registry.RefreshAutomationDriver(input.ProjectID, input.ViewID); err != nil {
+				return nil, ControlValueOutput{}, err
+			}
+		}
 		view, err := s.registry.ViewSummary(input.ProjectID, input.ViewID)
 		if err != nil {
 			return nil, ControlValueOutput{}, err
@@ -402,6 +424,11 @@ func (s *Service) registerRuntimeTools() {
 		tree, err := runtime.RuntimeTree()
 		if err != nil {
 			return nil, FieldDraftOutput{}, err
+		}
+		if s.automation {
+			if err := s.registry.RefreshAutomationDriver(input.ProjectID, input.ViewID); err != nil {
+				return nil, FieldDraftOutput{}, err
+			}
 		}
 		var field *semantic.Node
 		for _, node := range semantic.Flatten(tree) {
@@ -459,6 +486,11 @@ func (s *Service) registerRuntimeTools() {
 		data, warning, err := runtime.CapturePNG(input.Scale)
 		if err != nil {
 			return nil, CaptureOutput{}, err
+		}
+		if s.automation && warning == "" {
+			if err := s.registry.RefreshAutomationDriver(input.ProjectID, input.ViewID); err != nil {
+				return nil, CaptureOutput{}, err
+			}
 		}
 		if after := runtime.AutomationSnapshot(); after.FrameRevision != before.FrameRevision {
 			s.notifyView(input.ProjectID, input.ViewID)
@@ -530,6 +562,62 @@ func (s *Service) registerAutomationTools() {
 		}
 		return nil, output, waitErr
 	})
+	mutation := &mcp.ToolAnnotations{ReadOnlyHint: false, IdempotentHint: false, OpenWorldHint: boolPointer(false), DestructiveHint: boolPointer(false)}
+	mcp.AddTool(s.server, &mcp.Tool{Name: "gora_dispatch_input", Description: "Dispatch an ordered, renderer-neutral pointer or keyboard batch to one MCP view.", Annotations: mutation}, func(ctx context.Context, _ *mcp.CallToolRequest, input DispatchInput) (*mcp.CallToolResult, DispatchOutput, error) {
+		if input.Wait == "" {
+			input.Wait = "published"
+		}
+		if input.Wait != "none" && input.Wait != "published" && input.Wait != "idle" {
+			return nil, DispatchOutput{}, fmt.Errorf("wait must be none, published, or idle")
+		}
+		timeout := 5 * time.Second
+		if input.TimeoutMS != 0 {
+			if input.TimeoutMS < 1 || input.TimeoutMS > 60000 {
+				return nil, DispatchOutput{}, fmt.Errorf("timeout_ms must be between 1 and 60000")
+			}
+			timeout = time.Duration(input.TimeoutMS) * time.Millisecond
+		}
+		runtime, err := s.registry.Runtime(input.ProjectID, input.ViewID)
+		if err != nil {
+			return nil, DispatchOutput{}, err
+		}
+		driver, err := s.registry.AutomationDriver(input.ProjectID, input.ViewID)
+		if err != nil {
+			return nil, DispatchOutput{}, err
+		}
+		results, dispatchErr := driver.Dispatch(input.Events)
+		snapshot := runtime.AutomationSnapshot()
+		output := DispatchOutput{ProjectID: input.ProjectID, ViewID: input.ViewID, Results: results, Snapshot: snapshot, Resources: automationResources(input.ProjectID, input.ViewID)}
+		if dispatchErr != nil {
+			if len(results) != 0 {
+				// A runtime error after an earlier valid event may leave that
+				// prefix committed; publish its resulting snapshot.
+				s.notifyView(input.ProjectID, input.ViewID)
+			}
+			return &mcp.CallToolResult{IsError: true, StructuredContent: output, Content: []mcp.Content{&mcp.TextContent{Text: dispatchErr.Error()}}}, output, nil
+		}
+		// Dispatch publishes each changed event synchronously through Runtime;
+		// notify subscribers after the final batch frame is installed.
+		s.notifyView(input.ProjectID, input.ViewID)
+		if input.Wait != "none" {
+			request := studio.WaitForViewRequest{Condition: input.Wait, StableFrames: 1, Timeout: timeout, AfterFrameSet: true, AfterFrameRevision: snapshot.FrameRevision, AllowAlreadySatisfied: true}
+			waited, waitErr := runtime.WaitForView(ctx, request)
+			output.Snapshot = waited
+			if waitErr != nil {
+				var timeoutErr *studio.WaitTimeoutError
+				if errors.As(waitErr, &timeoutErr) {
+					return &mcp.CallToolResult{IsError: true, StructuredContent: output, Content: []mcp.Content{&mcp.TextContent{Text: waitErr.Error()}}}, output, nil
+				}
+				return nil, output, waitErr
+			}
+		}
+		return nil, output, nil
+	})
+}
+
+func automationResources(projectID, viewID string) []string {
+	base := "gora://project/" + projectID + "/views/" + viewID
+	return []string{base + "/tree", base + "/automation"}
 }
 
 func (s *Service) registerAutomationResources() {
@@ -581,6 +669,11 @@ func (s *Service) runtimeMutation(projectID, viewID string) (*mcp.CallToolResult
 	}
 	if _, err := runtime.RuntimeTree(); err != nil {
 		return nil, RuntimeMutationOutput{}, err
+	}
+	if s.automation {
+		if err := s.registry.RefreshAutomationDriver(projectID, viewID); err != nil {
+			return nil, RuntimeMutationOutput{}, err
+		}
 	}
 	view, err := s.registry.ViewSummary(projectID, viewID)
 	if err == nil {

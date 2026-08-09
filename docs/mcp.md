@@ -40,6 +40,16 @@ asset work across its views; it does not recursively discover the root.
 - Runtime: `gora_set_viewport`, `gora_select`, `gora_activate`, `gora_scroll`,
   `gora_set_state`, `gora_reset_state`, `gora_set_control_value`, and
   `gora_capture`. Runtime calls require matching project and view IDs.
+- Automation (enabled only with `gora mcp --automation`):
+  `gora_wait_for_view` and `gora_dispatch_input`. Dispatch accepts one fully
+  validated ordered batch of renderer-neutral pointer or keyboard events and
+  returns one result per event with canonical target, focus/capture,
+  consumed state, effects, and resulting revisions. A malformed event
+  anywhere in a batch is rejected before the first event is delivered.
+  `wait` may be `none`, `published`, or `idle`; the default timeout is 5s and
+  the accepted range is 1–60000ms. Secondary/middle/none pointer buttons are
+  reported unconsumed rather than converted into primary activation. Text
+  insertion and OS-level input injection remain outside this phase.
 - Editing: `gora_apply_document_changes` creates, replaces, or applies ordered
   RFC 6902-style `add`, `replace`, and `remove` operations to structured Gora
   documents. Existing files require their current SHA-256 revision.
@@ -63,6 +73,48 @@ validates and atomically synchronizes a form's enabled field drafts before
 running authored submit effects; `gora_reset_form` restores only bindings
 represented by that form.
 All three require `project_id`, `view_id`, and a stable semantic field/form ID.
+
+## Renderer-neutral input automation
+
+Start the server with the feature gate when an agent needs raw semantic input:
+
+```sh
+gora mcp --automation
+```
+
+Open a project and view as usual, then send a batch such as:
+
+```json
+{
+  "project_id": "project-id",
+  "view_id": "view-id",
+  "wait": "published",
+  "events": [
+    {"type":"pointer","kind":"press","pointer_id":1,"source":"mouse","x":24,"y":20,"button":"primary","time_ms":1},
+    {"type":"pointer","kind":"release","pointer_id":1,"source":"mouse","x":24,"y":20,"button":"primary","time_ms":2}
+  ]
+}
+```
+
+Pointer coordinates are logical view coordinates and may be outside the
+viewport for release/cancel tests. Pointer IDs are positive and stable through
+a press sequence; a release must use the same source and button as its press,
+while cancel releases the sequence without activation. Pointer kinds are `enter`, `leave`, `move`, `press`,
+`release`, and `cancel`; sources are `mouse` or `touch`; buttons are
+`primary`, `secondary`, `middle`, or `none`. Keyboard kinds are `down` and
+`up`, with portable names `Tab`, `Enter`, `Space`, `Escape`, directional,
+page, Home/End, Backspace/Delete, `A`–`Z`, and `0`–`9`. Modifiers are a unique
+subset of `shift`, `control`, `command`, and `option`; event times are finite,
+non-negative, and monotonic within a batch.
+
+Each app/component view owns one bounded automation router. It uses the same
+canonical clipped hit testing, pointer capture, focus traversal, control
+activation, scroll metrics, and state/value reducers as the runtime. A valid
+event publishes its resulting frame before the response and automation
+resource notification; `published`/`idle` waits reuse the frame barrier and do
+not synthesize an extra frame. Closing or reloading a view clears stale
+pointer and keyboard ownership. Token views reject automation tools and
+resources, and project/view mismatches are rejected before delivery.
 
 ## Resources and subscriptions
 

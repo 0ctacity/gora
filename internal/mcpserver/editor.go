@@ -376,16 +376,27 @@ func (p *Project) reloadAffectedViewsLocked(changed map[string]bool) {
 		}
 		if view.runtime == nil {
 			view.runtime = studio.NewRuntimeAllowInvalid(p.root, view.entry)
+			view.driver = newAutomationDriver(view.runtime)
 		} else {
 			view.runtime.Reload()
+			if view.driver == nil {
+				view.driver = newAutomationDriver(view.runtime)
+			}
 		}
 		snapshot := view.runtime.Snapshot()
 		if !snapshot.Invalid && snapshot.Root != nil {
 			// A valid reload is not complete for automation until its fresh
 			// reference frame is installed. Invalid candidates retain the
 			// last-good publication and expose only current diagnostics.
-			_, _ = view.runtime.RuntimeTree()
+			tree, frameErr := view.runtime.RuntimeTree()
+			if frameErr == nil && view.driver != nil {
+				view.driver.Update(tree)
+				view.runtime.PublishRouterSnapshot(view.driver.Router().Snapshot())
+			}
 			snapshot = view.runtime.Snapshot()
+		} else if view.driver != nil {
+			view.driver.Update(nil)
+			view.runtime.PublishRouterSnapshot(view.driver.Router().Snapshot())
 		}
 		view.diagnostics = snapshot.Diagnostics
 		for _, dependency := range view.runtime.Dependencies() {

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"gora/internal/automation"
 	"gora/internal/document"
 	"gora/internal/project"
 	"gora/internal/studio"
@@ -61,6 +62,7 @@ type View struct {
 	kind        document.Kind
 	diagnostics []document.Diagnostic
 	runtime     *studio.Runtime
+	driver      *automation.Driver
 }
 
 func NewRegistry() *Registry {
@@ -155,6 +157,7 @@ func (r *Registry) OpenView(projectID, file string) (ViewSummary, error) {
 	view := &View{id: opaqueID(), entry: entry, kind: kind, diagnostics: diagnostics}
 	if kind != document.KindTokens {
 		view.runtime = studio.NewRuntimeAllowInvalid(project.root, entry)
+		view.driver = newAutomationDriver(view.runtime)
 	}
 	project.views[view.id] = view
 	project.byEntry[entry] = view.id
@@ -168,11 +171,27 @@ func (r *Registry) OpenView(projectID, file string) (ViewSummary, error) {
 		// Publish the initial valid reference frame eagerly so automation clients
 		// can wait immediately after opening a view. Invalid views remain open
 		// with diagnostics and simply have no last-good frame yet.
-		_, _ = view.runtime.RuntimeTree()
+		if tree, frameErr := view.runtime.RuntimeTree(); frameErr == nil && !view.runtime.Snapshot().Invalid {
+			view.driver.Update(tree)
+		} else {
+			view.driver.Update(nil)
+		}
+		view.runtime.PublishRouterSnapshot(view.driver.Router().Snapshot())
 	}
 	project.revision++
 	project.refreshWatchLocked()
 	return view.summary(), nil
+}
+
+func newAutomationDriver(runtime *studio.Runtime) *automation.Driver {
+	return automation.NewDriverWithSnapshot(runtime, func() automation.RevisionSnapshot {
+		snapshot := runtime.AutomationSnapshot()
+		return automation.RevisionSnapshot{
+			RuntimeRevision: snapshot.RuntimeRevision, FrameRevision: snapshot.FrameRevision,
+			GeometryRevision: snapshot.GeometryRevision, PublishedRuntimeRevision: snapshot.PublishedRuntimeRevision,
+			PublishedGeometryRevision: snapshot.PublishedGeometryRevision, AutomationInputRevision: snapshot.AutomationInputRevision,
+		}
+	})
 }
 
 func (r *Registry) ListViews(projectID string) []ViewSummary {
@@ -208,6 +227,9 @@ func (r *Registry) CloseView(projectID, viewID string) error {
 	if view.runtime != nil {
 		view.runtime.Close()
 	}
+	if view.driver != nil {
+		view.driver.Close()
+	}
 	return nil
 }
 
@@ -226,6 +248,53 @@ func (r *Registry) Runtime(projectID, viewID string) (*studio.Runtime, error) {
 		return nil, fmt.Errorf("view %q does not support runtime operations", viewID)
 	}
 	return view.runtime, nil
+}
+
+// AutomationDriver returns the ordered input coordinator owned by one live
+// app/component view. Token views intentionally have no driver.
+func (r *Registry) AutomationDriver(projectID, viewID string) (*automation.Driver, error) {
+	project, err := r.project(projectID)
+	if err != nil {
+		return nil, err
+	}
+	project.mu.RLock()
+	view := project.views[viewID]
+	project.mu.RUnlock()
+	if view == nil {
+		return nil, fmt.Errorf("unknown view %q", viewID)
+	}
+	if view.driver == nil {
+		return nil, fmt.Errorf("view %q does not support automation input", viewID)
+	}
+	return view.driver, nil
+}
+
+// RefreshAutomationDriver reconciles a view-owned router after a non-input
+// MCP mutation (selection, viewport, state, or document control update).
+// CurrentRuntimeTree avoids manufacturing a second frame when publication is
+// already current; Update then clears stale pointer ownership on a context
+// change.
+func (r *Registry) RefreshAutomationDriver(projectID, viewID string) error {
+	runtime, err := r.Runtime(projectID, viewID)
+	if err != nil {
+		return err
+	}
+	driver, err := r.AutomationDriver(projectID, viewID)
+	if err != nil {
+		return err
+	}
+	snapshot := runtime.Snapshot()
+	if snapshot.Invalid {
+		driver.Update(nil)
+	} else {
+		tree, treeErr := runtime.CurrentRuntimeTree()
+		if treeErr != nil {
+			return treeErr
+		}
+		driver.Update(tree)
+	}
+	runtime.PublishRouterSnapshot(driver.Router().Snapshot())
+	return nil
 }
 
 func (r *Registry) ViewSummary(projectID, viewID string) (ViewSummary, error) {
@@ -298,6 +367,9 @@ func (p *Project) close() {
 	p.sources = make(map[string]bool)
 	p.mu.Unlock()
 	for _, view := range views {
+		if view.driver != nil {
+			view.driver.Close()
+		}
 		if view.runtime != nil {
 			view.runtime.Close()
 		}

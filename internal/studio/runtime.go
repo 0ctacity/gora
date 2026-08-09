@@ -475,6 +475,18 @@ func (runtime *Runtime) AutomationSnapshot() AutomationSnapshot {
 	return result
 }
 
+// CurrentTransient returns the runtime-owned interaction state without
+// consuming any router or editing queues. Automation drivers use it to
+// reconcile navigation/select changes after applying an activation.
+func (runtime *Runtime) CurrentTransient() interaction.Transient {
+	runtime.mu.RLock()
+	defer runtime.mu.RUnlock()
+	if runtime.state == nil {
+		return interaction.Transient{}
+	}
+	return runtime.state.Transient()
+}
+
 func cloneStateValues(values map[string]map[string]any) map[string]map[string]any {
 	if values == nil {
 		return map[string]map[string]any{}
@@ -1193,6 +1205,14 @@ func (runtime *Runtime) RuntimeTree() (*semantic.Node, error) {
 	return result.Tree, nil
 }
 
+// CurrentRuntimeTree returns the current published tree when it already
+// agrees with runtime state, rendering and publishing one frame only when a
+// mutation made the publication stale. Renderer-neutral automation uses this
+// boundary to avoid creating a frame before every input event.
+func (runtime *Runtime) CurrentRuntimeTree() (*semantic.Node, error) {
+	return runtime.currentRuntimeTree()
+}
+
 func (runtime *Runtime) runtimeFrame() (render.Result, error) {
 	snapshot := runtime.Snapshot()
 	if snapshot.Root == nil {
@@ -1769,7 +1789,7 @@ func (runtime *Runtime) ResetStateScope(scope string) error {
 
 // ScrollSemanticID changes one visible scroll node and clamps it to content extents.
 func (runtime *Runtime) ScrollSemanticID(id, mode string, x, y int) error {
-	result, err := runtime.runtimeFrame()
+	result, err := runtime.currentRuntimeFrame()
 	if err != nil {
 		return err
 	}

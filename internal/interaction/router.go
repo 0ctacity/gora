@@ -122,6 +122,20 @@ func (r *Router) Update(tree *semantic.Node) {
 		// A queued drag belongs to the old frame/tree and must not be applied
 		// after a reload, selection change, or visibility update.
 		r.scrollChange = nil
+	} else if r.scrollCapture != nil && r.scrollCapture.axis != nil {
+		// A scroll mutation replaces semantic nodes while a thumb drag remains
+		// owned by the same pointer. Rebind the capture to the new axis and
+		// geometry so subsequent moves use the current track/thumb metrics.
+		for _, region := range r.regions {
+			if region != nil && region.Role == "scrollbar" && region.Handle == r.scrollCapture.axis.Handle && region.Bounds != nil {
+				r.scrollCapture.axis = region
+				r.scrollCapture.track = region.Bounds.ImageRectangle()
+				if thumb := scrollbarThumb(region); thumb != nil && thumb.Bounds != nil {
+					r.scrollCapture.thumb = thumb.Bounds.ImageRectangle()
+				}
+				break
+			}
+		}
 	}
 }
 
@@ -145,8 +159,27 @@ func (r *Router) MovePointer(pointerID int, point image.Point, touch bool) {
 	r.move(pointerID, point, touch)
 }
 
+// HitID returns the canonical semantic ID at a logical point using the same
+// clipped, final-paint-order hit testing used by pointer routing. It is a
+// read-only adapter for renderer-neutral automation hosts.
+func (r *Router) HitID(point image.Point) string {
+	if r == nil {
+		return ""
+	}
+	if node := r.hit(point); node != nil {
+		return node.ID
+	}
+	return ""
+}
+
 func (r *Router) move(pointerID int, point image.Point, touch bool) {
 	if r.inspecting {
+		return
+	}
+	// A second pointer must not steer or clear the pointer that owns a
+	// semantic control/scrollbar capture. Host gestures may still report the
+	// event, but document routing ignores it until the owning pointer ends.
+	if r.captureID >= 0 && pointerID >= 0 && pointerID != r.captureID {
 		return
 	}
 	if r.scrollCapture != nil {
@@ -159,8 +192,10 @@ func (r *Router) move(pointerID int, point image.Point, touch bool) {
 		r.queueScrollbarDrag(point)
 		return
 	}
-	if region := r.enabledRegion(r.captureHandle); region != nil && region.Role == "slider" {
-		r.queueSliderValue(region, point)
+	if region := r.enabledRegion(r.captureHandle); region != nil && region.Role == "slider" && point != image.Pt(-1, -1) {
+		if pointerID < 0 || pointerID == r.captureID {
+			r.queueSliderValue(region, point)
+		}
 	}
 	if touch {
 		if touch {

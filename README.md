@@ -11,7 +11,9 @@ project-oriented MCP control server.
 
 V1 is deliberately a preview tool. It does not generate production UI code and
 does not include URL routing, animation, remote assets, SVG, secure/password
-fields, file inputs, or raw input injection.
+fields, file inputs, or OS-level input injection. The optional MCP automation
+gate provides deterministic renderer-neutral pointer and keyboard batches for
+testing headless app/component views.
 
 ## Install
 
@@ -70,6 +72,16 @@ It serves Streamable HTTP at `http://127.0.0.1:8787/mcp`. Agents open or reuse
 projects by canonical root, then open independent app, component, or token
 views inside them. See [MCP server](docs/mcp.md) for resources, tools, editing,
 and client configuration.
+
+Start it with renderer-neutral input automation enabled:
+
+```sh
+./gora mcp --automation
+```
+
+Agents can then use `gora_dispatch_input` for validated pointer/keyboard event
+batches and `gora_wait_for_view` for publication/idle barriers. This does not
+inject events into a visible native window.
 
 To exercise percentage sizing, aspect ratios, intrinsic containers, and
 wrapping stacks, open the web-layout conformance example from the repository
